@@ -504,12 +504,12 @@ class Models():
         output = torch.empty((1, 512), dtype=torch.float32, device='cuda').contiguous()
         io_binding = recognition_session.io_binding()
         io_binding.bind_input(
-            name='input.1', device_type='cuda', device_id=0,
+            name=recognition_session.get_inputs()[0].name, device_type='cuda', device_id=0,
             element_type=np.float32, shape=(1, 3, 112, 112),
             buffer_ptr=img.data_ptr(),
         )
         io_binding.bind_output(
-            name='683', device_type='cuda', device_id=0,
+            name=recognition_session.get_outputs()[0].name, device_type='cuda', device_id=0,
             element_type=np.float32, shape=(1, 512),
             buffer_ptr=output.data_ptr(),
         )
@@ -585,6 +585,16 @@ class Models():
         pref = self._backend_pref.get('retinaface_model')
         want_trt = pref != 'onnx'
         onnx_path = self._mp('det_10g.onnx')
+        # Bind by the names the loaded model actually declares — ONNX
+        # export naming varies (input.1 / input, 448 / scores8 / …).
+        def _io_names(path):
+            m = onnx.load(path, load_external_data=False)
+            return ([i.name for i in m.graph.input],
+                    [o.name for o in m.graph.output])
+        det_in, det_out = _io_names(onnx_path)
+        det_img_name = det_in[0]
+        if det_out:
+            print('[Models] retinaface IO: input=%r outputs=%r' % (det_in, det_out))
         sess = None
 
         if want_trt:
@@ -614,9 +624,9 @@ class Models():
                 # Dynamic input profile: one engine covers every
                 # DetectInputSize value (320 / 416 / 480 / 640). opt
                 # at 640 — TRT specializes for that point.
-                'trt_profile_min_shapes': 'input.1:1x3x320x320',
-                'trt_profile_opt_shapes': 'input.1:1x3x640x640',
-                'trt_profile_max_shapes': 'input.1:1x3x640x640',
+                'trt_profile_min_shapes': '%s:1x3x320x320' % det_img_name,
+                'trt_profile_opt_shapes': '%s:1x3x640x640' % det_img_name,
+                'trt_profile_max_shapes': '%s:1x3x640x640' % det_img_name,
             }
             try:
                 cur_stream = torch.cuda.current_stream()
@@ -660,6 +670,7 @@ class Models():
         self._retinaface_trt_input_min = 320
         self._retinaface_trt_input_max = 640
         self._retinaface_engine_size_warned = False
+        self._retinaface_io_names = (det_img_name, det_out)
         backend = 'TensorrtExecutionProvider' if self._retinaface_uses_trt else 'CUDAExecutionProvider'
         print(f'{self._load_tag("find")} [Models] retinaface: {backend} (accepts input 320-640)')
         return sess
@@ -1953,12 +1964,8 @@ class Models():
 
         with nvtx_range("rf_ort_run"):
             # det_10g has 9 outputs — 3 scores, 3 bbox deltas, 3 kps deltas
-            # at strides 8/16/32. The downstream loop consumes them by index.
-            _RF_OUTPUT_ORDER = (
-                '448', '471', '494',  # scores @ stride 8 / 16 / 32
-                '451', '474', '497',  # bbox deltas
-                '454', '477', '500',  # kps deltas
-            )
+            # at strides 8/16/32, declared in that order (names vary by
+            # export). The downstream loop consumes them by index.
 
             # Pre-allocate output buffers on GPU. Shapes are deterministic
             # from input_size + stride (det_10g has 2 anchors per cell).
@@ -1978,27 +1985,28 @@ class Models():
                 kps_bufs.append(torch.empty((n_anchors, 10), dtype=torch.float32, device='cuda'))
 
             retinaface_session = self._get_retinaface_session()
+            det_img_name, det_out_names = self._retinaface_io_names
             io_binding = retinaface_session.io_binding()
             io_binding.bind_input(
-                name='input.1', device_type='cuda', device_id=0,
+                name=det_img_name, device_type='cuda', device_id=0,
                 element_type=np.float32, shape=det_img.size(),
                 buffer_ptr=det_img.data_ptr(),
             )
-            for i, name in enumerate(_RF_OUTPUT_ORDER[:3]):
+            for i, name in enumerate(det_out_names[:3]):
                 buf = score_bufs[i]
                 io_binding.bind_output(
                     name=name, device_type='cuda', device_id=0,
                     element_type=np.float32, shape=tuple(buf.shape),
                     buffer_ptr=buf.data_ptr(),
                 )
-            for i, name in enumerate(_RF_OUTPUT_ORDER[3:6]):
+            for i, name in enumerate(det_out_names[3:6]):
                 buf = bbox_bufs[i]
                 io_binding.bind_output(
                     name=name, device_type='cuda', device_id=0,
                     element_type=np.float32, shape=tuple(buf.shape),
                     buffer_ptr=buf.data_ptr(),
                 )
-            for i, name in enumerate(_RF_OUTPUT_ORDER[6:9]):
+            for i, name in enumerate(det_out_names[6:9]):
                 buf = kps_bufs[i]
                 io_binding.bind_output(
                     name=name, device_type='cuda', device_id=0,
@@ -2286,7 +2294,7 @@ class Models():
             output = torch.empty((1, 512), dtype=torch.float32, device='cuda').contiguous()
             io_binding = recognition_session.io_binding()
             io_binding.bind_output(
-                name='683', device_type='cuda', device_id=0,
+                name=recognition_session.get_outputs()[0].name, device_type='cuda', device_id=0,
                 element_type=np.float32, shape=(1, 512),
                 buffer_ptr=output.data_ptr(),
             )
@@ -2297,7 +2305,7 @@ class Models():
                     input = img[j::dim, i::dim].permute(2, 0, 1)
                     input = torch.unsqueeze(input, 0).contiguous()
                     io_binding.bind_input(
-                        name='input.1', device_type='cuda', device_id=0,
+                        name=recognition_session.get_inputs()[0].name, device_type='cuda', device_id=0,
                         element_type=np.float32, shape=(1, 3, 112, 112),
                         buffer_ptr=input.data_ptr(),
                     )
