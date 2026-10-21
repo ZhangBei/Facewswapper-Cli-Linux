@@ -1,0 +1,66 @@
+# ===================== Rope-Pearl =====================
+# Keep the repo to source only. Model weights, the venv, caches, and
+# per-user app state are all provided/generated locally, not committed.
+
+# --- Python virtual environment (machine-specific, large) ---
+venv/
+.venv/
+env/
+ENV/
+
+# --- Model weights / ONNX / TRT engines (many GB; provided separately) ---
+models/
+.rope-models.json
+*.part
+# Safety net for weights or engines placed anywhere outside models/:
+*.onnx
+*.engine
+*.pth
+*.trt
+*.safetensors
+*.plan
+
+# --- Runtime caches (regenerable) ---
+cache/
+
+# --- Per-user app state (saved tuning, local folder paths) ---
+saved_parameters.json
+
+# --- Python bytecode / build artifacts ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+*.pyd
+
+# --- Profiling output (kernprof / line_profiler) ---
+*.lprof
+
+# --- Claude Code local settings (machine-specific) ---
+.claude/settings.local.json
+
+# --- Repo-internal docs / design assets (not published to the public repo) ---
+CLAUDE.md
+torch.cuda.md
+ui_tiers.svg
+
+# --- Tooling caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Editors / IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+Thumbs.db
+desktop.ini
+.DS_Store

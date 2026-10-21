@@ -1,0 +1,50 @@
+# =============================================================================
+# Conda environment for the headless Rope CLI.
+#
+# Why this split:
+#   conda owns the *native* dependencies (CUDA runtime, FFmpeg, OpenGL
+#   runtime for OpenCV). Python packages stay on pip so there is exactly
+#   one ONNX Runtime build - mixing conda's onnxruntime with pip's
+#   onnxruntime-gpu is the classic "no CUDAExecutionProvider" trap.
+#
+# Usage:
+#   conda env create -f environment.yml
+#   conda activate rope
+#   pip install -r requirements.txt
+#   python -m rope.cli --models ./models download-models
+#   python tools/check_env.py --models ./models
+#
+# =============================================================================
+
+name: rope
+channels:
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+
+  # FFmpeg: PyAV ships its own build, but the video mux step shells out to
+  # the system ffmpeg, and check_env.py requires libx264.
+  - ffmpeg>=6.1
+
+  # CUDA runtime libraries. The NVIDIA driver is NOT installed by conda;
+  # run nvidia-smi first. The CUDA minor version here must match the pip
+  # wheel channel you install torch from:
+  #   cuda-toolkit 12.8 -> cu128 wheels (driver 570+)
+  #   cuda-toolkit 12.6 -> cu126 wheels (driver 560+)
+  #   cuda-toolkit 12.4 -> cu124 wheels (driver 550+)
+  - cuda-toolkit=12.8
+
+  # Headless OpenCV still links against libGL / libglib even though it
+  # opens no windows, so provide them from conda rather than apt.
+  - libgl
+  - libglib
+
+  # curl is used by the model downloader for resumable transfers.
+  - curl
+
+  # Python packages live in requirements.txt and are installed with pip
+  # inside this environment, so there is exactly one onnxruntime build.
+  - pip

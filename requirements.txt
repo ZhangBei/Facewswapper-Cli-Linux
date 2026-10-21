@@ -1,0 +1,40 @@
+# =============================================================================
+# Rope (headless CLI) - runtime dependencies.
+#
+# Target: Ubuntu 24.04 + NVIDIA GPU. The GUI stack (PySide6 / PyOpenGL /
+# cuda-python) and the Windows-only capture stack (mss / bettercam /
+# dxcam) were removed along with the Qt frontend - nothing imports them.
+#
+# Install with the CUDA-aware helper:
+#   python tools/install.py cu128
+#   python tools/check_env.py --models ./models
+#
+# The cu128 wheels need an NVIDIA driver that supports CUDA 12.8
+# (driver 570+). On an older driver, use the cu126 or cu124 index URL
+# instead - the code does not care which CUDA minor version is present.
+#
+# Model ONNX files are NOT pip-installable. Place them in the models
+# folder: det_10g.onnx, w600k_r50.onnx, inswapper_128.fp16.onnx (minimum).
+# =============================================================================
+
+# --- Core runtime -----------------------------------------------------------
+numpy>=1.26
+onnxruntime-gpu>=1.20
+onnx>=1.16
+opencv-python-headless>=4.9      # headless: no libGL / Qt GUI deps
+scikit-image>=0.22
+pillow>=10.0
+
+# --- Video -------------------------------------------------------------------
+av>=13.0                          # PyAV: demux + decode (CPU)
+# torchcodec>=0.4                 # optional: GPU-resident video decode
+# pynvvideocodec>=2.1             # optional: alternative NVDEC binding
+
+# --- Optional: TensorRT backend (--backend trt) ---------------------------
+# The default path uses the ONNX Runtime CUDA ExecutionProvider and does
+# not need TensorRT. Linux TensorRT wheels are not interchangeable with
+# the Windows ones - install them separately if you want --backend trt.
+# tensorrt
+
+# --- Optional: bundled ffmpeg fallback ------------------------------------
+# imageio-ffmpeg>=0.4
