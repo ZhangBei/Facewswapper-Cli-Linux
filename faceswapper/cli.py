@@ -1,26 +1,26 @@
-"""Command-line entry point for headless Rope.
+"""Command-line entry point for headless Faceswapper.
 
 Image:
 
-    python -m rope.cli swap \
+    python -m faceswapper.cli swap \
         --source face.jpg --target target.jpg --output out.png
 
-    python -m rope.cli swap \
+    python -m faceswapper.cli swap \
         --source face.jpg --target-dir ./targets --output-dir ./out
 
 Video (one source identity, every face):
 
-    python -m rope.cli video \
+    python -m faceswapper.cli video \
         --source face.jpg --target clip.mp4 --output out.mp4
 
 Inspection:
 
-    python -m rope.cli inspect --target target.jpg
+    python -m faceswapper.cli inspect --target target.jpg
 
 Models:
 
-    python -m rope.cli download-models
-    python -m rope.cli check-models
+    python -m faceswapper.cli download-models
+    python -m faceswapper.cli check-models
 """
 
 from __future__ import annotations
@@ -31,8 +31,8 @@ import sys
 import traceback
 from typing import Any
 
-from rope.errors import HeadlessError
-from rope.model_store import (
+from faceswapper.errors import HeadlessError
+from faceswapper.model_store import (
     BASE_MODELS,
     DEFAULT_PROVIDERS,
     MODEL_SPECS,
@@ -42,12 +42,12 @@ from rope.model_store import (
     inspect_models,
     specs_for_names,
 )
-from rope.parameters import PARAMETER_BY_NAME
-from rope.parameters_io import load as load_params
+from faceswapper.parameters import PARAMETER_BY_NAME
+from faceswapper.parameters_io import load as load_params
 
 
 # Image extensions the CLI accepts for source faces and target images.
-# Kept here (instead of in rope.headless) so the argument parser and the
+# Kept here (instead of in faceswapper.headless) so the argument parser and the
 # --help text work without OpenCV / torch installed.
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {
@@ -56,14 +56,14 @@ VIDEO_EXTENSIONS = {
 
 
 def _headless():
-    """Import rope.headless lazily.
+    """Import faceswapper.headless lazily.
 
     The heavy deps (OpenCV, torch, ONNX Runtime) are only needed once a
     command actually swaps something, so `--help` and `params` stay
     usable on a machine that has not finished installing the runtime.
     """
     try:
-        from rope import headless
+        from faceswapper import headless
     except ImportError as exc:
         raise HeadlessError(
             f"missing runtime dependency: {exc}\n"
@@ -363,7 +363,7 @@ def _cmd_check_models(args: argparse.Namespace) -> int:
         )
         raise HeadlessError(
             f"invalid model(s): {', '.join(spec.local_name for spec in invalid)}\n"
-            f"repair with: python -m rope.cli --models {args.models} "
+            f"repair with: python -m faceswapper.cli --models {args.models} "
             f"download-models {repair_args}"
         )
     if not args.quick:
@@ -373,8 +373,8 @@ def _cmd_check_models(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="rope",
-        description="Headless Rope - command-line face swapping.",
+        prog="faceswapper",
+        description="Faceswapper - command-line face swapping.",
     )
     parser.add_argument(
         "--models",

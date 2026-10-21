@@ -1,4 +1,4 @@
-# ===================== Rope-Pearl =====================
+# ===================== Faceswapper-Cli =====================
 # Keep the repo to source only. Model weights, the venv, caches, and
 # per-user app state are all provided/generated locally, not committed.
 
@@ -10,7 +10,7 @@ ENV/
 
 # --- Model weights / ONNX / TRT engines (many GB; provided separately) ---
 models/
-.rope-models.json
+.faceswapper-models.json
 *.part
 # Safety net for weights or engines placed anywhere outside models/:
 *.onnx

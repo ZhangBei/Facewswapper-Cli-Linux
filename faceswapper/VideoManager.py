@@ -7,8 +7,8 @@ import numpy as np
 from skimage import transform as trans
 from math import floor, ceil
 
-from rope.parameters import default_values, seed_control_dict
-from rope._nvtx import nvtx_range
+from faceswapper.parameters import default_values, seed_control_dict
+from faceswapper._nvtx import nvtx_range
 
 
 import onnxruntime

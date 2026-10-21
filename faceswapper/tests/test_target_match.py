@@ -3,7 +3,7 @@
 Exercises the similarity filter used by video mode to decide whether a
 detected face belongs to the person the user asked to replace.
 
-    python -m rope.tests.test_target_match
+    python -m faceswapper.tests.test_target_match
 """
 
 from __future__ import annotations
@@ -14,10 +14,10 @@ import numpy as np
 
 
 def _cosine_similarity_pct(a: np.ndarray, b: np.ndarray) -> float:
-    """Copy of rope.headless._cosine_similarity_pct.
+    """Copy of faceswapper.headless._cosine_similarity_pct.
 
     Duplicated here so this test runs without OpenCV / torch installed.
-    If the formula in rope/headless.py changes, update it here too.
+    If the formula in faceswapper/headless.py changes, update it here too.
     """
     denom = float(np.linalg.norm(a) * np.linalg.norm(b))
     if denom == 0:
@@ -86,7 +86,7 @@ def test_threshold_separates_identities() -> None:
 
 
 def main() -> int:
-    print("rope target-person matching tests")
+    print("faceswapper target-person matching tests")
     test_identical_is_100()
     test_orthogonal_is_50()
     test_opposite_is_0()

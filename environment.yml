@@ -1,5 +1,5 @@
 # =============================================================================
-# Conda environment for the headless Rope CLI.
+# Conda environment for the headless Faceswapper CLI.
 #
 # Why this split:
 #   conda owns the *native* dependencies (CUDA runtime, FFmpeg, OpenGL
@@ -9,14 +9,14 @@
 #
 # Usage:
 #   conda env create -f environment.yml
-#   conda activate rope
+#   conda activate faceswapper
 #   pip install -r requirements.txt
-#   python -m rope.cli --models ./models download-models
+#   python -m faceswapper.cli --models ./models download-models
 #   python tools/check_env.py --models ./models
 #
 # =============================================================================
 
-name: rope
+name: faceswapper
 channels:
   - nvidia
   - conda-forge

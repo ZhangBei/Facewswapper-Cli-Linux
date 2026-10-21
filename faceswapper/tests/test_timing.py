@@ -4,7 +4,7 @@ The encoder normalises the first frame to 0 while keeping the original
 spacing between frames, then the mux step re-applies the source start
 offset. These tests pin down that arithmetic.
 
-    python -m rope.tests.test_timing
+    python -m faceswapper.tests.test_timing
 """
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ def test_time_base_is_not_frame_rate() -> None:
 
 
 def main() -> int:
-    print("rope video timing tests")
+    print("faceswapper video timing tests")
     test_cfr_spacing_preserved()
     test_vfr_spacing_preserved()
     test_nonzero_start_normalised()

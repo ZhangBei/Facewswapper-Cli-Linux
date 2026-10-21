@@ -8,8 +8,8 @@ import tempfile
 from dataclasses import replace
 from pathlib import Path
 
-from rope.errors import HeadlessError
-from rope.model_store import (
+from faceswapper.errors import HeadlessError
+from faceswapper.model_store import (
     BASE_MODELS,
     MODEL_SPECS,
     build_download_url,
@@ -128,7 +128,7 @@ def test_ensure_allows_offline_failure() -> None:
 
 
 def main() -> int:
-    print("rope model store tests")
+    print("faceswapper model store tests")
     test_inventory_is_complete()
     test_provider_urls()
     test_missing_and_corrupt_detection()

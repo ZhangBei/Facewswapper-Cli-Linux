@@ -220,7 +220,7 @@ def check_models(models_dir: str) -> str | None:
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
-    from rope.model_store import MODEL_SPECS, inspect_models
+    from faceswapper.model_store import MODEL_SPECS, inspect_models
 
     statuses = inspect_models(models_dir, MODEL_SPECS, verify=True)
     invalid_required = [
@@ -261,8 +261,8 @@ def check_cli_import() -> str | None:
     if repo_root not in sys.path:
         sys.path.insert(0, repo_root)
     try:
-        import rope.cli  # noqa: F401
-        import rope.headless  # noqa: F401
+        import faceswapper.cli  # noqa: F401
+        import faceswapper.headless  # noqa: F401
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"
     return None
@@ -270,7 +270,7 @@ def check_cli_import() -> str | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Pre-flight check for the Rope headless CLI environment."
+        description="Pre-flight check for the Faceswapper headless CLI environment."
     )
     parser.add_argument(
         "--models", default="./models",
@@ -278,7 +278,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    print("Rope environment check")
+    print("Faceswapper environment check")
     print(f"  python: {sys.version.split()[0]}  ({sys.executable})")
     print(f"  models: {os.path.abspath(args.models)}")
     conda_env = detect_conda()
@@ -311,7 +311,7 @@ def main() -> int:
     check(
         "model files", lambda: check_models(args.models),
         (
-            "run: python -m rope.cli --models "
+            "run: python -m faceswapper.cli --models "
             f"{args.models} download-models"
         ),
     )

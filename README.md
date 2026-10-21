@@ -1,4 +1,4 @@
-# Rope 无界面换脸 CLI
+# Faceswapper 无界面换脸 CLI
 
 基于 insightface `inswapper` 模型的命令行换脸工具，面向 **Ubuntu +
 NVIDIA GPU** 的云端/服务器环境。没有图形界面，不需要桌面环境，通过 SSH
@@ -44,22 +44,22 @@ bash /tmp/miniconda.sh -b -p "$HOME/miniconda3"
 source "$HOME/miniconda3/bin/activate"
 
 # 2. 创建 conda 环境（含 CUDA、FFmpeg、libGL）
-cd /path/to/Rope-Rope-Bronze
+cd /path/to/Faceswapper-Cli
 conda env create -f environment.yml
-conda activate rope
+conda activate faceswapper
 python -m pip install --upgrade pip
 
 # 3. 安装 CUDA Python 运行时（驱动较旧时改用 cu126 或 cu124）
 python tools/install.py cu128
 
 # 4. 下载并校验模型（可省略，首次换脸会自动下载）
-python -m rope.cli --models ./models download-models
+python -m faceswapper.cli --models ./models download-models
 
 # 5. 环境自检
 python tools/check_env.py --models ./models
 
 # 6. 图片换脸
-python -m rope.cli --models ./models swap \
+python -m faceswapper.cli --models ./models swap \
     --source face.jpg \
     --target target.jpg \
     --output out.jpg
@@ -140,9 +140,9 @@ source "$HOME/miniconda3/bin/activate"
 OpenCV 所需的 `libGL`：
 
 ```bash
-cd /path/to/Rope-Rope-Bronze
+cd /path/to/Faceswapper-Cli
 conda env create -f environment.yml
-conda activate rope
+conda activate faceswapper
 python -m pip install --upgrade pip
 ```
 
@@ -202,7 +202,7 @@ python tools/install.py cu128 --skip-torch
 sudo apt update
 sudo apt install -y python3.11-venv ffmpeg curl libgl1 libglib2.0-0
 
-cd /path/to/Rope-Rope-Bronze
+cd /path/to/Faceswapper-Cli
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -221,7 +221,7 @@ ONNX 模型不能通过 `pip install` 安装。项目现在提供自动下载器
 ### 3.1 自动下载基础模型
 
 ```bash
-python -m rope.cli --models ./models download-models
+python -m faceswapper.cli --models ./models download-models
 ```
 
 默认下载并校验以下 3 个模型：
@@ -246,7 +246,7 @@ python -m rope.cli --models ./models download-models
 按指定顺序下载：
 
 ```bash
-python -m rope.cli --models ./models download-models \
+python -m faceswapper.cli --models ./models download-models \
     --provider hf-mirror \
     --provider github
 ```
@@ -254,7 +254,7 @@ python -m rope.cli --models ./models download-models \
 显式指定只使用一个来源：
 
 ```bash
-python -m rope.cli --models ./models download-models \
+python -m faceswapper.cli --models ./models download-models \
     --provider github
 ```
 
@@ -263,21 +263,21 @@ python -m rope.cli --models ./models download-models \
 GFPGAN 人脸修复：
 
 ```bash
-python -m rope.cli --models ./models download-models \
+python -m faceswapper.cli --models ./models download-models \
     --model gfpgan
 ```
 
 SCRFD 备用人脸检测器：
 
 ```bash
-python -m rope.cli --models ./models download-models \
+python -m faceswapper.cli --models ./models download-models \
     --model scrfd
 ```
 
 也可以同时指定：
 
 ```bash
-python -m rope.cli --models ./models download-models \
+python -m faceswapper.cli --models ./models download-models \
     --model gfpgan \
     --model scrfd \
     --provider huggingface
@@ -306,13 +306,13 @@ python -m rope.cli --models ./models download-models \
 完整计算并校验 SHA-256：
 
 ```bash
-python -m rope.cli --models ./models check-models
+python -m faceswapper.cli --models ./models check-models
 ```
 
 使用文件大小和本地缓存快速检查：
 
 ```bash
-python -m rope.cli --models ./models check-models --quick
+python -m faceswapper.cli --models ./models check-models --quick
 ```
 
 输出：
@@ -323,7 +323,7 @@ valid    w600k_r50.onnx             166.3 MiB  ArcFace recognition
 valid    inswapper_128.fp16.onnx     264.8 MiB  Inswapper 128 face swapper
 ```
 
-校验结果缓存在 `models/.rope-models.json`。文件内容、大小或修改时间变化时会
+校验结果缓存在 `models/.faceswapper-models.json`。文件内容、大小或修改时间变化时会
 重新计算 SHA-256。
 
 ### 3.5 首次换脸自动下载
@@ -334,7 +334,7 @@ valid    inswapper_128.fp16.onnx     264.8 MiB  Inswapper 128 face swapper
 禁用自动下载：
 
 ```bash
-python -m rope.cli --no-auto-download --models ./models swap \
+python -m faceswapper.cli --no-auto-download --models ./models swap \
     --source face.jpg --target target.jpg --output out.jpg
 ```
 
@@ -382,7 +382,7 @@ all checks passed
 ### 5.1 最基础命令
 
 ```bash
-python -m rope.cli --models ./models swap \
+python -m faceswapper.cli --models ./models swap \
     --source face.jpg \
     --target target.jpg \
     --output out.png
@@ -393,7 +393,7 @@ python -m rope.cli --models ./models swap \
 只替换最大的一张脸：
 
 ```bash
-python -m rope.cli --models ./models swap \
+python -m faceswapper.cli --models ./models swap \
     --source face.jpg \
     --target target.jpg \
     --output out.jpg \
@@ -403,7 +403,7 @@ python -m rope.cli --models ./models swap \
 ### 5.2 低显存配置
 
 ```bash
-python -m rope.cli --models ./models swap \
+python -m faceswapper.cli --models ./models swap \
     --source face.jpg \
     --target target.jpg \
     --output out.jpg \
@@ -415,7 +415,7 @@ python -m rope.cli --models ./models swap \
 ### 5.3 最快配置
 
 ```bash
-python -m rope.cli --models ./models swap \
+python -m faceswapper.cli --models ./models swap \
     --source face.jpg \
     --target target.jpg \
     --output out.jpg \
@@ -436,7 +436,7 @@ python -m rope.cli --models ./models swap \
 ### 5.4 多张源脸合并
 
 ```bash
-python -m rope.cli --models ./models swap \
+python -m faceswapper.cli --models ./models swap \
     --source face1.jpg \
     --source face2.jpg \
     --target target.jpg \
@@ -449,7 +449,7 @@ python -m rope.cli --models ./models swap \
 ### 5.5 批量处理
 
 ```bash
-python -m rope.cli --models ./models swap \
+python -m faceswapper.cli --models ./models swap \
     --source ./faces \
     --target-dir ./targets \
     --output-dir ./output
@@ -460,7 +460,7 @@ python -m rope.cli --models ./models swap \
 ### 5.6 检测目标图片中的脸
 
 ```bash
-python -m rope.cli --models ./models inspect --target target.jpg
+python -m faceswapper.cli --models ./models inspect --target target.jpg
 ```
 
 ---
@@ -478,7 +478,7 @@ python -m rope.cli --models ./models inspect --target target.jpg
 | 目标视频 | `--target` | 待处理视频 |
 
 ```bash
-python -m rope.cli --models ./models video \
+python -m faceswapper.cli --models ./models video \
     --source new_face.jpg \
     --target-face person_in_video.jpg \
     --target input.mp4 \
@@ -497,7 +497,7 @@ python -m rope.cli --models ./models video \
 可以传多张目标人物参考图：
 
 ```bash
-python -m rope.cli --models ./models video \
+python -m faceswapper.cli --models ./models video \
     --source new_face.jpg \
     --target-face person_front.jpg \
     --target-face person_side.jpg \
@@ -508,7 +508,7 @@ python -m rope.cli --models ./models video \
 ### 6.2 匹配阈值
 
 ```bash
-python -m rope.cli --models ./models video \
+python -m faceswapper.cli --models ./models video \
     --source new_face.jpg \
     --target-face person.jpg \
     --target input.mp4 \
@@ -524,7 +524,7 @@ python -m rope.cli --models ./models video \
 ### 6.3 替换视频中所有人脸
 
 ```bash
-python -m rope.cli --models ./models video \
+python -m faceswapper.cli --models ./models video \
     --source new_face.jpg \
     --target input.mp4 \
     --output output.mp4
@@ -533,7 +533,7 @@ python -m rope.cli --models ./models video \
 ### 6.4 低显存配置
 
 ```bash
-python -m rope.cli --models ./models video \
+python -m faceswapper.cli --models ./models video \
     --source new_face.jpg \
     --target-face person_in_video.jpg \
     --target input.mp4 \
@@ -547,7 +547,7 @@ python -m rope.cli --models ./models video \
 ### 6.5 最快配置
 
 ```bash
-python -m rope.cli --models ./models video \
+python -m faceswapper.cli --models ./models video \
     --source new_face.jpg \
     --target-face person_in_video.jpg \
     --target input.mp4 \
@@ -576,7 +576,7 @@ ffmpeg -i input.mp4 -vf scale=-2:720 \
 `--every-nth 20` 只用于验证链路，并不是完整的逐帧换脸结果：
 
 ```bash
-python -m rope.cli --models ./models video \
+python -m faceswapper.cli --models ./models video \
     --source new_face.jpg \
     --target test.mp4 \
     --output test_out.mp4 \
@@ -600,7 +600,7 @@ python -m rope.cli --models ./models video \
 全局参数必须写在子命令前面：
 
 ```bash
-python -m rope.cli \
+python -m faceswapper.cli \
     --models /data/models \
     --model-provider hf-mirror \
     video --help
@@ -628,7 +628,7 @@ python -m rope.cli \
 查看所有参数默认值：
 
 ```bash
-python -m rope.cli params
+python -m faceswapper.cli params
 ```
 
 ---
@@ -650,7 +650,7 @@ SHA-256 校验。
 使用镜像：
 
 ```bash
-python -m rope.cli --models ./models download-models \
+python -m faceswapper.cli --models ./models download-models \
     --provider hf-mirror \
     --provider github
 ```
@@ -718,13 +718,13 @@ ffmpeg -i input.mp4 -fps_mode cfr -r 30 \
 ### 8.9 如何强制重新下载模型
 
 ```bash
-python -m rope.cli --models ./models download-models --force
+python -m faceswapper.cli --models ./models download-models --force
 ```
 
 只强制某个模型：
 
 ```bash
-python -m rope.cli --models ./models download-models \
+python -m faceswapper.cli --models ./models download-models \
     --model inswapper \
     --force
 ```
@@ -760,10 +760,10 @@ python -c "import onnxruntime as ort; print(ort.get_available_providers())"
 
 ```bash
 conda deactivate
-conda env remove -n rope
+conda env remove -n faceswapper
 sed -i 's/cuda-toolkit=12.8/cuda-toolkit=12.6/' environment.yml
 conda env create -f environment.yml
-conda activate rope
+conda activate faceswapper
 python tools/install.py cu126
 ```
 
@@ -789,7 +789,7 @@ python tools/install.py cu126
 ## 9. 项目结构
 
 ```text
-rope/
+faceswapper/
   cli.py             CLI 入口
   model_store.py     模型清单、下载和 SHA-256 校验
   headless.py        图片和视频换脸管线
@@ -818,10 +818,10 @@ python -m pytest -q
 也可以直接运行：
 
 ```bash
-python -m rope.tests.test_cli
-python -m rope.tests.test_model_store
-python -m rope.tests.test_target_match
-python -m rope.tests.test_timing
+python -m faceswapper.tests.test_cli
+python -m faceswapper.tests.test_model_store
+python -m faceswapper.tests.test_target_match
+python -m faceswapper.tests.test_timing
 ```
 
 ---

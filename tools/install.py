@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the Rope CUDA runtime without relying on GUI dependencies."""
+"""Install the Faceswapper CUDA runtime without GUI dependencies."""
 
 from __future__ import annotations
 
@@ -45,7 +45,7 @@ def run(command: list[str], *, dry_run: bool) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Install CUDA PyTorch, ONNX Runtime GPU, and the headless Rope "
+            "Install CUDA PyTorch, ONNX Runtime GPU, and the headless Faceswapper "
             "dependencies."
         )
     )
@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
 
     pip = [sys.executable, "-m", "pip"]
     print(
-        f"Rope CUDA installer: {args.cuda} "
+        f"Faceswapper CUDA installer: {args.cuda} "
         f"(NVIDIA driver {cuda['driver']} or newer)"
     )
 

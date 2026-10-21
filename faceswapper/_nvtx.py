@@ -7,7 +7,7 @@ bands instead of an undifferentiated kernel timeline.
 
 Usage:
 
-    from rope._nvtx import nvtx_range
+    from faceswapper._nvtx import nvtx_range
 
     with nvtx_range("swap_core"):
         ...

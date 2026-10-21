@@ -23,7 +23,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from rope.parameters import PARAMETER_BY_NAME, SelectParam
+from faceswapper.parameters import PARAMETER_BY_NAME, SelectParam
 
 
 def _coerce(name: str, value: Any) -> Any:

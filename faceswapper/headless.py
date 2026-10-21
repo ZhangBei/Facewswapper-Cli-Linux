@@ -9,7 +9,7 @@ module provides the equivalent batch paths:
     video:  decode frame -> swap every face -> encode -> mux audio
 
 The heavy lifting is shared: detection, recognition and the actual swap
-all go through rope.Models and VideoManager, so the CLI produces the
+all go through faceswapper.Models and VideoManager, so the CLI produces the
 same pixels as the desktop app for the same parameters.
 """
 
@@ -26,10 +26,10 @@ import cv2
 import numpy as np
 import torch
 
-from rope.EmbeddingMerge import combine
-from rope.errors import HeadlessError
-from rope.Models import Models
-from rope.VideoManager import VideoManager
+from faceswapper.EmbeddingMerge import combine
+from faceswapper.errors import HeadlessError
+from faceswapper.Models import Models
+from faceswapper.VideoManager import VideoManager
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
@@ -100,7 +100,7 @@ class _SwapperBase:
         self.models.set_models_folder(options.models_folder)
         if options.backend == "cuda":
             # "onnx" here means the plain CUDA ExecutionProvider path in
-            # rope.Models, not the CPU provider. Naming is inherited from
+            # faceswapper.Models, not the CPU provider. Naming is inherited from
             # the GUI's per-model backend toggle.
             for attr in ("swapper_model", "retinaface_model", "recognition_model"):
                 self.models.set_backend_preference(attr, "onnx", unload=False)
@@ -422,7 +422,7 @@ class VideoSwapper(_SwapperBase):
             if out_dir:
                 os.makedirs(out_dir, exist_ok=True)
 
-            with tempfile.TemporaryDirectory(prefix="rope-video-") as tmp:
+            with tempfile.TemporaryDirectory(prefix="faceswapper-video-") as tmp:
                 silent = os.path.join(tmp, "silent.mp4")
                 first_pts = self._encode_video(
                     av, container, stream, silent, width, height, fps,

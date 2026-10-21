@@ -14,7 +14,7 @@ from itertools import product as product
 import subprocess as sp
 import threading
 
-from rope._nvtx import nvtx_range
+from faceswapper._nvtx import nvtx_range
 onnxruntime.set_default_logger_severity(4)
 
 
@@ -226,7 +226,7 @@ class Models():
             return
         self.models_folder = new_folder
         try:
-            from rope import TensorRTEngine as TRT
+            from faceswapper import TensorRTEngine as TRT
             TRT.set_models_folder(new_folder)
         except Exception:
             # TRT is optional — silently skip if it can't be updated.
@@ -846,7 +846,7 @@ class Models():
         _swapper_uses_trt flag reflects reality, not the request."""
         # Defensive: clamp the env-level Default logger severity right
         # before we create the session. ORT_LOG_SEVERITY_LEVEL is set in
-        # rope/_native_dlls.py before ORT imports, but if ORT was somehow
+        # faceswapper/_native_dlls.py before ORT imports, but if ORT was somehow
         # imported earlier (transitive site-packages import, hot reload)
         # the Env logger may have been created at INFO. Re-asserting via
         # the in-process API silences the BFCArena chatter that

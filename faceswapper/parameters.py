@@ -1,6 +1,6 @@
 """Typed parameter schema for the headless CLI.
 
-Every entry maps to a key that rope.VideoManager reads out of
+Every entry maps to a key that faceswapper.VideoManager reads out of
 `self.parameters`. The on-disk format is unchanged: `saved_parameters.json`
 stays a flat {name: value} mapping, so a file exported from the original
 desktop GUI still loads here.
@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Literal
 
-from rope._default_data import DEFAULT_DATA
+from faceswapper._default_data import DEFAULT_DATA
 
 
 ParameterKind = Literal["slider", "switch", "select", "entry"]

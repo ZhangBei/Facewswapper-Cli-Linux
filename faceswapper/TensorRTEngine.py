@@ -9,7 +9,7 @@ hand-built engine path left in the runtime. What remains in this module is:
   * the models-folder path constants + set_models_folder() rebinding that
     Models.set_models_folder() calls, and
   * _patch_inswapper_for_dynamic_batch(), reused by
-    rope/scripts/probe_inswapper_fp16.py so its probe engine has the same
+    faceswapper/scripts/probe_inswapper_fp16.py so its probe engine has the same
     dynamic-batch I/O semantics as the production ORT-TRT-EP engine.
 
 (The LivePortrait TRT path — grid_sample_3d plugin, hand-built LP engines,
@@ -17,7 +17,7 @@ TRTRunner, LivePortraitTRT — was removed when the LivePortrait feature was
 dropped.)
 
 The `onnx` package is imported lazily inside the function so that
-`import rope.TensorRTEngine` is safe even where it isn't installed.
+`import faceswapper.TensorRTEngine` is safe even where it isn't installed.
 """
 
 import os

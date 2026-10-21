@@ -1,6 +1,6 @@
 """Default values for the headless CLI parameters.
 
-The schema lives in rope/parameters.py; this module holds the raw values
+The schema lives in faceswapper/parameters.py; this module holds the raw values
 it resolves against. Only parameters the CLI can honour are present - the
 GUI-only entries (icons, buttons, timeline and capture controls) were
 removed along with the Qt frontend.

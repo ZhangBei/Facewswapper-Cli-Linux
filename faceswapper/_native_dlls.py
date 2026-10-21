@@ -21,8 +21,8 @@ Idempotent and safe to call repeatedly. On non-Windows platforms it's a
 no-op — Linux/macOS rely on rpath / LD_LIBRARY_PATH which the wheel
 packaging sets up correctly.
 
-Importing `rope` (or any submodule) triggers the bootstrap via
-`rope/__init__.py`, so the app, the test scripts, and the bisection
+Importing `faceswapper` (or any submodule) triggers the bootstrap via
+`faceswapper/__init__.py`, so the app, the test scripts, and the bisection
 probe all benefit without each one having to remember to call it.
 
 Curated package list
@@ -99,7 +99,7 @@ def ensure_native_dll_search_path() -> list[str]:
         # Print once at startup so the user can confirm. Quiet if no
         # packages were found — the user might intentionally not have
         # TRT installed and ORT will route to CUDA EP transparently.
-        print('[rope] native DLL search path: added '
+        print('[faceswapper] native DLL search path: added '
               + ', '.join(os.path.basename(p) for p in added))
 
     return added

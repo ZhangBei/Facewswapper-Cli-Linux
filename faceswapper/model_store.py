@@ -17,10 +17,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
-from rope.errors import HeadlessError
+from faceswapper.errors import HeadlessError
 
 
-CACHE_FILE = ".rope-models.json"
+CACHE_FILE = ".faceswapper-models.json"
 DEFAULT_PROVIDERS = ("huggingface", "hf-mirror", "github")
 PROVIDER_LABELS = {
     "github": "GitHub Release",
@@ -302,7 +302,7 @@ def _download_with_urllib(
         existing_size = 0
 
     headers = {
-        "User-Agent": "Rope-CLI-model-downloader/1.0",
+        "User-Agent": "Faceswapper-CLI-model-downloader/1.0",
     }
     if existing_size:
         headers["Range"] = f"bytes={existing_size}-"

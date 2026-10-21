@@ -1,5 +1,5 @@
 # =============================================================================
-# Rope (headless CLI) - runtime dependencies.
+# Faceswapper (headless CLI) - runtime dependencies.
 #
 # Target: Ubuntu 24.04 + NVIDIA GPU. The GUI stack (PySide6 / PyOpenGL /
 # cuda-python) and the Windows-only capture stack (mss / bettercam /

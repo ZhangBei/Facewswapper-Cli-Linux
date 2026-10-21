@@ -3,7 +3,7 @@
 These run without a GPU, without ONNX models and without OpenCV, so they
 can be used as a quick smoke test after a fresh clone:
 
-    python -m rope.tests.test_cli
+    python -m faceswapper.tests.test_cli
 """
 
 from __future__ import annotations
@@ -13,17 +13,17 @@ import sys
 import tempfile
 from pathlib import Path
 
-from rope.cli import (
+from faceswapper.cli import (
     VIDEO_EXTENSIONS,
     _collect_sources,
     _collect_targets,
     _parameter_overrides,
     build_parser,
 )
-from rope.errors import HeadlessError
-from rope.parameters import PARAMETER_BY_NAME, default_values, seed_control_dict
-from rope.parameters_io import load as load_params
-from rope.parameters_io import save as save_params
+from faceswapper.errors import HeadlessError
+from faceswapper.parameters import PARAMETER_BY_NAME, default_values, seed_control_dict
+from faceswapper.parameters_io import load as load_params
+from faceswapper.parameters_io import save as save_params
 
 
 def fail(msg: str) -> None:
@@ -205,7 +205,7 @@ def test_headless_error_is_raisable() -> None:
 
 
 def main() -> int:
-    print("rope headless CLI tests")
+    print("faceswapper headless CLI tests")
     test_parser_subcommands()
     test_parser_accepts_documented_flags()
     test_collect_expands_folders()
