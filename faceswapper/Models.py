@@ -21,13 +21,11 @@ onnxruntime.set_default_logger_severity(4)
 DEFAULT_MODELS_FOLDER = './models'
 
 
-# Inventory of model files the application can load from the models
-# folder. Used by the Settings tab to show which files are present /
-# missing so the user can verify a freshly-picked folder is complete.
-# Each entry: (filename, human-readable role, required-for-basic-swap?).
-# Required = True means a baseline swap won't work without it; optional
-# entries are tied to specific features (alternate detector, restorer,
-# occlusion masking, etc.).
+# 本应用可从 models folder 加载的模型文件清单。Settings tab 用它展示哪些
+# 文件在、哪些缺失，方便用户在选定一个文件夹后确认它是完整的。
+# 每条记录: (filename, human-readable role, required-for-basic-swap?)。
+# required = True 表示没有它连一次基础换脸都跑不了；False 的条目各自
+# 绑定一个具体功能（备用 detector、restorer、遮挡 mask 等）。
 MODEL_INVENTORY = (
     ('det_10g.onnx',              'RetinaFace detector',                True),
     ('scrfd_2.5g_bnkps.onnx',     'SCRFD detector (alt)',               False),
@@ -44,20 +42,18 @@ MODEL_INVENTORY = (
 )
 
 
-# Per-inventory-row metadata used by the Settings tab to render Loaded /
-# TRT columns and the per-model Unload button. Keys are the source ONNX
-# filename (same as MODEL_INVENTORY[i][0]).
+# Settings tab 用它渲染 Loaded / TRT 两列和每个模型的 Unload 按钮。键是
+# 源 ONNX 文件名（与 MODEL_INVENTORY[i][0] 相同）。
 #
-#   models_attr: the Models attribute name set on load; `is_model_loaded`
-#                / `unload_model` accept this string. None = the row
-#                doesn't correspond to a tracked Models slot, so the row
-#                shows no Loaded state or Unload button.
+#   models_attr: 加载时被赋值的 Models 属性名；`is_model_loaded` /
+#                `unload_model` 接受这个字符串。None 表示这一行不对应
+#                任何被跟踪的 Models slot，因此该行不显示 Loaded 状态，
+#                也没有 Unload 按钮。
 #
-#   trt_engine:  filename of the TRT engine built from this ONNX (sits
-#                next to the ONNX in the models folder), or None if no
-#                TRT path exists. The "Build TensorRT" button covers the
-#                identity / detect / recognize set: inswapper_128,
-#                inswapper_512, retinaface (det_10g), arcface (w600k_r50).
+#   trt_engine:  由该 ONNX 构建出的 TRT engine 文件名（与 ONNX 同目录），
+#                没有 TRT 路径时为 None。"Build TensorRT" 按钮覆盖的是
+#                identity / detect / recognize 这一组: inswapper_128、
+#                inswapper_512、retinaface (det_10g)、arcface (w600k_r50)。
 MODEL_INVENTORY_DETAILS = {
     'det_10g.onnx':              {'models_attr': 'retinaface_model',  'trt_engine': 'det_10g.engine'},
     'scrfd_2.5g_bnkps.onnx':     {'models_attr': 'scrdf_model',       'trt_engine': None},
@@ -74,14 +70,13 @@ MODEL_INVENTORY_DETAILS = {
 }
 
 class Models():
-    # Attribute names whose (re)assignment indicates VRAM has changed.
-    # __setattr__ flips vram_dirty whenever any of these is written, so
-    # the Qt coordinator can emit vram_updated on the next tick without
-    # any call-site instrumentation at the ~15 lazy load points.
+    # 这些属性名被（重新）赋值即代表 VRAM 发生了变化。__setattr__ 在写入
+    # 其中任何一个时把 vram_dirty 置位，Qt coordinator 于是可以在下一个
+    # tick 发出 vram_updated，无需在约 15 处懒加载点逐个加埋点。
     _VRAM_TRACKED_ATTRS = frozenset([
         'retinaface_model', 'scrdf_model', 'resnet50_model',
         'recognition_model', 'swapper_model',
-        'swapper_512_model', 'swapper_256_model',
+        'swapper_512_model', 'swapper_256_model', 'hyperswap_model',
         'GFPGAN_model', 'GPEN_256_model', 'GPEN_512_model', 'codeformer_model',
         'occluder_model', 'faceparser_model', 'dfl_xseg_model',
     ])
@@ -92,9 +87,9 @@ class Models():
             object.__setattr__(self, 'vram_dirty', True)
 
     def __init__(self):
-        # Models folder — the directory all *.onnx / *.engine / *.pth
-        # files are resolved against. Override via set_models_folder()
-        # (driven from the Settings tab's "Models Folder" picker).
+        # models folder —— 所有 *.onnx / *.engine / *.pth 都相对它解析。
+        # 通过 set_models_folder() 覆盖（由 Settings tab 的 "Models
+        # Folder" 选择器驱动）。
         self.models_folder = DEFAULT_MODELS_FOLDER
 
         self.arcface_dst = np.array( [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float32)
@@ -106,15 +101,19 @@ class Models():
 
         self.recognition_model = []
         self.swapper_model = []
-        # inswapper_512: parallel 512x512-in/512x512-out variant. Loaded
-        # lazily on first run_swapper_512 call; same source conditioning
-        # format as the 128 model, so calc_swapper_latent's `latent`
-        # works for both.
+        # inswapper_512: 与之并列的 512x512 进 / 512x512 出变体。首次
+        # run_swapper_512 调用时懒加载；source conditioning 格式与 128
+        # 相同，所以 calc_swapper_latent 的 `latent` 对它同样适用。
         self.swapper_512_model = []
-        # inswapper_256_phase1: native 256x256 single-pass variant. Same
-        # emap-projected latent as 128/512; loaded lazily on first
-        # run_swapper_256 call (only when the "256-Native" mode is chosen).
+        # inswapper_256_phase1: 原生 256x256 单次 pass 变体。与 128/512
+        # 一样吃 emap 投影后的 latent；只在选中 "256-Native" 模式后，首次
+        # run_swapper_256 调用时懒加载。
         self.swapper_256_model = []
+        # hyperswap_1a_256: 原生 256x256 单次 pass 的 HyperSwap 生成器。
+        # 吃的是 raw L2-normalized 512-d embedding（不经 emap），且要求
+        # 裁剪图按 (x/255 - 0.5) / 0.5 归一化到 [-1, 1]。首次
+        # run_hyperswap 调用时懒加载。
+        self.hyperswap_model = []
 
         self.emap = []
         self.GFPGAN_model = []
@@ -124,12 +123,11 @@ class Models():
         
         self.occluder_model = []
         self.faceparser_model = []
-        # DeepFaceLab XSeg occlusion mask (user-supplied ONNX). The export
-        # variants in the wild differ in tensor layout (NHWC from the TF
-        # original vs NCHW from some converters), input/output node names,
-        # resolution, and FP16/FP32 I/O. _load_dfl_xseg_model introspects
-        # the graph once and stores the contract in these attrs so
-        # run_dfl_xseg can bind correctly regardless of the export.
+        # DeepFaceLab XSeg 遮挡 mask（用户自备 ONNX）。市面上的导出变体在
+        # tensor layout（TF 原版是 NHWC，某些转换器给出 NCHW）、输入/输出
+        # 节点名、分辨率、FP16/FP32 I/O 上都可能不同。
+        # _load_dfl_xseg_model 会对图做一次 introspection，把这份契约存进
+        # 下面几个 attr，这样 run_dfl_xseg 无论遇到哪种导出都能正确绑定。
         self.dfl_xseg_model = []
         self._dfl_xseg_in_name = None
         self._dfl_xseg_out_name = None
@@ -140,87 +138,79 @@ class Models():
 
         self.swapper_model_kps = []
         self.swapper_model_swap = []
-        # TRT vs ONNX state. Each "_uses_trt" flag is set by the matching
-        # lazy loader (_load_*_model) and consulted by the matching call
-        # site. Reset to False by delete_models / unload_model so the next
-        # call re-detects whether an engine is present.
+        # TRT vs ONNX 状态。每个 "_uses_trt" 标志由对应的懒加载器
+        # (_load_*_model) 置位，由对应的调用点读取。delete_models /
+        # unload_model 会把它重置为 False，这样下次调用会重新探测
+        # engine 是否存在。
         self._retinaface_uses_trt = False
         self._recognition_uses_trt = False
-        # Anchor centers used by retinaface post-processing depend only
-        # on (height, width, stride), all derived from input_size which
-        # changes only when the DetectInputSize slider moves. Cache on
-        # self so the meshgrid + reshape + stack work is paid once per
-        # (input_size, stride) instead of every frame on every worker.
-        # Tensors are kept on GPU; cache miss builds + syncs the device
-        # once so other workers' streams see the writes. Dict mutations
-        # are GIL-protected — concurrent computes on first call just
-        # produce identical results; one write wins.
+        # retinaface 后处理用的 anchor center 只依赖 (height, width,
+        # stride)，而它们全部由 input_size 推导——input_size 只在
+        # DetectInputSize 滑杆移动时变化。因此把它缓存到 self 上，
+        # meshgrid + reshape + stack 的开销按 (input_size, stride)
+        # 组合只付一次，而不是每个 worker 每帧都付。tensor 常驻 GPU；
+        # 缓存未命中时构建设备并同步一次，让其他 worker 的 stream 看到
+        # 写入。dict 变更受 GIL 保护——首次并发计算只会产出相同结果，
+        # 某一次写入胜出。
         self._retinaface_center_cache: dict = {}
-        # Per-worker (1, 3, H, W) float32 input buffer for retinaface,
-        # keyed by input_size. Pre-allocating skips the torch.zeros call
-        # per frame and keeps the (1, 3, H, W) layout end-to-end, so the
-        # preprocessing path no longer needs a final permute+contiguous
-        # round-trip. Per-worker because workers write concurrently
-        # into their own copies.
+        # 每个 worker 一个的 retinaface (1, 3, H, W) float32 输入缓冲，
+        # 以 input_size 为键。预分配省掉了每帧的 torch.zeros 调用，并让
+        # (1, 3, H, W) layout 一路保持下去，预处理路径不再需要最后补一次
+        # permute+contiguous 往返。按 worker 分开是因为各 worker 会并发
+        # 写入各自的副本。
         self._retinaface_buffers_tls = threading.local()
-        # Progress counter for the [N/M] prefix on main-pipeline session
-        # load messages. Counter is phase-scoped: model loads arrive in
-        # distinct user-driven phases (find = retinaface + arcface, swap
-        # = inswapper variant), so the counter resets when the phase
-        # changes. M = (models in this phase) × workers (Per-Thread) or
-        # × 1 (Shared). Counter overflow is fine — e.g. loading both
-        # inswapper_128 and _512 in the same session shows [2/1].
+        # 主管线 session 加载消息里 [N/M] 前缀的进度计数。计数按 phase
+        # 划分：模型加载来自几个互不重叠的用户驱动阶段（find =
+        # retinaface + arcface，swap = inswapper 变体），phase 一变计数
+        # 就归零。M =（本 phase 的模型数）× worker 数（Per-Thread）或
+        # × 1（Shared）。计数溢出无妨——例如同一会话里同时加载
+        # inswapper_128 和 _512 会显示 [2/1]。
         self._load_lock = threading.Lock()
         self._load_count = 0
         self._load_expected = 0
         self._load_phase = None
-        # Worker-count hint from VideoManager / ThreadsSlider. Used to
-        # compute M in Per-Thread mode. Defaults to 1 (Shared at start).
+        # 来自 VideoManager / ThreadsSlider 的 worker 数提示，用于计算
+        # Per-Thread 模式下的 M。默认为 1（起始是 Shared）。
         self._workers_hint = 1
-        # Per-attribute backend preference. Keys: Models attribute names
-        # that have both ONNX and TRT paths ('swapper_model',
-        # 'swapper_512_model', 'retinaface_model', 'recognition_model').
-        # Values: 'trt' (force TRT), 'onnx' (force ONNX), or absent =
-        # auto (current behavior — prefer TRT if engine present).
-        # Driven by the Settings-tab Backend toggle and applied at the
-        # next lazy load.
+        # 按属性区分的后端偏好。键是同时有 ONNX 与 TRT 两条路径的
+        # Models 属性名（'swapper_model'、'swapper_512_model'、
+        # 'retinaface_model'、'recognition_model'）。值: 'trt'（强制
+        # TRT）、'onnx'（强制 ONNX），缺省 = auto（当前行为——有
+        # engine 就优先 TRT）。由 Settings tab 的 Backend 开关驱动，
+        # 在下次懒加载时生效。
         self._backend_pref: dict = {}
         self.syncvec = torch.empty((1,1), dtype=torch.float32, device='cuda:0')
 
-        # Model session mode — controls every ORT-TRT-EP session the
-        # main pipeline uses (inswapper, inswapper_512, retinaface,
-        # recognition). 'Shared' uses one session per model across all
-        # worker threads (low VRAM, but workers serialize on each
-        # session's internal state); 'Per-Thread' gives each worker
-        # its own session per model for parallel runs at the cost of
-        # ~150-300MB extra VRAM per worker per model. The on-disk TRT
-        # engine cache is shared across sessions so engine build is
-        # paid once.
+        # model session mode——控制主管线用到的每一个 ORT-TRT-EP session
+        # （inswapper、inswapper_512、retinaface、recognition）。
+        # 'Shared' 是每个模型在所有 worker 线程间共用一份 session
+        # （VRAM 省，但 worker 会在该 session 的内部状态上串行化）；
+        # 'Per-Thread' 给每个 worker 每种模型各一份 session，可以并行
+        # 跑，代价是每个 worker 每个模型多占约 150-300MB VRAM。磁盘上的
+        # TRT engine 缓存在各 session 间共享，engine 构建只付一次。
         self._model_session_mode: str = 'Shared'
         self._sessions_tls = threading.local()
-        # name → list of strong refs to every Per-Thread session we
-        # hand out. The mode-change / unload path drops these refs so
-        # the dying workers' sessions GC properly (TLS alone leaves
-        # them pinned because Python's thread-local can't reach into
-        # other threads' slots).
+        # name → 我们交出的每个 Per-Thread session 的强引用列表。
+        # 切换模式 / 卸载的路径要丢掉这些引用，垂死 worker 的 session
+        # 才能被正常 GC（只靠 TLS 不行，因为 Python 的 thread-local
+        # 伸不进其他线程的 slot）。
         self._sessions_lock = threading.Lock()
         self._all_sessions: dict[str, list] = {}
 
-        # Session-wide mean source-face embedding, set by main_window as
-        # source faces get recognized. Used by the Distinctiveness slider
-        # (calc_swapper_latent) — None means "no mean yet" and the
-        # extrap branch falls through to a no-op.
+        # 会话级的源人脸平均 embedding，由 main_window 在识别源脸时
+        # 写入。供 Distinctiveness 滑杆使用（calc_swapper_latent）——
+        # None 表示"还没有均值"，此时 extrap 分支直接空转。
         self._mean_emb = None
 
     def _mp(self, name):
-        """Resolve a model filename against the configured folder."""
+        """把模型文件名解析到当前配置的 folder 下。"""
         return os.path.join(self.models_folder, name)
 
     def set_models_folder(self, path):
-        """Point all model lookups at a new folder. Falsy = revert to
-        default. Drops every loaded model so the next inference call
-        reloads from the new path; also re-points TensorRTEngine's
-        inswapper engine constants so TRT picks up the new location."""
+        """让所有模型查找指向新 folder。传假值 = 恢复默认。会丢掉所有
+        已加载模型，让下次推理调用从新路径重新加载；同时把
+        TensorRTEngine 里 inswapper engine 的常量重新指向，让 TRT 也用上
+        新位置。"""
         new_folder = path if path else DEFAULT_MODELS_FOLDER
         if new_folder == self.models_folder:
             return
@@ -229,24 +219,23 @@ class Models():
             from faceswapper import TensorRTEngine as TRT
             TRT.set_models_folder(new_folder)
         except Exception:
-            # TRT is optional — silently skip if it can't be updated.
+            # TRT 是可选的——更新失败就静默跳过。
             pass
-        # Force a reload so the next call picks up the new path.
+        # 强制重载，让下次调用拿到新路径。
         self.delete_models()
 
     def get_gpu_memory(self):
-        # cudaMemGetInfo via torch — microseconds, no subprocess. The
-        # previous nvidia-smi shell-out blocked the GUI event loop for
-        # 100-400 ms per call, causing a visible 1 Hz stutter when this
-        # was polled by the Qt VRAM indicator.
+        # 通过 torch 调 cudaMemGetInfo——微秒级，不起子进程。此前
+        # shell out 到 nvidia-smi 的做法每次会阻塞 GUI 事件循环
+        # 100-400 ms，被 Qt VRAM 指示器轮询时会造成肉眼可见的 1 Hz 卡顿。
         free_bytes, total_bytes = torch.cuda.mem_get_info()
         mib = 1024 * 1024
         return (total_bytes - free_bytes) // mib, total_bytes // mib
 
     def run_detect(self, img, detect_mode='Retinaface', max_num=1, score=0.5, input_size=640):
-        """Run face detection. `input_size` is the square model input
-        edge (a multiple of 32 — 320 / 416 / 480 / 640). Retinaface
-        and SCRDF accept dynamic input shapes so they honor it."""
+        """跑一次人脸检测。`input_size` 是模型输入的正方形边长
+        （32 的倍数——320 / 416 / 480 / 640）。Retinaface 与 SCRDF
+        都接受动态输入 shape，所以这个值对它们有效。"""
         kpss = []
 
         if detect_mode=='Retinaface':
@@ -262,30 +251,30 @@ class Models():
 
         return kpss
         
-    # Maps Models attribute name → the short TLS/strong-ref key used by
-    # _get_model_session. Per-Thread mode never writes the shared attr,
-    # so is_model_loaded has to consult the strong-ref list instead.
+    # Models 属性名 → _get_model_session 用的短 TLS/强引用键。
+    # Per-Thread 模式从不写共享属性，所以 is_model_loaded 必须改去查
+    # 强引用列表。
     _ATTR_TO_TLS_NAME = {
         'swapper_model':       'swapper',
         'swapper_512_model':   'swapper_512',
         'swapper_256_model':   'swapper_256',
+        'hyperswap_model':     'hyperswap',
         'retinaface_model':    'retinaface',
         'recognition_model':   'recognition',
     }
 
     def is_model_loaded(self, attr_name):
-        """True if the Models attribute named attr_name currently holds a
-        live session/wrapper. Empty list / None / False all read as not
-        loaded. In Per-Thread mode the shared attribute is never written
-        — sessions live on `_sessions_tls` and in `_all_sessions[name]`
-        — so we also check the strong-ref list. Used by the Settings tab
-        inventory."""
+        """attr_name 指向的 Models 属性当前是否持有活的 session/wrapper。
+        空 list / None / False 都算未加载。Per-Thread 模式下共享属性
+        永远不会被写入——session 住在 `_sessions_tls` 和
+        `_all_sessions[name]` 里——所以还要查强引用列表。Settings tab
+        的清单用它。"""
         val = getattr(self, attr_name, None)
         if val is not None and val is not False:
             if not (isinstance(val, (list, tuple)) and len(val) == 0):
                 return True
-        # Per-Thread fallback: a session may exist for at least one
-        # worker even though the shared attribute is still [].
+        # Per-Thread 兜底: 哪怕共享属性还是 []，某个 worker 可能已经有
+        # session 了。
         tls_name = self._ATTR_TO_TLS_NAME.get(attr_name)
         if tls_name is not None:
             all_sessions = getattr(self, '_all_sessions', None)
@@ -301,20 +290,18 @@ class Models():
         return False
 
     def unload_model(self, attr_name):
-        """Drop a single loaded model. Mirrors what delete_models() does
-        for each attribute (assign back to []/None), letting the user
-        free one slot without nuking the rest. Unknown / non-tracked
-        attribute names are ignored."""
+        """卸掉单个已加载模型。做的事与 delete_models() 对每个属性做的
+        一致（赋回 []/None），让用户只腾出一个 slot 而不用清空其余。
+        未知 / 未被跟踪的属性名直接忽略。"""
         if attr_name not in self._VRAM_TRACKED_ATTRS:
             return
         if attr_name == 'swapper_model':
-            # Keep the TRT/batch flags in sync with delete_models so the
-            # next swap re-detects engine + batch capability.
+            # 让 TRT/batch 标志与 delete_models 保持同步，这样下次换脸会
+            # 重新探测 engine 与 batch 能力。
             self._swapper_uses_trt = False
             self._swapper_batch_unsupported = False
-            # Drop any Per-Thread sessions too so a full unload actually
-            # frees the VRAM — TLS alone holds strong refs we'd otherwise
-            # leak across the unload.
+            # Per-Thread session 也要一并丢掉，卸载才真的能释放 VRAM——
+            # 光靠 TLS 会持有那些强引用，让它们跨着这次卸载泄漏出去。
             self._sessions_tls = threading.local()
             self.clear_per_thread_sessions('swapper')
         elif attr_name == 'swapper_512_model':
@@ -324,6 +311,9 @@ class Models():
         elif attr_name == 'swapper_256_model':
             self._swapper_256_uses_trt = False
             self.clear_per_thread_sessions('swapper_256')
+        elif attr_name == 'hyperswap_model':
+            self._hyperswap_uses_trt = False
+            self.clear_per_thread_sessions('hyperswap')
         elif attr_name == 'retinaface_model':
             self._retinaface_uses_trt = False
             self.clear_per_thread_sessions('retinaface')
@@ -332,25 +322,25 @@ class Models():
             self.clear_per_thread_sessions('recognition')
         setattr(self, attr_name, [])
 
-    # Attributes whose lazy loader honors _backend_pref. Other models
-    # have only an ONNX path so the toggle is irrelevant.
+    # 懒加载器会遵守 _backend_pref 的属性。其他模型只有 ONNX 一条路径，
+    # 这个开关对它们没有意义。
     _BACKEND_PREF_ATTRS = frozenset([
         'swapper_model', 'swapper_512_model', 'swapper_256_model',
+        'hyperswap_model',
         'retinaface_model', 'recognition_model',
     ])
 
     def set_backend_preference(self, attr_name, backend, *, unload=True):
-        """Set the per-model backend preference.
+        """设置单个模型的后端偏好。
 
-            backend == 'trt':  force TRT path (falls back to ONNX only
-                               if engine load fails at runtime).
-            backend == 'onnx': force ONNX path even if engine is on disk.
-            backend in (None, 'auto'): clear the override — auto-detect
-                               at next load (prefer TRT if engine present).
+            backend == 'trt':  强制走 TRT 路径（只有运行时 engine 加载
+                               失败才会回退到 ONNX）。
+            backend == 'onnx': 即使磁盘上有 engine 也强制走 ONNX 路径。
+            backend in (None, 'auto'): 清除覆盖——下次加载时自动探测
+                               （有 engine 就优先 TRT）。
 
-        When unload=True (default) and the model is currently loaded,
-        also drop it so the next inference call re-loads with the new
-        preference. Unknown attribute names are ignored."""
+        unload=True（默认）且该模型当前已加载时，顺便把它卸掉，这样下次
+        推理调用会按新偏好重新加载。未知属性名直接忽略。"""
         if attr_name not in self._BACKEND_PREF_ATTRS:
             return
         if backend in (None, 'auto'):
@@ -363,7 +353,7 @@ class Models():
             self.unload_model(attr_name)
 
     def get_backend_preference(self, attr_name):
-        """Return 'trt' / 'onnx' / None (auto)."""
+        """返回 'trt' / 'onnx' / None（auto）。"""
         return self._backend_pref.get(attr_name)
 
     def delete_models(self):
@@ -375,6 +365,7 @@ class Models():
         self.swapper_model = []
         self.swapper_512_model = []
         self.swapper_256_model = []
+        self.hyperswap_model = []
         self.GFPGAN_model = []
         self.GPEN_256_model = []
         self.GPEN_512_model = []
@@ -382,14 +373,15 @@ class Models():
         self.occluder_model = []
         self.faceparser_model = []
         self.dfl_xseg_model = []
-        # Drop the TRT/batched-unsupported flags too — the matching
-        # lazy loaders will re-detect on next use (so a Build TensorRT
-        # done after a Clear VRAM is picked up automatically).
+        # TRT/batched-unsupported 标志也一并丢掉——对应的懒加载器下次
+        # 使用时会重新探测（这样在 Clear VRAM 之后做的 Build TensorRT
+        # 会被自动识别到）。
         self._swapper_uses_trt = False
         self._swapper_batch_unsupported = False
         self._swapper_512_uses_trt = False
         self._swapper_512_batch_unsupported = False
         self._swapper_256_uses_trt = False
+        self._hyperswap_uses_trt = False
         self._retinaface_uses_trt = False
         self._recognition_uses_trt = False
 
@@ -403,38 +395,37 @@ class Models():
     
 
     def set_session_mean_embedding(self, mean):
-        """Stash a session-wide mean face embedding for the Distinctiveness
-        slider's extrapolation. Pass None to clear. Caller should also
-        clear the latent cache after changing this (the cache is keyed
-        by raw source embedding, not effective embedding)."""
+        """存放会话级的人脸平均 embedding，供 Distinctiveness 滑杆做
+        extrapolation。传 None 清除。调用方改完这个值后还应清掉 latent
+        缓存（缓存是按 raw source embedding 做键的，不是按生效后的
+        embedding）。"""
         if mean is None:
             self._mean_emb = None
             return
         m = np.asarray(mean, dtype=np.float32).reshape(-1)
         n = float(np.linalg.norm(m))
         if n > 0:
-            m = m / n  # store normalized so extrap_amount has predictable scale
+            m = m / n  # 存归一化后的值，让 extrap_amount 的尺度可预期
         self._mean_emb = m
 
     def calc_swapper_latent(self, source_embedding, *, scale=1.0, extrap_amount=0.0, latent_mode='emap'):
-        """Compute the swapper conditioning latent. Extra knobs over the
-        original Insightface formula:
-            extrap_amount: pushes source_embedding away from the session
-                mean (set via set_session_mean_embedding) before the
-                normalize -> emap -> normalize pipeline. 0 = no change.
-            scale: multiplies the final latent. >1 increases identity
-                intensity in the swap output.
-            latent_mode: 'emap' (default — insightface inswapper:
-                normalize -> emap projection -> normalize) or 'raw'
-                (just L2-normalize; no emap projection — for a model that
-                consumes the raw embedding directly).
+        """计算 swapper 的 conditioning latent。相比原始 insightface 公式
+        多出来的几个旋钮：
+            extrap_amount: 在 normalize -> emap -> normalize 这条管线之前，
+                把 source_embedding 推离会话均值（通过
+                set_session_mean_embedding 设置）。0 = 不改变。
+            scale: 乘在最终 latent 上。>1 会增强换脸结果里的身份强度。
+            latent_mode: 'emap'（默认——insightface inswapper:
+                normalize -> emap 投影 -> normalize）或 'raw'
+                （只做 L2 归一化；不做 emap 投影——给直接消费 raw
+                embedding 的模型用）。
         """
         s = np.asarray(source_embedding, dtype=np.float32).reshape(-1)
         mean = getattr(self, '_mean_emb', None)
         if extrap_amount > 0.0 and mean is not None and mean.shape == s.shape:
-            # Re-scale mean to match s_e's magnitude before subtraction so
-            # the extrapolation is in a consistent space regardless of how
-            # the user's embeddings were normalized.
+            # 相减前先把 mean 重新缩放到与 s_e 相同的量级，这样无论用户的
+            # embedding 当初是怎么归一化的，extrapolation 都在一个一致的
+            # 空间里进行。
             s_norm = float(np.linalg.norm(s))
             mean_scaled = mean * s_norm
             s = s + float(extrap_amount) * (s - mean_scaled)
@@ -442,18 +433,17 @@ class Models():
         latent = n_e.reshape((1, -1))
 
         if latent_mode == 'raw':
-            # Hyperswap path: model consumes the raw L2-normalized
-            # embedding directly. No emap, no second normalize.
+            # Hyperswap 路径: 模型直接消费 raw L2-normalized embedding。
+            # 没有 emap，也没有第二次 normalize。
             if scale != 1.0:
                 latent = latent * float(scale)
             return latent
 
-        # Lazy-load the emap projection matrix on first emap-mode call.
-        # Historical code used graph.initializer[-1] but the FP16 ONNX
-        # has a 32x32 _ln_scale_32x32 tensor AFTER the emap, breaking
-        # that heuristic. Look up by name ('buff2fs' is stable across
-        # FP32 and FP16 exports), and fall back to "the (512, 512)
-        # initializer" for robustness against future renames.
+        # 首次 emap 模式调用时懒加载 emap 投影矩阵。历史上这里用的是
+        # graph.initializer[-1]，但 FP16 ONNX 在 emap 之后还有一个 32x32 的
+        # _ln_scale_32x32 tensor，那个启发式就失效了。改为按名字查找
+        # （'buff2fs' 在 FP32 与 FP16 导出中都是稳定的），并回退到
+        # "那个 (512, 512) 的 initializer"，对将来的改名留一点余量。
         if getattr(self, 'emap', None) is None or len(self.emap) == 0:
             graph = onnx.load(self._mp("inswapper_128.fp16.onnx")).graph
             emap_arr = None
@@ -471,8 +461,8 @@ class Models():
                 raise RuntimeError(
                     "emap (512x512) not found in inswapper_128.fp16.onnx"
                 )
-            # FP16 ONNX stores the emap in float16; promote to float32
-            # so the downstream np.dot stays in FP32 for numerical safety.
+            # FP16 ONNX 把 emap 存成 float16；提升到 float32，让下游的
+            # np.dot 保持 FP32，数值上更安全。
             self.emap = emap_arr.astype(np.float32, copy=False)
 
         latent = np.dot(latent, self.emap)
@@ -482,20 +472,20 @@ class Models():
         return latent
 
     def embed_face_chip(self, img_chw_uint8):
-        """ArcFace embedding of an already-aligned face crop. Skips the
-        kps-driven similarity warp that `recognize()` does — the input
-        must already be a tight, aligned face. Used by High Fidelity to
-        measure the swap output's identity without re-detecting kps.
+        """对一张已对齐的人脸裁剪图求 ArcFace embedding。跳过了
+        `recognize()` 里那步由 kps 驱动的相似变换——传入的必须已经是
+        裁紧且对齐的人脸。High Fidelity 用它衡量换脸结果的身份一致性，
+        不需要重新检测 kps。
 
-        img_chw_uint8: torch (3, H, W) uint8 RGB CUDA tensor; resized to
-            112x112 inside the function.
-        Returns: numpy (512,) float32 embedding (NOT L2-normalized,
-            matching what `recognize()` returns)."""
-        # Resize to the recognizer's expected 112x112 input.
+        img_chw_uint8: torch (3, H, W) uint8 RGB CUDA tensor；函数内部
+            会缩放到 112x112。
+        返回: numpy (512,) float32 embedding（未做 L2 归一化，与
+            `recognize()` 的返回一致）。"""
+        # 缩放到识别器期望的 112x112 输入。
         img = img_chw_uint8.to(torch.float32)
         if img.shape[-1] != 112 or img.shape[-2] != 112:
             img = v2.functional.resize(img, [112, 112], antialias=True)
-        # ArcFace expects BGR, (x - 127.5) / 127.5.
+        # ArcFace 要求 BGR，(x - 127.5) / 127.5。
         img = img[[2, 1, 0]]
         img = (img - 127.5) / 127.5
         img = img.unsqueeze(0).contiguous()
@@ -520,17 +510,15 @@ class Models():
         
     # @profile
     def run_swapper(self, image, embedding, output):
-        # Get the session appropriate for the calling thread. In
-        # Shared mode this is the single self.swapper_model; in
-        # Per-Thread mode each worker gets its own session for true
-        # parallel inswapper runs.
+        # 取与调用线程相称的 session。Shared 模式下就是唯一的
+        # self.swapper_model；Per-Thread 模式下每个 worker 各有一份
+        # session，inswapper 才能真正并行跑。
         swapper_session = self._get_swapper_session()
 
-        # The active inswapper ONNX may declare FP16 or FP32 I/O (set
-        # at load time as _swapper_io_dtype). Callers always pass and
-        # expect FP32 torch tensors, so we cast at the boundary when
-        # the model wants FP16 — input via .half(), output via a temp
-        # FP16 buffer that we copy back into the caller's buffer.
+        # 当前加载的 inswapper ONNX 可能声明 FP16 或 FP32 的 I/O
+        # （加载时记入 _swapper_io_dtype）。调用方一律传入并期待 FP32
+        # 的 torch tensor，所以模型要求 FP16 时在边界处转换——输入用
+        # .half()，输出用一个临时 FP16 缓冲，再拷回调用方的缓冲。
         io_dtype = self._swapper_io_dtype
         if io_dtype == np.float16:
             image_in = image.half() if image.dtype != torch.float16 else image
@@ -541,42 +529,40 @@ class Models():
             embedding_in = embedding
             output_buf = output
 
-        # Both backends (TRT-EP and CUDA-EP) return an ORT
-        # InferenceSession, so a single io_binding path serves both —
-        # ORT routes the call to the active provider internally.
+        # 两个后端（TRT-EP 与 CUDA-EP）返回的都是 ORT
+        # InferenceSession，所以一条 io_binding 路径同时服务两者——
+        # ORT 内部会把调用路由给当前生效的 provider。
         io_binding = swapper_session.io_binding()
         io_binding.bind_input(name='target', device_type='cuda', device_id=0, element_type=io_dtype, shape=(1,3,128,128), buffer_ptr=image_in.data_ptr())
         io_binding.bind_input(name='source', device_type='cuda', device_id=0, element_type=io_dtype, shape=(1,512), buffer_ptr=embedding_in.data_ptr())
         io_binding.bind_output(name='output', device_type='cuda', device_id=0, element_type=io_dtype, shape=(1,3,128,128), buffer_ptr=output_buf.data_ptr())
 
-        # Drain torch's pending writes on the current CUDA stream before
-        # ORT reads from the bound input buffers — but ONLY when torch
-        # and ORT are on different streams. In Per-Thread mode with a
-        # worker stream active, the ORT session was built with
-        # `user_compute_stream` pointing at the same stream torch is
-        # using, so ORT enqueues its kernels strictly after torch's on
-        # that one stream — no race, no sync required. Skipping the
-        # syncvec drain here is the structural payoff of the per-thread
-        # streams refactor; it removes the cross-worker host stall on
-        # the global default stream that prior nsys traces showed as
-        # the next bottleneck.
+        # ORT 读取绑定的输入缓冲前，先 drain 掉 torch 在当前 CUDA stream
+        # 上未完成的写入——但只在 torch 与 ORT 位于不同 stream 时才需要。
+        # Per-Thread 模式下 worker stream 处于活动状态时，该 ORT session
+        # 是用指向 torch 正使用的同一条 stream 的
+        # `user_compute_stream` 构建的，于是 ORT 把自己的 kernel 严格
+        # 排在那一条 stream 上 torch 的 kernel 之后——不存在竞争，也不需要
+        # 同步。在这里省掉 syncvec drain 是 per-thread stream 重构的结构性
+        # 回报；它消除了此前 nsys trace 显示为下一个瓶颈的、发生在全局默认
+        # stream 上的跨 worker 主机端停顿。
         if self._swapper_should_drain_syncvec():
             with nvtx_range("syncvec_drain"):
                 self.syncvec.cpu()
         with nvtx_range("ort_run_swapper"):
             swapper_session.run_with_iobinding(io_binding)
 
-        # If we ran in FP16 mode, lift the result back into the
-        # caller's FP32 buffer. copy_ handles the dtype conversion.
+        # 如果刚才跑的是 FP16 模式，把结果搬回调用方的 FP32 缓冲。
+        # copy_ 会处理 dtype 转换。
         if io_dtype == np.float16:
             output.copy_(output_buf)
 
     def _create_retinaface_session(self):
-        """Build a fresh retinaface ORT-TRT-EP session. Honors the
-        backend preference: 'onnx' → CUDA-EP only; default → TRT-EP
-        with dynamic 320-640 input profile, CUDA-EP fallback if TRT-EP
-        init fails. `user_compute_stream` picks up the calling thread's
-        torch stream when one is active (Per-Thread + worker stream)."""
+        """构建一个新的 retinaface ORT-TRT-EP session。遵守后端偏好：
+        'onnx' → 只用 CUDA-EP；默认 → TRT-EP，输入 profile 动态覆盖
+        320-640，TRT-EP 初始化失败则回退 CUDA-EP。
+        `user_compute_stream` 会在调用线程有 torch stream 活动时
+        （Per-Thread + worker stream）自动接上它。"""
         try:
             onnxruntime.set_default_logger_severity(3)
         except (AttributeError, OSError):
@@ -585,8 +571,8 @@ class Models():
         pref = self._backend_pref.get('retinaface_model')
         want_trt = pref != 'onnx'
         onnx_path = self._mp('det_10g.onnx')
-        # Bind by the names the loaded model actually declares — ONNX
-        # export naming varies (input.1 / input, 448 / scores8 / …).
+        # 按加载的模型实际声明的名字来绑定——ONNX 导出的命名并不统一
+        # （input.1 / input、448 / scores8 / …）。
         def _io_names(path):
             m = onnx.load(path, load_external_data=False)
             return ([i.name for i in m.graph.input],
@@ -611,19 +597,16 @@ class Models():
                 'trt_timing_cache_path': cache_dir,
                 'trt_fp16_enable': True,
                 'trt_builder_optimization_level': 5,
-                # Note: we intentionally do NOT set
-                # `trt_dump_ep_context_model=True`. That flag writes an
-                # extra EP-context-model ONNX wrapper next to the engine
-                # in the cache dir; ORT additionally REQUIRES the cache
-                # path to be relative when this flag is on (for security
-                # reasons it printed an [E] warning at every session
-                # load). We rely on `trt_engine_cache_enable=True` for
-                # fast subsequent loads — that path works fine with
-                # absolute cache dirs and is what makes Per-Thread mode
-                # cheap after the first build.
-                # Dynamic input profile: one engine covers every
-                # DetectInputSize value (320 / 416 / 480 / 640). opt
-                # at 640 — TRT specializes for that point.
+                # 注意: 我们有意不设 `trt_dump_ep_context_model=True`。
+                # 该标志会在 cache 目录里 engine 旁边多写一个 EP-context-model
+                # ONNX 包装文件；而且 ORT 还要求这个标志打开时 cache 路径
+                # 必须是相对路径（出于安全考虑，它会在每次 session 加载时
+                # 打一条 [E] 警告）。我们靠 `trt_engine_cache_enable=True`
+                # 换后续加载的速度——那条路径与绝对 cache 目录相处良好，
+                # 也正是它让 Per-Thread 模式在首次构建之后变得便宜。
+                # 动态输入 profile: 一个 engine 覆盖所有 DetectInputSize
+                # 取值（320 / 416 / 480 / 640）。opt 取 640——TRT 会针对
+                # 这个点做特化。
                 'trt_profile_min_shapes': '%s:1x3x320x320' % det_img_name,
                 'trt_profile_opt_shapes': '%s:1x3x640x640' % det_img_name,
                 'trt_profile_max_shapes': '%s:1x3x640x640' % det_img_name,
@@ -651,10 +634,10 @@ class Models():
                 sess = None
 
         if sess is None:
-            # retinaface's input is a dynamic 320→640 profile, so EXHAUSTIVE
-            # would re-benchmark on every DetectInputSize change (per
-            # session). HEURISTIC picks a near-optimal algo with no
-            # benchmarking → no interactive stalls.
+            # retinaface 的输入是动态的 320→640 profile，所以 EXHAUSTIVE
+            # 会在每次 DetectInputSize 变化时重新 benchmark（每个 session
+            # 都要来一次）。HEURISTIC 不做 benchmark 就能挑到一个接近最优
+            # 的算法 → 不会出现交互卡顿。
             cuda_options = self._cuda_ep_provider_options(cudnn_algo='HEURISTIC')
             sess_options = self._make_session_options()
             sess = onnxruntime.InferenceSession(
@@ -665,8 +648,8 @@ class Models():
 
         active = sess.get_providers()
         self._retinaface_uses_trt = bool(active) and active[0] == 'TensorrtExecutionProvider'
-        # Profile bounds are what we configured above; no engine
-        # introspection needed since ORT-TRT-EP honors what we asked.
+        # profile 上下界就是我们上面配置的那些；不需要 introspection
+        # engine，因为 ORT-TRT-EP 会照我们提的做。
         self._retinaface_trt_input_min = 320
         self._retinaface_trt_input_max = 640
         self._retinaface_engine_size_warned = False
@@ -676,9 +659,8 @@ class Models():
         return sess
 
     def _load_retinaface_model(self):
-        """Shared-mode loader: builds the session and stashes it on
-        self.retinaface_model. Per-Thread mode goes through
-        _get_retinaface_session directly."""
+        """Shared 模式加载器: 构建 session 并存到 self.retinaface_model。
+        Per-Thread 模式直接走 _get_retinaface_session。"""
         self.retinaface_model = self._create_retinaface_session()
 
     def _get_retinaface_session(self):
@@ -687,12 +669,11 @@ class Models():
         )
 
     def _get_retinaface_input_buffer(self, input_size):
-        """Per-worker cached (1, 3, H, W) float32 input buffer for the
-        retinaface ORT call. Built lazily on first use per (worker
-        thread, input_size). Caller zeros and writes into it; ORT's
-        io_binding reads from .data_ptr() directly. Sized once per
-        input_size, so when the DetectInputSize slider is stable there's
-        zero allocator pressure on detect's hot path."""
+        """retinaface ORT 调用用的、按 worker 缓存的 (1, 3, H, W) float32
+        输入缓冲。首次使用时按 (worker 线程, input_size) 懒构建。调用方
+        往里清零再写入；ORT 的 io_binding 直接读 .data_ptr()。每种
+        input_size 只分配一次，所以 DetectInputSize 滑杆不动时，detect
+        的热路径上完全没有分配器压力。"""
         bufs = getattr(self._retinaface_buffers_tls, 'cache', None)
         if bufs is None:
             bufs = {}
@@ -707,43 +688,40 @@ class Models():
         return buf
 
     def _get_retinaface_gpu_anchors(self, height, width, stride):
-        """Return a (height*width*2, 2) torch tensor of anchor centers
-        on CUDA for the given det_10g feature map. The detector has 2
-        anchors per cell; the doubled rows are interleaved to match
-        the model's output ordering.
+        """给定 det_10g feature map，返回 CUDA 上 (height*width*2, 2) 的
+        anchor center torch tensor。检测器每格 2 个 anchor；翻倍的行按
+        交错排列，与模型输出的顺序一致。
 
-        Cached on self._retinaface_center_cache. First call per
-        (h, w, stride) builds + torch.cuda.synchronize()s so the writes
-        are visible to other workers' streams; subsequent calls return
-        the cached tensor with no sync."""
+        缓存在 self._retinaface_center_cache 上。每个 (h, w, stride)
+        组合首次调用会构建并 torch.cuda.synchronize()，让写入对其他
+        worker 的 stream 可见；后续调用直接返回缓存的 tensor，不产生
+        同步。"""
         key = (int(height), int(width), int(stride))
         cached = self._retinaface_center_cache.get(key)
         if cached is not None:
             return cached
         y_coords = torch.arange(height, dtype=torch.float32, device='cuda:0')
         x_coords = torch.arange(width, dtype=torch.float32, device='cuda:0')
-        # indexing='ij' → yy[h, w] = h, xx[h, w] = w. Stacking [xx, yy]
-        # along the last axis gives anchors[h, w] = (x, y) where x is
-        # the column and y the row, matching the numpy original via
-        # np.mgrid[:H, :W][::-1].
+        # indexing='ij' → yy[h, w] = h, xx[h, w] = w。沿最后一轴 stack
+        # [xx, yy] 得到 anchors[h, w] = (x, y)，x 是列、y 是行，与
+        # numpy 原版的 np.mgrid[:H, :W][::-1] 一致。
         yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
         anchors = torch.stack([xx, yy], dim=-1) * float(stride)  # (H, W, 2)
         anchors = anchors.reshape(-1, 2)                          # (H*W, 2)
-        # Duplicate each row for the 2 anchors per cell. Interleaved
-        # via expand+reshape (matches np.stack([a]*2, axis=1).reshape).
+        # 每行复制一份，对应每格 2 个 anchor。用 expand+reshape 做交错
+        # （与 np.stack([a]*2, axis=1).reshape 等价）。
         anchors = anchors.unsqueeze(1).expand(-1, 2, -1).reshape(-1, 2).contiguous()
-        # Force the build kernels to materialize before another worker
-        # on a different stream reads the cache entry. Only paid on
-        # cache miss (~3 times per input_size at app startup).
+        # 强制构建 kernel 落地，避免另一个 stream 上的 worker 读到尚未
+        # 写完的缓存项。只在缓存未命中时付这笔钱（应用启动时每种
+        # input_size 约 3 次）。
         torch.cuda.synchronize()
         self._retinaface_center_cache[key] = anchors
         return anchors
 
     def _create_recognition_session(self):
-        """Build a fresh arcface (w600k_r50) ORT-TRT-EP session.
-        Same pattern as retinaface: TRT-EP by default with CUDA-EP
-        fallback. Input is a fixed (1, 3, 112, 112) face chip — no
-        dynamic profile needed."""
+        """构建一个新的 arcface (w600k_r50) ORT-TRT-EP session。与
+        retinaface 同一套模式: 默认 TRT-EP，失败回退 CUDA-EP。输入是
+        固定的 (1, 3, 112, 112) 人脸 chip——不需要动态 profile。"""
         try:
             onnxruntime.set_default_logger_severity(3)
         except (AttributeError, OSError):
@@ -768,16 +746,13 @@ class Models():
                 'trt_timing_cache_path': cache_dir,
                 'trt_fp16_enable': True,
                 'trt_builder_optimization_level': 5,
-                # Note: we intentionally do NOT set
-                # `trt_dump_ep_context_model=True`. That flag writes an
-                # extra EP-context-model ONNX wrapper next to the engine
-                # in the cache dir; ORT additionally REQUIRES the cache
-                # path to be relative when this flag is on (for security
-                # reasons it printed an [E] warning at every session
-                # load). We rely on `trt_engine_cache_enable=True` for
-                # fast subsequent loads — that path works fine with
-                # absolute cache dirs and is what makes Per-Thread mode
-                # cheap after the first build.
+                # 注意: 我们有意不设 `trt_dump_ep_context_model=True`。
+                # 该标志会在 cache 目录里 engine 旁边多写一个 EP-context-model
+                # ONNX 包装文件；而且 ORT 还要求这个标志打开时 cache 路径
+                # 必须是相对路径（出于安全考虑，它会在每次 session 加载时
+                # 打一条 [E] 警告）。我们靠 `trt_engine_cache_enable=True`
+                # 换后续加载的速度——那条路径与绝对 cache 目录相处良好，
+                # 也正是它让 Per-Thread 模式在首次构建之后变得便宜。
             }
             try:
                 cur_stream = torch.cuda.current_stream()
@@ -802,7 +777,7 @@ class Models():
                 sess = None
 
         if sess is None:
-            # arcface has a fixed 112×112 input → EXHAUSTIVE, one-time warmup.
+            # arcface 输入固定是 112×112 → EXHAUSTIVE，一次性 warmup。
             cuda_options = self._cuda_ep_provider_options(cudnn_algo='EXHAUSTIVE')
             sess_options = self._make_session_options()
             sess = onnxruntime.InferenceSession(
@@ -826,42 +801,38 @@ class Models():
         )
 
     def _create_swapper_session(self):
-        """Build and return a fresh inswapper ORT InferenceSession,
-        picking provider per the user's backend preference. Shared
-        and Per-Thread modes both call into this; the caller decides
-        where to stash the returned session.
+        """构建并返回一个新的 inswapper ORT InferenceSession，按用户的
+        后端偏好挑选 provider。Shared 与 Per-Thread 模式都会调到这里；
+        由调用方决定把返回的 session 存到哪。
 
-        Provider semantics:
+        Provider 语义:
 
-            'onnx' (or no TRT available) → CUDAExecutionProvider
-                Plain cuDNN/cuBLAS path. Always works. Used as the
-                fallback when TRT init fails.
-            'trt' (default if absent)    → TensorrtExecutionProvider
-                ORT builds and caches a TensorRT engine internally on
-                first run. The crucial option is
-                trt_layer_norm_fp32_fallback=True — without it, FP16
-                LayerNorm accumulators overflow on the inswapper graph
-                and produce visibly garbled output (the same failure
-                our hand-built FP16 engine hit). This option is an
-                ORT-TRT-EP-specific knob with no raw TRT API equivalent,
-                which is why we route through ORT instead of building
-                the engine ourselves like we do for retinaface/arcface.
+            'onnx'（或没有可用 TRT）→ CUDAExecutionProvider
+                纯 cuDNN/cuBLAS 路径。总能跑。TRT 初始化失败时作为
+                兜底。
+            'trt'（缺省时默认）    → TensorrtExecutionProvider
+                ORT 首次运行时会内部构建并缓存一个 TensorRT engine。
+                最关键的选项是 trt_layer_norm_fp32_fallback=True——
+                少了它，FP16 的 LayerNorm 累加器会在 inswapper 图上
+                溢出，产出肉眼可见的坏输出（与我们手工构建 FP16 engine
+                时撞上的是同一个故障）。这个选项是 ORT-TRT-EP 特有的
+                旋钮，原生 TRT API 里没有对应物，这也是我们像
+                retinaface/arcface 那样选择走 ORT、而不是自己构建
+                engine 的原因。
 
-        Inspired by VisoMaster's models_processor.trt_ep_options. ORT
-        persists the built engine to {models_folder}/ort_trt_cache so
-        subsequent sessions reload it quickly.
+        思路来自 VisoMaster 的 models_processor.trt_ep_options。ORT 会把
+        构建好的 engine 持久化到 {models_folder}/ort_trt_cache，后续
+        session 能快速重载。
 
-        After construction we read session.get_providers() to learn
-        which provider actually ended up active — ORT silently falls
-        back to CUDA EP if TRT-EP fails to initialize. The
-        _swapper_uses_trt flag reflects reality, not the request."""
-        # Defensive: clamp the env-level Default logger severity right
-        # before we create the session. ORT_LOG_SEVERITY_LEVEL is set in
-        # faceswapper/_native_dlls.py before ORT imports, but if ORT was somehow
-        # imported earlier (transitive site-packages import, hot reload)
-        # the Env logger may have been created at INFO. Re-asserting via
-        # the in-process API silences the BFCArena chatter that
-        # otherwise floods stdout on first CUDA-EP session.
+        构建完成后我们读 session.get_providers() 来得知实际生效的是哪个
+        provider——ORT 在 TRT-EP 初始化失败时会静默回退到 CUDA EP。
+        _swapper_uses_trt 标志反映的是现实，而不是请求。"""
+        # 防御性: 就在创建 session 之前把 env 层的 Default logger 严重级别
+        # 夹紧。ORT_LOG_SEVERITY_LEVEL 本已在 faceswapper/_native_dlls.py
+        # 里、ORT import 之前设好，但如果 ORT 因故被更早导入（site-packages
+        # 的传递性 import、热重载），Env logger 可能已按 INFO 创建。通过
+        # 进程内 API 重新声明一次，可以消掉 BFCArena 的啰嗦输出——否则它会
+        # 在第一个 CUDA-EP session 上灌满 stdout。
         try:
             onnxruntime.set_default_logger_severity(3)
         except (AttributeError, OSError):
@@ -874,11 +845,10 @@ class Models():
         sess = None
 
         if want_trt:
-            # ORT-TRT-EP joins the configured cache path with its own
-            # working-directory base — passing a relative path produces
-            # nonsense like "./models\ort_trt_cache\./models\ort_trt_cache"
-            # and the provider falls back silently to CUDA EP. Always
-            # pass an absolute, normalized path.
+            # ORT-TRT-EP 会把配置的 cache 路径拼到自己的工作目录基址后面
+            # ——传相对路径会拼出 "./models\ort_trt_cache\./models\ort_trt_cache"
+            # 这种废话，然后 provider 静默回退到 CUDA EP。所以必须传绝对
+            # 且已规范化的路径。
             cache_dir = os.path.abspath(self._mp("ort_trt_cache"))
             try:
                 os.makedirs(cache_dir, exist_ok=True)
@@ -891,46 +861,41 @@ class Models():
                 'trt_timing_cache_enable': True,
                 'trt_timing_cache_path': cache_dir,
                 'trt_fp16_enable': True,
-                # The critical flag: keeps LayerNorm reductions in FP32
-                # even under FP16. Without this the FP16 path on
-                # inswapper produces visually garbled output.
+                # 关键标志: 即使整体跑 FP16，也让 LayerNorm 的归约留在
+                # FP32。少了它，inswapper 的 FP16 路径会产出视觉上完全
+                # 坏掉的输出。
                 'trt_layer_norm_fp32_fallback': True,
                 'trt_builder_optimization_level': 5,
-                # Note: we intentionally do NOT set
-                # `trt_dump_ep_context_model=True`. That flag writes an
-                # extra EP-context-model ONNX wrapper next to the engine
-                # in the cache dir; ORT additionally REQUIRES the cache
-                # path to be relative when this flag is on (for security
-                # reasons it printed an [E] warning at every session
-                # load). We rely on `trt_engine_cache_enable=True` for
-                # fast subsequent loads — that path works fine with
-                # absolute cache dirs and is what makes Per-Thread mode
-                # cheap after the first build.
+                # 注意: 我们有意不设 `trt_dump_ep_context_model=True`。
+                # 该标志会在 cache 目录里 engine 旁边多写一个 EP-context-model
+                # ONNX 包装文件；而且 ORT 还要求这个标志打开时 cache 路径
+                # 必须是相对路径（出于安全考虑，它会在每次 session 加载时
+                # 打一条 [E] 警告）。我们靠 `trt_engine_cache_enable=True`
+                # 换后续加载的速度——那条路径与绝对 cache 目录相处良好，
+                # 也正是它让 Per-Thread 模式在首次构建之后变得便宜。
             }
-            # If the calling thread has its own CUDA stream set as
-            # current (the VideoManager worker pattern in Per-Thread
-            # mode), pass that to ORT-TRT-EP via user_compute_stream
-            # so ORT enqueues its kernels onto the same stream torch
-            # is using. Torch and ORT then share ordering — no cross-
-            # stream race, syncvec drain becomes unnecessary, workers
-            # don't serialize on the global default stream.
+            # 如果调用线程自己设了 current CUDA stream（Per-Thread 模式下
+            # VideoManager 的 worker 模式正是如此），通过
+            # user_compute_stream 把它交给 ORT-TRT-EP，ORT 就会把自己的
+            # kernel 派发到 torch 正在用的同一条 stream 上。torch 与 ORT
+            # 于是共享执行顺序——不存在跨 stream 竞争，syncvec 的 drain
+            # 不再必要，worker 也不会在全局默认 stream 上串行化。
             try:
                 cur_stream = torch.cuda.current_stream()
-                # Skip when the worker is on the default stream
-                # (Shared mode or no per-worker streams active): the
-                # device→host syncvec keeps cross-stream ordering
-                # safe and we don't gain anything from binding ORT
-                # to the same stream torch already serializes on.
+                # worker 跑在默认 stream 上时跳过（Shared 模式，或没有
+                # 启用 per-worker stream）: device→host 的 syncvec 已足以
+                # 保证跨 stream 顺序，而把 ORT 绑到 torch 本来就会串行化
+                # 的那条 stream 上并不会带来额外收益。
                 if cur_stream is not None and cur_stream != torch.cuda.default_stream():
                     trt_ep_options['user_compute_stream'] = str(int(cur_stream.cuda_stream))
             except Exception:
                 pass
             try:
                 sess_options = self._make_session_options()
-                # The CUDA-EP fallback carries the same tuned options
-                # (incl. user_compute_stream) so a silent TRT→CUDA fallback
-                # still binds to the worker stream — a bare string entry
-                # would drop the stream and run on the default stream.
+                # CUDA-EP 兜底路径带着同一组调好的选项（包括
+                # user_compute_stream），这样一次静默的 TRT→CUDA 回退仍然
+                # 绑在 worker stream 上——只写一个裸字符串条目会丢掉 stream，
+                # 让推理跑到默认 stream 上去。
                 cuda_options = self._cuda_ep_provider_options(cudnn_algo='EXHAUSTIVE')
                 sess = onnxruntime.InferenceSession(
                     onnx_path,
@@ -946,9 +911,9 @@ class Models():
                 sess = None
 
         if sess is None:
-            # inswapper_128 has a fixed 128×128 input, so EXHAUSTIVE's
-            # one-time conv benchmark is absorbed by the startup preload
-            # warm-up (see preload_pipeline_sessions).
+            # inswapper_128 输入固定是 128×128，所以 EXHAUSTIVE 那一次性的
+            # conv benchmark 被启动时的 preload warm-up 吸收掉了
+            # （见 preload_pipeline_sessions）。
             cuda_options = self._cuda_ep_provider_options(cudnn_algo='EXHAUSTIVE')
             sess_options = self._make_session_options()
             sess = onnxruntime.InferenceSession(
@@ -957,29 +922,26 @@ class Models():
                 providers=[('CUDAExecutionProvider', cuda_options)],
             )
 
-        # Was TRT-EP actually selected? get_providers() returns the
-        # active list in priority order; if the first entry is TRT,
-        # it's hot. Silent fallbacks (TRT-EP requested but ORT picked
-        # CUDA anyway) end up here as False. Detect once and cache —
-        # all sessions of the same model under the same backend pref
-        # land on the same provider, so we don't need to re-detect
-        # for every Per-Thread session.
+        # TRT-EP 真的被选上了吗？get_providers() 按优先级返回生效的
+        # provider 列表；第一项是 TRT 就说明它热着。静默回退（请求了
+        # TRT-EP 但 ORT 仍然选了 CUDA）在这里会得到 False。只探测一次并
+        # 缓存——同一后端偏好下同一模型的所有 session 都会落到同一个
+        # provider，所以没必要为每个 Per-Thread session 重新探测。
         active = sess.get_providers()
         self._swapper_uses_trt = bool(active) and active[0] == 'TensorrtExecutionProvider'
-        # Detect the model's actual I/O dtype. Real FP16-throughout
-        # inswapper exports declare FP16 inputs/outputs and require
-        # FP16-bound buffers; older "FP16-weights, FP32-IO" exports
-        # declare FP32 and accept FP32 buffers directly. We cast at
-        # the io_binding boundary based on this. ORT's input.type is a
-        # string like "tensor(float16)" or "tensor(float)".
+        # 探测模型实际的 I/O dtype。真正全 FP16 的 inswapper 导出会声明
+        # FP16 输入/输出并要求绑定 FP16 缓冲；较早的"FP16 权重、FP32 IO"
+        # 导出声明 FP32，可直接接受 FP32 缓冲。我们据此在 io_binding
+        # 边界做转换。ORT 的 input.type 是形如 "tensor(float16)" 或
+        # "tensor(float)" 的字符串。
         inp = sess.get_inputs()[0]
         self._swapper_io_dtype = (
             np.float16 if 'float16' in inp.type else np.float32
         )
-        # Detect static-batch ONNX exports (shape[0] is an int rather
-        # than a string/None for symbolic dims). If so, pre-set the
-        # batch-unsupported flag so run_swapper_batched routes to the
-        # per-call fallback without paying the one-shot exception cost.
+        # 探测静态 batch 的 ONNX 导出（shape[0] 是 int，而不是符号维的
+        # 字符串/None）。若是，就预置 batch-unsupported 标志，让
+        # run_swapper_batched 直接走逐次调用的兜底路径，不必付那一次性
+        # 异常的代价。
         try:
             shape0 = inp.shape[0]
             self._swapper_batch_unsupported = isinstance(shape0, int) and shape0 == 1
@@ -990,24 +952,24 @@ class Models():
         print(f'{self._load_tag("swap")} [Models] inswapper: {backend} (io={self._swapper_io_dtype.__name__}{batch_note})')
         return sess
 
-    # ===== Generic per-thread session dispatcher ==========================
-    # Every ORT-TRT-EP model in the main pipeline (inswapper, inswapper_512,
-    # retinaface, recognition) routes through these helpers. The mode is
-    # process-wide; each model carries its own (name, shared-attr, factory)
-    # so the same dispatcher serves all of them.
+    # ===== 通用 per-thread session 分发器 =================================
+    # 主管线里的每个 ORT-TRT-EP 模型（inswapper、inswapper_512、
+    # retinaface、recognition）都走这几个 helper。模式是进程级的；每个
+    # 模型自带自己的 (name, shared-attr, factory)，所以同一个分发器能
+    # 服务所有这些模型。
 
     def _get_model_session(self, name, shared_attr, create_fn):
-        """Return the ORT session for `name` in the current mode.
+        """按当前模式返回 `name` 对应的 ORT session。
 
-        Shared mode: lazy-load into self.<shared_attr> and hand the same
-        session to every thread. Per-Thread mode: lazy-load into thread-
-        local storage so each worker gets its own session. The on-disk
-        TRT engine cache is shared, so the second-through-Nth Per-Thread
-        session deserializes the existing engine instead of rebuilding.
+        Shared 模式: 懒加载进 self.<shared_attr>，所有线程共用同一份
+        session。Per-Thread 模式: 懒加载进 thread-local 存储，每个
+        worker 各得一份 session。磁盘上的 TRT engine 缓存是共享的，所以
+        第 2 到第 N 个 Per-Thread session 会反序列化已有的 engine，
+        而不是重新构建。
 
-        create_fn() is the factory that produces a fresh session — built
-        on the calling thread so its `user_compute_stream` (if any) picks
-        up that thread's current torch stream."""
+        create_fn() 是产出新 session 的工厂——它运行在调用线程上，这样
+        它的 `user_compute_stream`（如果有）会接上该线程当前的 torch
+        stream。"""
         if self._model_session_mode == 'Per-Thread':
             sess = getattr(self._sessions_tls, name, None)
             if sess is None:
@@ -1016,7 +978,7 @@ class Models():
                 with self._sessions_lock:
                     self._all_sessions.setdefault(name, []).append(sess)
             return sess
-        # Shared mode: lazy-load once, reuse across all threads.
+        # Shared 模式: 只懒加载一次，所有线程复用。
         sess = getattr(self, shared_attr, None)
         if not sess:
             sess = create_fn()
@@ -1024,12 +986,12 @@ class Models():
         return sess
 
     def _should_drain_syncvec(self):
-        """True when an ORT call needs an explicit torch-stream drain
-        before ORT reads its input buffers. False only when torch's
-        current stream is the same stream the ORT session was built
-        with — that happens in Per-Thread mode when a worker is running
-        inside its `with torch.cuda.stream(worker_stream)` context.
-        Same stream = implicit ordering, no race."""
+        """为 True 时，ORT 调用前需要显式 drain 一次 torch stream，ORT
+        才会读到输入缓冲的最新写入。只有当 torch 当前 stream 与构建该
+        ORT session 时用的 stream 是同一条时才为 False——这发生在
+        Per-Thread 模式下 worker 正跑在自己的
+        `with torch.cuda.stream(worker_stream)` 上下文里。同一条
+        stream = 隐式顺序，不存在竞争。"""
         if self._model_session_mode != 'Per-Thread':
             return True
         try:
@@ -1038,29 +1000,26 @@ class Models():
         except Exception:
             return True
 
-    # ===== Shared ORT session configuration ==============================
-    # Both the explicit-ONNX branch and the TRT branch's CUDA fallback in
-    # every _create_*_session factory route through these two helpers so the
-    # CUDA-EP path is tuned identically everywhere (previously each factory
-    # inlined its own — and inconsistent — options).
+    # ===== 共享的 ORT session 配置 =======================================
+    # 每个 _create_*_session 工厂里，显式 ONNX 分支和 TRT 分支的 CUDA
+    # 兜底都走这两个 helper，这样 CUDA-EP 路径在各处被调成完全一致
+    # （此前每个工厂各自内联一份——彼此还不一样）。
 
     def _cuda_ep_provider_options(self, cudnn_algo='EXHAUSTIVE'):
-        """CUDAExecutionProvider options dict. Returns a fresh dict each
-        call (ORT may mutate it, and the stream value is thread-specific).
-        Must be called on the worker thread so `torch.cuda.current_stream()`
-        picks up that worker's stream — same construction-time contract the
-        TRT branch already uses.
+        """CUDAExecutionProvider 选项 dict。每次调用返回一个新 dict
+        （ORT 可能会改它，而且 stream 的值是线程相关的）。必须在 worker
+        线程上调用，这样 `torch.cuda.current_stream()` 取到的是该 worker
+        的 stream——与 TRT 分支早已使用的构建期契约相同。
 
         cudnn_algo:
-            'EXHAUSTIVE' (default) — benchmark the fastest conv algorithm.
-                Best steady-state; a one-time per-shape benchmark on first
-                inference. Right for the fixed-input-shape models (swapper,
-                arcface, inswapper_512), whose warmup the startup preload
-                absorbs.
-            'HEURISTIC' — pick a near-optimal algo analytically, no
-                benchmarking. Right for retinaface, whose input is a dynamic
-                320→640 profile (EXHAUSTIVE would re-benchmark and stall on
-                every DetectInputSize change, per session).
+            'EXHAUSTIVE'（默认）——benchmark 出最快的 conv 算法。稳态
+                最好；首次推理时按 shape 做一次 benchmark。适合输入
+                shape 固定的模型（swapper、arcface、inswapper_512），
+                它们的 warmup 由启动时的 preload 吸收掉了。
+            'HEURISTIC'——用解析方式挑一个接近最优的算法，不做
+                benchmark。适合 retinaface，它的输入是动态的 320→640
+                profile（EXHAUSTIVE 会在每次 DetectInputSize 变化时
+                重新 benchmark，每个 session 都要卡一次）。
         """
         opts = {
             'arena_extend_strategy': 'kSameAsRequested',
@@ -1075,47 +1034,45 @@ class Models():
         return opts
 
     def _make_session_options(self):
-        """SessionOptions tuned to avoid CPU thread oversubscription. ORT
-        sizes each session's intra-op pool to the CPU core count by default;
-        in Per-Thread mode ~3·N sessions are live (N = worker threads), so
-        N·3·core_count ORT threads would contend with each other and the N
-        torch workers — which hurts CUDA-EP (node-by-node dispatch) far more
-        than TRT-EP (one fused engine node). We keep each session lean and
-        let the N worker threads supply the concurrency instead.
+        """调过的 SessionOptions，用来避免 CPU 线程超订。ORT 默认按 CPU
+        核心数给每个 session 配 intra-op 线程池；Per-Thread 模式下约有
+        3·N 个 session 同时活着（N = worker 线程数），那样就是
+        N·3·core_count 个 ORT 线程互相抢，还要和 N 个 torch worker 抢
+        ——这对 CUDA-EP（逐节点派发）的伤害远大于 TRT-EP（整个融合成
+        一个 engine 节点）。我们让每个 session 保持精简，并发度交给那
+        N 个 worker 线程去提供。
 
-        Also sets log_severity_level=3 (was previously the only thing set)
-        because ORT 1.26's default-severity inheritance via -1 is broken and
-        every session otherwise spews ~100 INFO lines at init."""
+        另外设 log_severity_level=3（此前这是唯一被设置的一项），因为
+        ORT 1.26 通过 -1 继承默认严重级别的行为是坏的，否则每个 session
+        初始化时都会喷出约 100 行 INFO。"""
         so = onnxruntime.SessionOptions()
         so.log_severity_level = 3
         so.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
         so.inter_op_num_threads = 1
         if self._model_session_mode == 'Per-Thread':
-            # One intra-op thread per session; concurrency comes from the
-            # N worker threads each driving their own session.
+            # 每个 session 一个 intra-op 线程；并发度来自 N 个各自驱动
+            # 自己 session 的 worker 线程。
             so.intra_op_num_threads = 1
         else:
-            # Shared mode: ~3 sessions total, hit by N concurrent Run()
-            # calls — give them a small pool so CPU-side work isn't
-            # serialized, but stay well under core_count to avoid
-            # re-introducing oversubscription.
+            # Shared 模式: 总共约 3 个 session，被 N 个并发 Run() 调用
+            # 访问——给它们一个小池子，避免 CPU 侧工作被串行化，但仍要
+            # 明显低于 core_count，免得又把超订引回来。
             cores = os.cpu_count() or 4
             so.intra_op_num_threads = max(2, min(8, cores // 2))
         return so
 
-    # Per-phase model count: how many distinct models load in each
-    # user-driven phase. Used to compute M in _load_tag — multiplied by
-    # the worker count when in Per-Thread mode.
+    # 每个 phase 的模型数: 每个用户驱动阶段会加载多少个不同的模型。用于
+    # 计算 _load_tag 里的 M——Per-Thread 模式下再乘以 worker 数。
     _PHASE_PER_WORKER = {
         'find': 2,  # retinaface + arcface
-        'swap': 1,  # inswapper_128 or inswapper_512 (one at a time)
+        'swap': 1,  # inswapper_128 或 inswapper_512（一次只有一个）
     }
 
     def update_load_expectation(self, threads):
-        """Store the worker-count hint and reset phase tracking. Called
-        by VideoManager._ensure_executor when the pool rebuilds, and
-        from main_window on every parameter change. The next session
-        create starts a fresh phase counter."""
+        """存下 worker 数提示并重置 phase 追踪。由
+        VideoManager._ensure_executor 在线程池重建时调用，也由
+        main_window 在每次参数变化时调用。下一次 session 创建会从全新
+        的 phase 计数开始。"""
         threads = max(1, int(threads))
         with self._load_lock:
             self._workers_hint = threads
@@ -1124,10 +1081,9 @@ class Models():
             self._load_expected = 0
 
     def _load_tag(self, phase):
-        """Return '[N/M]' for the next session-create print. `phase` is
-        'find' or 'swap'. When phase changes from the previous call,
-        the counter resets and M is recomputed from _PHASE_PER_WORKER
-        × workers (Per-Thread) or × 1 (Shared)."""
+        """为下一次 session 创建的打印返回 '[N/M]'。`phase` 是 'find'
+        或 'swap'。phase 与上次不同时计数归零，M 按 _PHASE_PER_WORKER
+        × worker 数（Per-Thread）或 × 1（Shared）重新计算。"""
         per_worker = self._PHASE_PER_WORKER.get(phase, 1)
         with self._load_lock:
             workers = self._workers_hint if self._model_session_mode == 'Per-Thread' else 1
@@ -1141,13 +1097,12 @@ class Models():
         return f'[{n}/{m}]'
 
     def clear_per_thread_sessions(self, name=None):
-        """Release strong refs to Per-Thread sessions so dying workers'
-        sessions can GC. Pass `name` to clear just one model's
-        per-thread sessions; pass None to clear all. Each live worker
-        keeps its TLS slot intact, so in-flight calls are unaffected —
-        Python's threading.local auto-cleans the dead thread's slot
-        when the worker exits, and the session GCs once the strong-ref
-        list no longer holds it."""
+        """释放对 Per-Thread session 的强引用，让垂死 worker 的 session
+        得以 GC。传 `name` 只清某个模型的 per-thread session；传 None
+        全部清掉。每个活着的 worker 的 TLS slot 保持不动，正在进行的
+        调用不受影响——Python 的 threading.local 会在 worker 退出时
+        自动清理该线程的 slot，而一旦强引用列表不再持有它，session
+        就会被 GC。"""
         with self._sessions_lock:
             if name is None:
                 self._all_sessions = {}
@@ -1156,21 +1111,19 @@ class Models():
         self.vram_dirty = True
 
     def set_model_session_mode(self, mode):
-        """Switch between 'Shared' (one ORT session per model across
-        all workers) and 'Per-Thread' (one session per model per
-        worker). Drops all existing sessions across every model so the
-        new mode takes effect on next inference call — active workers
-        will re-load lazily."""
+        """在 'Shared'（每种模型所有 worker 共用一份 ORT session）与
+        'Per-Thread'（每种模型每个 worker 一份 session）之间切换。会
+        丢掉所有模型的全部已有 session，让新模式在下次推理调用时生效
+        ——活跃的 worker 会懒加载重来。"""
         mode = str(mode)
         if mode not in ('Shared', 'Per-Thread'):
             return
         if mode == self._model_session_mode:
             return
         self._model_session_mode = mode
-        # Drop everything — Shared attrs and Per-Thread refs both.
-        # Per-Thread mode change resets `_sessions_tls` which severs
-        # every thread's slot at once (workers will re-create on next
-        # access). Shared singletons are cleared individually.
+        # 全部丢掉——Shared 属性和 Per-Thread 引用都包括。切换模式会
+        # 重置 `_sessions_tls`，这一下就同时切断了每个线程的 slot
+        # （worker 下次访问时会重新创建）。Shared 单例则逐个清除。
         self._sessions_tls = threading.local()
         with self._sessions_lock:
             self._all_sessions = {}
@@ -1178,66 +1131,68 @@ class Models():
             'swapper_model',
             'swapper_512_model',
             'swapper_256_model',
+            'hyperswap_model',
             'retinaface_model',
             'recognition_model',
         ):
             if getattr(self, shared_attr, None):
                 setattr(self, shared_attr, None)
-        # Per-model "uses TRT" / batch / engine-profile caches are
-        # detected fresh on the next session build, so no clear needed
-        # — but mark VRAM dirty so the indicator catches the drop.
+        # 每个模型的 "uses TRT" / batch / engine-profile 缓存在下次构建
+        # session 时都会重新探测，所以无需清理——但要置 VRAM dirty，
+        # 让指示器能反映这次释放。
         self.vram_dirty = True
         print(f'[Models] model session mode -> {mode}')
 
-    # ===== Inswapper session glue =========================================
-    # Inswapper is the first model on the generic dispatcher. The helper
-    # name `_get_swapper_session` is preserved so existing call sites in
-    # run_swapper / run_swapper_batched keep working without churn.
+    # ===== Inswapper session 粘合层 =======================================
+    # Inswapper 是通用分发器上的第一个模型。保留 `_get_swapper_session`
+    # 这个 helper 名，这样 run_swapper / run_swapper_batched 里已有的
+    # 调用点无需改动就能继续工作。
 
     def _get_swapper_session(self):
         return self._get_model_session(
             'swapper', 'swapper_model', self._create_swapper_session,
         )
 
-    # ===== Startup preload ================================================
-    # The three per-thread swap-pipeline sessions, in the order preload
-    # builds them: (ONNX filename, session-getter method name). Getters
-    # route through _get_model_session, so calling one on a worker thread
-    # populates that thread's per-thread slot (Per-Thread mode) or the
-    # shared singleton (Shared mode) — exactly what a lazy swap would do.
-    # The recognizer (arcface) is always part of a swap regardless of the
-    # user's detector / swapper choices, so it's preloaded unconditionally.
+    # ===== 启动 preload ===================================================
+    # 三个 per-thread 换脸管线 session，按 preload 构建它们的顺序排列:
+    # (ONNX 文件名, session-getter 方法名)。getter 都走
+    # _get_model_session，所以在 worker 线程上调用其中一个，就会填充该
+    # 线程的 per-thread slot（Per-Thread 模式）或共享单例（Shared 模式）
+    # ——与懒加载换脸时发生的事完全一致。识别器（arcface）无论用户选哪个
+    # detector / swapper 都是换脸必经的一环，所以它被无条件 preload。
     _RECOGNITION_PRELOAD = ('w600k_r50.onnx', '_get_recognition_session')
 
-    # Detector selection (DetectTypeTextSel) → (ONNX filename, loader). Only
-    # Retinaface routes through the per-thread ORT-TRT-EP getter (thread-
-    # scaled, benefits most from preload); SCRDF is a shared singleton
-    # warmed once via _ensure_scrdf_model. Preloading the *selected*
-    # detector (and not the others) is what makes the button honor
-    # "which detector".
+    # detector 选择（DetectTypeTextSel）→ (ONNX 文件名, 加载器)。只有
+    # Retinaface 走 per-thread ORT-TRT-EP getter（随线程数扩展，从
+    # preload 中获益最大）；SCRDF 是通过 _ensure_scrdf_model 预热一次的
+    # 共享单例。只 preload *被选中*的那个 detector（而不是其他），按钮
+    # 才算真正尊重"选的是哪个 detector"。
     _DETECTOR_PRELOAD = {
         'Retinaface': ('det_10g.onnx',          '_get_retinaface_session'),
         'SCRDF':      ('scrfd_2.5g_bnkps.onnx', '_ensure_scrdf_model'),
     }
 
-    # Swapper-Resolution selection (SwapperTypeTextSel) → (ONNX filename,
-    # getter). 128/256/512 all drive inswapper_128 with polyphase tiling;
-    # only "256-Native" uses the dedicated single-pass inswapper_256_phase1.
+    # swapper 模型选择（SwapperTypeTextSel）→ (ONNX 文件名, getter)。
+    # inswapper-128/256/512 全都驱动 inswapper_128 做 polyphase 拼合；
+    # 只有 "inswapper-256" 用专门单次 pass 的 inswapper_256_phase1。
     _SWAPPER_PRELOAD_128 = ('inswapper_128.fp16.onnx', '_get_swapper_session')
     _SWAPPER_PRELOAD_NATIVE256 = ('inswapper_256_phase1.onnx', '_get_swapper_256_session')
+    _SWAPPER_PRELOAD_HYPERSWAP = ('hyperswap_1a_256.onnx', '_get_hyperswap_session')
 
     def _detector_preload_for(self, detect_mode):
         return self._DETECTOR_PRELOAD.get(
             str(detect_mode), self._DETECTOR_PRELOAD['Retinaface'])
 
     def _swapper_preload_for(self, swapper_type):
-        if str(swapper_type) == '256-Native':
+        if str(swapper_type) == 'inswapper-256':
             return self._SWAPPER_PRELOAD_NATIVE256
+        if str(swapper_type) == 'hyperswap-256':
+            return self._SWAPPER_PRELOAD_HYPERSWAP
         return self._SWAPPER_PRELOAD_128
 
-    def _pipeline_preload_set(self, swapper_type='128', detect_mode='Retinaface'):
-        """(filename, getter) triples to preload for the given detector +
-        swapper selection, plus the always-needed recognizer."""
+    def _pipeline_preload_set(self, swapper_type='inswapper-128', detect_mode='Retinaface'):
+        """给定 detector + swapper 选择，要 preload 的 (文件名, getter)
+        组合，外加始终需要的 recognizer。"""
         return [
             self._detector_preload_for(detect_mode),
             self._RECOGNITION_PRELOAD,
@@ -1245,60 +1200,61 @@ class Models():
         ]
 
     def _ensure_scrdf_model(self):
-        """Load the shared SCRDF detector session if not already loaded.
-        Shared singleton (not per-thread) — mirrors the lazy load in
-        run_detect so both paths build it identically."""
+        """若尚未加载则加载共享的 SCRDF detector session。共享单例
+        （非 per-thread）——与 run_detect 里的懒加载保持一致，这样两条
+        路径构建出的东西完全相同。"""
         if not self.scrdf_model:
             self.scrdf_model = onnxruntime.InferenceSession(
                 self._mp('scrfd_2.5g_bnkps.onnx'), providers=self.providers)
         return self.scrdf_model
 
-    # Detector selection (DetectTypeTextSel) → the Models attribute whose
-    # liveness is_model_loaded checks. Retinaface routes through the
-    # per-thread session list; SCRDF is a shared singleton.
+    # detector 选择（DetectTypeTextSel）→ is_model_loaded 检查其存活性的
+    # Models 属性。Retinaface 走 per-thread session 列表；SCRDF 是共享
+    # 单例。
     _DETECTOR_LOADED_ATTR = {
         'Retinaface': 'retinaface_model',
         'SCRDF':      'scrdf_model',
     }
 
-    def _pipeline_loaded_attrs(self, swapper_type='128', detect_mode='Retinaface'):
-        """Models attributes whose sessions must be live for the given
-        detector + swapper selection to run a swap (mirrors
-        _pipeline_preload_set, but in is_model_loaded's attr vocabulary)."""
+    def _pipeline_loaded_attrs(self, swapper_type='inswapper-128', detect_mode='Retinaface'):
+        """给定 detector + swapper 选择，跑一次换脸需要哪些 Models 属性的
+        session 是活的（与 _pipeline_preload_set 对应，但用的是
+        is_model_loaded 的 attr 词汇表）。"""
         det_attr = self._DETECTOR_LOADED_ATTR.get(str(detect_mode), 'retinaface_model')
-        sw_attr = ('swapper_256_model' if str(swapper_type) == '256-Native'
-                   else 'swapper_model')
+        swapper_type = str(swapper_type)
+        if swapper_type == 'inswapper-256':
+            sw_attr = 'swapper_256_model'
+        elif swapper_type == 'hyperswap-256':
+            sw_attr = 'hyperswap_model'
+        else:
+            sw_attr = 'swapper_model'
         return [det_attr, 'recognition_model', sw_attr]
 
-    def pipeline_sessions_loaded(self, swapper_type='128', detect_mode='Retinaface'):
-        """True when every model the current selection needs has a live
-        session. Used by the GUI to flip the Preload button to its loaded
-        state (and to verify a preload actually succeeded)."""
+    def pipeline_sessions_loaded(self, swapper_type='inswapper-128', detect_mode='Retinaface'):
+        """当前选择需要的每个模型都有活 session 时为 True。GUI 用它把
+        Preload 按钮翻到已加载状态（也用来验证 preload 确实成功了）。"""
         return all(self.is_model_loaded(a)
                    for a in self._pipeline_loaded_attrs(swapper_type, detect_mode))
 
-    def swap_pipeline_files_present(self, swapper_type='128', detect_mode='Retinaface'):
-        """True only if every ONNX backing the *selected* preloadable swap-
-        pipeline sessions exists in the current models folder. Preload is
-        skipped when False so a models-less install doesn't spew load
-        errors. Defaults reproduce the legacy retinaface + inswapper_128
-        check when called with no arguments."""
+    def swap_pipeline_files_present(self, swapper_type='inswapper-128', detect_mode='Retinaface'):
+        """仅当支撑 *被选中的* 可 preload 换脸管线 session 的每个 ONNX
+        都存在于当前 models folder 时为 True。为 False 时跳过 preload，
+        免得一个没有模型的安装刷出一堆加载错误。不带参数调用时复现
+        旧的 retinaface + inswapper_128 检查。"""
         return all(os.path.exists(self._mp(f))
                    for f, _ in self._pipeline_preload_set(swapper_type, detect_mode))
 
-    def preload_pipeline_sessions(self, swapper_type='128', detect_mode='Retinaface'):
-        """Build (or return the already-built) detector + recognizer +
-        swapper sessions matching the user's current selections, on the
-        CALLING thread. Meant to run on a VideoManager worker thread inside
-        its `with torch.cuda.stream(...)` block so the per-thread sessions
-        bind to that worker's stream, matching how swap_video would build
-        them lazily. Each model is guarded so a single missing/failed model
-        doesn't abort the rest.
+    def preload_pipeline_sessions(self, swapper_type='inswapper-128', detect_mode='Retinaface'):
+        """在**调用线程**上构建（或直接返回已构建的）与用户当前选择匹配的
+        detector + recognizer + swapper session。设计上应在 VideoManager
+        的 worker 线程内、它的 `with torch.cuda.stream(...)` 块中运行，
+        这样 per-thread session 会绑到该 worker 的 stream 上，与
+        swap_video 懒加载它们时的方式一致。每个模型都有保护，单个模型
+        缺失/失败不会中断其余部分。
 
-        `swapper_type` (SwapperTypeTextSel) picks inswapper_128 vs the
-        native-256 model; `detect_mode` (DetectTypeTextSel) picks which
-        detector to warm — so the button only builds what the current
-        selections will actually use."""
+        `swapper_type`（SwapperTypeTextSel）在 inswapper_128、native-256
+        模型和 hyperswap 之间选择；`detect_mode`（DetectTypeTextSel）选择
+        预热哪个 detector——所以按钮只构建当前选择真正会用到的东西。"""
         for fname, getter in self._pipeline_preload_set(swapper_type, detect_mode):
             if not os.path.exists(self._mp(fname)):
                 continue
@@ -1308,14 +1264,13 @@ class Models():
                 print(f'[Models.preload_pipeline_sessions] {fname}: '
                       f'{type(e).__name__}: {e}')
 
-        # Warm up the selected swapper with one throwaway inference so the
-        # CUDA-EP EXHAUSTIVE cuDNN conv benchmark (and workspace/handle
-        # allocation) happens here — at load, on this worker's stream —
-        # instead of stalling the first live swap frame on each of the N
-        # workers. On the TRT backend this is a cheap already-built engine
-        # run. Guarded so a warm-up failure never breaks startup. run_swapper
-        # handles FP16/FP32 casting internally, so plain FP32 zeros are fine.
-        if str(swapper_type) == '256-Native':
+        # 用一次丢弃式推理预热选中的 swapper，让 CUDA-EP 的 EXHAUSTIVE
+        # cuDNN conv benchmark（以及 workspace/handle 分配）发生在这里
+        # ——加载时、在这个 worker 的 stream 上——而不是让每个 worker 的
+        # 第一个真实换脸帧卡住。TRT 后端上这只是跑一遍已构建好的 engine，
+        # 很便宜。有保护，预热失败绝不会影响启动。run_swapper 内部会处理
+        # FP16/FP32 转换，所以直接给 FP32 零张量就行。
+        if str(swapper_type) == 'inswapper-256':
             if os.path.exists(self._mp('inswapper_256_phase1.onnx')):
                 try:
                     z_img = torch.zeros((1, 3, 256, 256), dtype=torch.float32, device='cuda')
@@ -1324,6 +1279,16 @@ class Models():
                     self.run_swapper_256(z_img, z_emb, z_out)
                 except Exception as e:
                     print(f'[Models.preload_pipeline_sessions] swapper_256 warm-up: '
+                          f'{type(e).__name__}: {e}')
+        elif str(swapper_type) == 'hyperswap-256':
+            if os.path.exists(self._mp('hyperswap_1a_256.onnx')):
+                try:
+                    z_img = torch.zeros((1, 3, 256, 256), dtype=torch.float32, device='cuda')
+                    z_emb = torch.zeros((1, 512), dtype=torch.float32, device='cuda')
+                    z_out = torch.zeros((1, 3, 256, 256), dtype=torch.float32, device='cuda')
+                    self.run_hyperswap(z_img, z_emb, z_out)
+                except Exception as e:
+                    print(f'[Models.preload_pipeline_sessions] hyperswap warm-up: '
                           f'{type(e).__name__}: {e}')
         elif os.path.exists(self._mp('inswapper_128.fp16.onnx')):
             try:
@@ -1339,31 +1304,27 @@ class Models():
         return self._should_drain_syncvec()
     # @profile
     def run_swapper_batched(self, image_batch, embedding_batch, output_batch):
-        """Run the swapper on a batch of N target tiles sharing one source.
-        Shapes:
-            image_batch    (N, 3, 128, 128) float32 cuda — contiguous
-            embedding_batch(1, 512) or (N, 512) float32 cuda — only row 0 is
-                read; the inswapper source binding is always (1, 512) and
-                the model broadcasts internally. (N, 512) is accepted for
-                callers that pre-existing code paths still produce, but is
-                wasted memory.
-            output_batch   (N, 3, 128, 128) float32 cuda — preallocated
-        Falls back to per-call run_swapper when the model's first batched
-        attempt fails (some inswapper exports lock the batch dim to 1).
-        After the first failure the unsupported flag is sticky so subsequent
-        calls skip the probe.
+        """对共享同一个 source 的 N 个 target tile 批量跑 swapper。
+        shape:
+            image_batch    (N, 3, 128, 128) float32 cuda——连续
+            embedding_batch(1, 512) 或 (N, 512) float32 cuda——只读第 0 行；
+                inswapper 的 source 绑定固定是 (1, 512)，模型内部会做
+                广播。(N, 512) 是为了兼容既有代码路径仍在产出这种形状的
+                调用方，但那是浪费内存。
+            output_batch   (N, 3, 128, 128) float32 cuda——已预分配
+        模型第一次批量尝试失败时回退到逐次调用 run_swapper（某些
+        inswapper 导出把 batch 维锁死为 1）。首次失败后 unsupported 标志
+        会粘住，后续调用跳过探测。
 
-        Both backends (ORT TRT-EP and CUDA-EP) accept dynamic batch via
-        a single io_binding call — the ONNX itself declares the batch
-        dim as symbolic, and ORT routes the call to whichever provider
-        is active."""
-        # Lazy-init the appropriate session (Shared or Per-Thread)
-        # by probing with an N=1 call. After this, run_swapper has
-        # populated _swapper_io_dtype + _swapper_batch_unsupported and
-        # the calling thread has its session ready.
+        两个后端（ORT TRT-EP 与 CUDA-EP）都通过单次 io_binding 调用接受
+        动态 batch——ONNX 本身把 batch 维声明为符号，ORT 会把这次调用
+        路由给当前生效的 provider。"""
+        # 用一次 N=1 的探测调用来懒初始化合适的 session（Shared 或
+        # Per-Thread）。这之后 run_swapper 已填好 _swapper_io_dtype 与
+        # _swapper_batch_unsupported，调用线程的 session 也就绪了。
         n = image_batch.shape[0]
-        # Source is shared across all targets, so always bind row 0
-        # regardless of whether the caller passed (1, 512) or (N, 512).
+        # source 在所有 target 间共享，所以无论调用方传的是 (1, 512) 还是
+        # (N, 512)，一律只绑定第 0 行。
         emb_one_caller = embedding_batch[0:1]
         if n == 1:
             self.run_swapper(image_batch, emb_one_caller, output_batch)
@@ -1381,8 +1342,8 @@ class Models():
         io_dtype = self._swapper_io_dtype
         if io_dtype == np.float16:
             image_in = image_batch.half() if image_batch.dtype != torch.float16 else image_batch
-            # Only the first row of the source is ever read; cast just
-            # that slice to FP16 instead of casting all N rows.
+            # source 只有第一行会被读到；所以只把这一片转成 FP16，而不是
+            # 把全部 N 行都转。
             embedding_in = emb_one_caller.half() if emb_one_caller.dtype != torch.float16 else emb_one_caller
             output_buf = torch.empty_like(output_batch, dtype=torch.float16).contiguous()
         else:
@@ -1390,10 +1351,10 @@ class Models():
             embedding_in = emb_one_caller
             output_buf = output_batch
 
-        # The inswapper source binding is fixed (1, 512); the model
-        # broadcasts the source identity across the target batch
-        # internally. embedding_in is already (1, 512) from emb_one_caller
-        # above; .contiguous() is a no-op on contiguous row-0 slices.
+        # inswapper 的 source 绑定固定是 (1, 512)；模型在内部把 source
+        # 身份广播到整个 target batch。embedding_in 在上面已经通过
+        # emb_one_caller 变成 (1, 512)；对连续的 row-0 分片而言
+        # .contiguous() 是空操作。
         emb_one = embedding_in.contiguous()
 
         io_binding = swapper_session.io_binding()
@@ -1412,9 +1373,9 @@ class Models():
             element_type=io_dtype, shape=(n, 3, 128, 128),
             buffer_ptr=output_buf.data_ptr(),
         )
-        # Same torch-stream drain as run_swapper — conditional on
-        # whether ORT and torch are on different streams. See
-        # _swapper_should_drain_syncvec / run_swapper for rationale.
+        # 与 run_swapper 相同的 torch-stream drain——取决于 ORT 与 torch
+        # 是否在不同 stream 上。理由见 _swapper_should_drain_syncvec /
+        # run_swapper。
         if self._swapper_should_drain_syncvec():
             with nvtx_range("syncvec_drain"):
                 self.syncvec.cpu()
@@ -1435,10 +1396,10 @@ class Models():
         if io_dtype == np.float16:
             output_batch.copy_(output_buf)
 
-    # ===== inswapper_512 (512x512 in / 512x512 out) =========================
-    # Parallel API to run_swapper / run_swapper_batched. Same conditioning
-    # vector (1,512 float32), same source-embedding -> latent pipeline via
-    # calc_swapper_latent. Only the target/output spatial shape differs.
+    # ===== inswapper_512（512x512 进 / 512x512 出）=========================
+    # 与 run_swapper / run_swapper_batched 并列的一套 API。conditioning
+    # 向量相同（(1,512) float32），source-embedding → latent 的管线也相同
+    # （都走 calc_swapper_latent）。只有 target/output 的空间 shape 不同。
 
     def run_swapper_512(self, image, embedding, output):
         swapper_512_session = self._get_swapper_512_session()
@@ -1465,10 +1426,9 @@ class Models():
         swapper_512_session.run_with_iobinding(io_binding)
 
     def _create_swapper_512_session(self):
-        """Build a fresh inswapper_512 ORT-TRT-EP session. Static
-        (1, 3, 512, 512) input — no dynamic profile needed. Batch is
-        always 1 at the engine level; callers invoke run_swapper_512
-        once per face."""
+        """构建一个新的 inswapper_512 ORT-TRT-EP session。输入是静态的
+        (1, 3, 512, 512)——不需要动态 profile。engine 层面 batch 恒为 1；
+        调用方每张脸调用一次 run_swapper_512。"""
         try:
             onnxruntime.set_default_logger_severity(3)
         except (AttributeError, OSError):
@@ -1493,16 +1453,13 @@ class Models():
                 'trt_timing_cache_path': cache_dir,
                 'trt_fp16_enable': True,
                 'trt_builder_optimization_level': 5,
-                # Note: we intentionally do NOT set
-                # `trt_dump_ep_context_model=True`. That flag writes an
-                # extra EP-context-model ONNX wrapper next to the engine
-                # in the cache dir; ORT additionally REQUIRES the cache
-                # path to be relative when this flag is on (for security
-                # reasons it printed an [E] warning at every session
-                # load). We rely on `trt_engine_cache_enable=True` for
-                # fast subsequent loads — that path works fine with
-                # absolute cache dirs and is what makes Per-Thread mode
-                # cheap after the first build.
+                # 注意: 我们有意不设 `trt_dump_ep_context_model=True`。
+                # 该标志会在 cache 目录里 engine 旁边多写一个 EP-context-model
+                # ONNX 包装文件；而且 ORT 还要求这个标志打开时 cache 路径
+                # 必须是相对路径（出于安全考虑，它会在每次 session 加载时
+                # 打一条 [E] 警告）。我们靠 `trt_engine_cache_enable=True`
+                # 换后续加载的速度——那条路径与绝对 cache 目录相处良好，
+                # 也正是它让 Per-Thread 模式在首次构建之后变得便宜。
             }
             try:
                 cur_stream = torch.cuda.current_stream()
@@ -1527,7 +1484,7 @@ class Models():
                 sess = None
 
         if sess is None:
-            # inswapper_512 has a fixed 512×512 input → EXHAUSTIVE.
+            # inswapper_512 输入固定是 512×512 → EXHAUSTIVE。
             cuda_options = self._cuda_ep_provider_options(cudnn_algo='EXHAUSTIVE')
             sess_options = self._make_session_options()
             sess = onnxruntime.InferenceSession(
@@ -1538,9 +1495,9 @@ class Models():
 
         active = sess.get_providers()
         self._swapper_512_uses_trt = bool(active) and active[0] == 'TensorrtExecutionProvider'
-        # Detect static-batch ONNX exports. inswapper_512_level2.onnx
-        # typically ships with batch=1 (the level-2 variant is per-call).
-        # If batch is symbolic, dynamic batch is supported.
+        # 探测静态 batch 的 ONNX 导出。inswapper_512_level2.onnx 通常带的是
+        # batch=1（level-2 变体是逐次调用的）。若 batch 是符号维，则支持
+        # 动态 batch。
         try:
             inp_shape = sess.get_inputs()[0].shape
             shape0 = inp_shape[0]
@@ -1559,13 +1516,13 @@ class Models():
             'swapper_512', 'swapper_512_model', self._create_swapper_512_session,
         )
 
-    # ===== inswapper_256_phase1 (256x256 native, emap latent) =============
-    # Single-tile native 256 swapper. Same source conditioning as the 128 /
-    # 512 inswappers (emap-projected latent fed as `source`). I/O tensor
-    # names are `target256` (input, 1×3×256×256), `source` (input, 1×512),
-    # and `p2_refined` (output, 1×3×256×256). The ONNX declares a dynamic
-    # spatial input, so the TRT-EP branch pins a fixed 256 profile (we only
-    # ever feed 256×256).
+    # ===== inswapper_256_phase1（256x256 原生，emap latent）==============
+    # 单 tile 的原生 256 swapper。source conditioning 与 128 / 512 两个
+    # inswapper 相同（喂给 `source` 的是 emap 投影后的 latent）。I/O
+    # tensor 名是 `target256`（输入，1×3×256×256）、`source`（输入，
+    # 1×512）和 `p2_refined`（输出，1×3×256×256）。该 ONNX 声明了动态的
+    # 空间输入，所以 TRT-EP 分支把 profile 固定在 256（我们永远只喂
+    # 256×256）。
 
     def run_swapper_256(self, image, embedding, output):
         swapper_256_session = self._get_swapper_256_session()
@@ -1591,19 +1548,25 @@ class Models():
             self.syncvec.cpu()
         swapper_256_session.run_with_iobinding(io_binding)
 
-    def _create_swapper_256_session(self):
-        """Build a fresh inswapper_256_phase1 ORT-TRT-EP session. The ONNX
-        has a dynamic (1, 3, H, W) input; we only ever feed 256×256, so the
-        TRT profile is pinned min=opt=max at 256. FP32 I/O; batch is always
-        1 (run_swapper_256 is called once per face)."""
+    def _create_single_pass_swapper_session(
+        self, onnx_name, *, fp16, profiles, label, backend_pref, uses_trt_attr,
+    ):
+        """为单次 pass 的 swapper 生成器构建一个 ORT session。
+
+        `profiles` 固定住动态的空间输入（{input: shape 字符串} 映射）；
+        ONNX 完全静态的生成器传 None。`fp16` 只为 engine 构建切换 TRT
+        FP16——I/O 缓冲仍是 FP32，这两个导出模型声明的都是 FP32。
+
+        两个 native-256 swapper 共用这一份：彼此只有 FP16 设置、profile
+        固定值和文件名不同。
+        """
         try:
             onnxruntime.set_default_logger_severity(3)
         except (AttributeError, OSError):
             pass
 
-        pref = self._backend_pref.get('swapper_256_model')
-        want_trt = pref != 'onnx'
-        onnx_path = self._mp('inswapper_256_phase1.onnx')
+        want_trt = self._backend_pref.get(backend_pref) != 'onnx'
+        onnx_path = self._mp(onnx_name)
         sess = None
 
         if want_trt:
@@ -1618,26 +1581,11 @@ class Models():
                 'trt_engine_cache_path': cache_dir,
                 'trt_timing_cache_enable': True,
                 'trt_timing_cache_path': cache_dir,
-                # FP16 is unsafe for this native-256 inswapper family. The
-                # model normalizes with decomposed ReduceMean→Sub→Sqrt→Div
-                # variance groups, and FP16 variance computes with catastrophic
-                # cancellation → a blurry/noisy face. Build the whole engine in
-                # FP32: the model ships FP32 weights (no FP16 export), so this
-                # is its native precision, and TRT still beats CUDA-EP via
-                # kernel fusion. Cost: ~2x the engine VRAM of an FP16 build
-                # (notable in Per-Thread mode with N per-worker engines). (The
-                # sibling phase2 variant additionally had InstanceNormalization
-                # ops that defeated trt_layer_norm_fp32_fallback — FP32 is the
-                # confirmed-safe path for these native-256 swappers.)
-                'trt_fp16_enable': False,
+                'trt_fp16_enable': fp16,
                 'trt_builder_optimization_level': 5,
-                # Dynamic spatial input pinned to the single size we feed.
-                # Only `target256` is dynamic; `source` (1, 512) is static
-                # and needs no profile.
-                'trt_profile_min_shapes': 'target256:1x3x256x256',
-                'trt_profile_opt_shapes': 'target256:1x3x256x256',
-                'trt_profile_max_shapes': 'target256:1x3x256x256',
             }
+            if profiles:
+                trt_ep_options.update(profiles)
             try:
                 cur_stream = torch.cuda.current_stream()
                 if cur_stream is not None and cur_stream != torch.cuda.default_stream():
@@ -1656,12 +1604,11 @@ class Models():
                     ],
                 )
             except Exception as e:
-                print('[Models] inswapper_256 TRT-EP init failed (%s: %s); '
-                      'falling back to CUDA EP' % (type(e).__name__, e))
+                print('[Models] %s TRT-EP init failed (%s: %s); '
+                      'falling back to CUDA EP' % (label, type(e).__name__, e))
                 sess = None
 
         if sess is None:
-            # We only ever feed a fixed 256×256 → EXHAUSTIVE (one-time warmup).
             cuda_options = self._cuda_ep_provider_options(cudnn_algo='EXHAUSTIVE')
             sess_options = self._make_session_options()
             sess = onnxruntime.InferenceSession(
@@ -1671,14 +1618,108 @@ class Models():
             )
 
         active = sess.get_providers()
-        self._swapper_256_uses_trt = bool(active) and active[0] == 'TensorrtExecutionProvider'
-        backend = 'TensorrtExecutionProvider' if self._swapper_256_uses_trt else 'CUDAExecutionProvider'
-        print(f'{self._load_tag("swap")} [Models] inswapper_256_phase1: {backend}')
+        uses_trt = bool(active) and active[0] == 'TensorrtExecutionProvider'
+        setattr(self, uses_trt_attr, uses_trt)
+        backend = 'TensorrtExecutionProvider' if uses_trt else 'CUDAExecutionProvider'
+        print(f'{self._load_tag("swap")} [Models] {label}: {backend}')
         return sess
+
+    def _create_swapper_256_session(self):
+        """构建一个新的 inswapper_256_phase1 ORT-TRT-EP session。该 ONNX
+        有一个动态 (1, 3, H, W) 输入；我们永远只喂 256×256，所以 TRT
+        profile 的 min=opt=max 全固定在 256。FP32 I/O；batch 恒为 1
+        （run_swapper_256 每张脸调用一次）。"""
+        # FP16 对这一系 native-256 inswapper 不安全。模型用分解后的
+        # ReduceMean→Sub→Sqrt→Div 方差组做归一化，而 FP16 方差会出现
+        # 灾难性抵消 → 一张模糊/带噪点的脸。整个 engine 按 FP32 构建:
+        # 模型本身带的就是 FP32 权重（没有 FP16 导出），FP32 就是它的
+        # 原生精度，而 TRT 靠 kernel 融合仍能胜过 CUDA-EP。代价: engine
+        # VRAM 约为 FP16 构建的 2 倍（Per-Thread 模式下有 N 个 per-worker
+        # engine 时值得注意）。（隔壁的 phase2 变体还额外带有
+        # InstanceNormalization 算子，会让 trt_layer_norm_fp32_fallback
+        # 失效——FP32 是这些 native-256 swapper 已验证的安全路径。）
+        return self._create_single_pass_swapper_session(
+            'inswapper_256_phase1.onnx',
+            fp16=False,
+            # 动态的空间输入固定到我们唯一喂的那一个尺寸。只有
+            # `target256` 是动态的；`source` (1, 512) 是静态的，不需要
+            # profile。
+            profiles={
+                'trt_profile_min_shapes': 'target256:1x3x256x256',
+                'trt_profile_opt_shapes': 'target256:1x3x256x256',
+                'trt_profile_max_shapes': 'target256:1x3x256x256',
+            },
+            label='inswapper_256_phase1',
+            backend_pref='swapper_256_model',
+            uses_trt_attr='_swapper_256_uses_trt',
+        )
 
     def _get_swapper_256_session(self):
         return self._get_model_session(
             'swapper_256', 'swapper_256_model', self._create_swapper_256_session,
+        )
+
+    def run_hyperswap(self, image, embedding, output):
+        """单次 pass 的 HyperSwap 生成器。
+
+        image    (1, 3, 256, 256) float32 cuda，取值 [-1, 1]——裁剪图
+                 已按 (x/255 - 0.5) / 0.5 归一化。这步由调用方
+                 （_hyperswap_pass）做，因为同一个缓冲还要喂给要求 0-1
+                 的 inswapper 路径。
+        embedding (1, 512) float32 cuda，raw L2-normalized 身份向量
+                 （latent_mode='raw'——不做 emap 投影）。
+        output   (1, 3, 256, 256) float32 cuda，接收仍是 [-1, 1] 的
+                 混合结果；由调用方做反归一化。
+
+        ONNX 还输出第二个张量（'mask'），而图内部已经把它应用过了
+        （output*mask + target*(1-mask)），所以它保持不绑定，不为它
+        付代价。
+        """
+        session = self._get_hyperswap_session()
+
+        io_binding = session.io_binding()
+        io_binding.bind_input(
+            name='target', device_type='cuda', device_id=0,
+            element_type=np.float32, shape=(1, 3, 256, 256),
+            buffer_ptr=image.data_ptr(),
+        )
+        io_binding.bind_input(
+            name='source', device_type='cuda', device_id=0,
+            element_type=np.float32, shape=(1, 512),
+            buffer_ptr=embedding.data_ptr(),
+        )
+        io_binding.bind_output(
+            name='output', device_type='cuda', device_id=0,
+            element_type=np.float32, shape=(1, 3, 256, 256),
+            buffer_ptr=output.data_ptr(),
+        )
+
+        if self._should_drain_syncvec():
+            self.syncvec.cpu()
+        session.run_with_iobinding(io_binding)
+
+    def _create_hyperswap_session(self):
+        """构建一个新的 hyperswap_1a_256 ORT session。
+
+        该导出是 FP32（FaceFusion 有 fp16 IO 变体，但我们下载的那个声明
+        的是 FP32），所以 TRT 与 CUDA 两条路径都绑定 FP32 缓冲，
+        run_hyperswap 不做任何 dtype 转换。TRT FP16 只为 engine 构建启用
+        ——它把 engine VRAM 减半，而这个生成器以卷积为主，AAD 堆栈里没有
+        inswapper 需要 fp32-fallback 保护的那种 LayerNorm。所有输入都是
+        静态的 (1,3,256,256) 和 (1,512)，所以不需要 TRT profile。
+        """
+        return self._create_single_pass_swapper_session(
+            'hyperswap_1a_256.onnx',
+            fp16=True,
+            profiles=None,
+            label='hyperswap_1a_256',
+            backend_pref='hyperswap_model',
+            uses_trt_attr='_hyperswap_uses_trt',
+        )
+
+    def _get_hyperswap_session(self):
+        return self._get_model_session(
+            'hyperswap', 'hyperswap_model', self._create_hyperswap_session,
         )
 
     def run_GFPGAN(self, image, output):
@@ -1764,16 +1805,15 @@ class Models():
 
     @staticmethod
     def _ort_type_to_np(type_str):
-        """Map an ORT NodeArg type string ('tensor(float16)') to a numpy
-        dtype. Defaults to float32 for anything unrecognised."""
+        """把 ORT NodeArg 的类型字符串（'tensor(float16)'）映射为 numpy
+        dtype。无法识别的一律按 float32 处理。"""
         return np.float16 if 'float16' in type_str else np.float32
 
     def _load_dfl_xseg_model(self):
-        """Lazy-load the user-supplied DeepFaceLab XSeg ONNX and introspect
-        its I/O contract. DFL's native export is NHWC (1, res, res, 3) with
-        an NHWC (1, res, res, 1) mask output; some community converters emit
-        NCHW. Node names and resolution also vary, so read them off the graph
-        rather than hardcoding."""
+        """懒加载用户自备的 DeepFaceLab XSeg ONNX 并 introspection 它的
+        I/O 契约。DFL 的原生导出是 NHWC (1, res, res, 3)，mask 输出也是
+        NHWC (1, res, res, 1)；某些社区转换器给出的是 NCHW。节点名和
+        分辨率同样会变，所以这些值都从图上读，不硬编码。"""
         self.dfl_xseg_model = onnxruntime.InferenceSession(
             self._mp("dfl_xseg.onnx"), providers=self.providers,
         )
@@ -1785,9 +1825,9 @@ class Models():
         self._dfl_xseg_in_dtype = self._ort_type_to_np(inp.type)
         self._dfl_xseg_out_dtype = self._ort_type_to_np(out.type)
 
-        # Decide layout + resolution from the input shape. Symbolic dims
-        # (e.g. 'batch') come through as strings; the channel/spatial dims
-        # are normally concrete. NCHW iff dim 1 == 3, else assume NHWC.
+        # 从输入 shape 判定 layout 与分辨率。符号维（例如 'batch'）过来是
+        # 字符串；通道/空间维通常是具体数值。dim 1 == 3 即 NCHW，否则按
+        # NHWC 处理。
         shape = list(inp.shape)
         def _as_int(v, fallback):
             return v if isinstance(v, int) and v > 0 else fallback
@@ -1806,18 +1846,17 @@ class Models():
         )
 
     def run_dfl_xseg(self, img):
-        """Run the DeepFaceLab XSeg occlusion model on an aligned face.
+        """对一张对齐的人脸跑 DeepFaceLab XSeg 遮挡模型。
 
-        `img` is a (3, H, W) RGB float tensor in [0, 255] on cuda (the
-        pipeline-aligned input face). Returns a (res, res) float32 mask in
-        [0, 1] on cuda where 1 = keep the swap, 0 = let the original show
-        through (DFL convention: XSeg paints the face region as foreground).
+        `img` 是 cuda 上 (3, H, W) 的 RGB float tensor，取值 [0, 255]
+        （经管线对齐后的输入人脸）。返回 cuda 上 (res, res) 的 float32
+        mask，取值 [0, 1]，其中 1 = 保留换脸结果，0 = 让原图透出来
+        （DFL 约定: XSeg 把人脸区域涂成前景）。
 
-        Preprocessing matches DFL: BGR channel order, values in [0, 1].
+        预处理与 DFL 一致: BGR 通道顺序，取值 [0, 1]。
 
-        The model is user-supplied and may be absent; if so we warn once
-        and return an all-ones mask (a no-op composite) rather than crashing
-        the swap pipeline on every frame."""
+        模型由用户自备，可能不存在；此时只警告一次，并返回全 1 的 mask
+        （等于不做合成），而不是让换脸管线每帧都崩。"""
         if not self.dfl_xseg_model:
             path = self._mp("dfl_xseg.onnx")
             if not os.path.exists(path):
@@ -1836,9 +1875,9 @@ class Models():
 
         res = self._dfl_xseg_res
 
-        # (3, H, W) RGB [0,255] -> (1, 3, res, res) BGR [0,1]. The aligned
-        # face arrives as uint8; cast first since F.interpolate's bilinear
-        # path doesn't implement the Byte dtype.
+        # (3, H, W) RGB [0,255] -> (1, 3, res, res) BGR [0,1]。对齐后的人脸
+        # 是 uint8；先做类型转换，因为 F.interpolate 的 bilinear 路径没有
+        # 实现 Byte dtype。
         x = img.unsqueeze(0).to(torch.float32)
         if x.shape[-1] != res or x.shape[-2] != res:
             x = torch.nn.functional.interpolate(
@@ -1892,15 +1931,13 @@ class Models():
             return self._detect_retinaface_inner(img, max_num, score, input_size)
 
     def _detect_retinaface_inner(self, img, max_num, score, input_size=640):
-        # Resize image to fit within the input_size. Model is fully
-        # convolutional so it accepts any multiple-of-32 edge length;
-        # smaller input → linearly less compute → faster detect at the
-        # cost of recall on small faces.
+        # 把图缩放到 input_size 之内。模型是全卷积的，所以任何 32 的
+        # 倍数边长都接受；输入越小 → 计算量线性越少 → 检测越快，代价是
+        # 小脸的召回率下降。
         #
-        # Clamp to the configured TRT-EP profile range (320-640) when
-        # TRT is active. The session is configured with that explicit
-        # profile in _create_retinaface_session, so requests outside
-        # the range would error inside ORT.
+        # TRT 激活时把请求夹到配置好的 TRT-EP profile 范围（320-640）内。
+        # session 在 _create_retinaface_session 里配的就是那个显式
+        # profile，超出范围的请求会在 ORT 内部直接报错。
         with nvtx_range("rf_preprocess"):
             if self._retinaface_uses_trt and hasattr(self, '_retinaface_trt_input_max'):
                 lo = self._retinaface_trt_input_min
@@ -1917,10 +1954,10 @@ class Models():
                     req = max(lo, min(hi, req))
                 input_size = req
             input_size = (int(input_size), int(input_size))
-            # Plain Python float math — the previous torch.div on int args
-            # wrapped both in CUDA tensors for a single scalar divide, paid
-            # tensor-allocation overhead, and forced a downstream sync via
-            # `.numpy()`. None of that is needed; these are scalars.
+            # 纯 Python 浮点运算——此前在 int 参数上用 torch.div 会为了
+            # 一次标量除法把两边都包成 CUDA tensor，付出 tensor 分配的
+            # 开销，还通过 `.numpy()` 强制了一次下游同步。这些都不必要；
+            # 它们只是标量。
             im_ratio = float(img.size()[1]) / float(img.size()[2])
 
             model_ratio = float(input_size[1]) / input_size[0]
@@ -1932,46 +1969,42 @@ class Models():
                 new_height = int(new_width * im_ratio)
             det_scale = float(new_height) / float(img.size()[1])
 
-            # Resize input to (3, new_h, new_w) uint8 on GPU. This kernel
-            # is the dominant cost of preprocessing; the rest of the chain
-            # below is cheap arithmetic on the resized tile.
+            # 在 GPU 上把输入缩放到 (3, new_h, new_w) uint8。这个 kernel 是
+            # 预处理的主要开销；下面链条的其余部分都只是对缩放后 tile 的
+            # 廉价算术。
             img_resized = v2.functional.resize(
                 img, [new_height, new_width], antialias=True,
             )
 
-            # Pre-allocated per-worker letterbox buffer (1, 3, H, W) float32.
-            # Reusing it across calls avoids the torch.zeros allocator hit
-            # every frame; keeping the canonical (1, 3, H, W) shape end-to-
-            # end avoids the HWC↔CHW permute + .contiguous() round-trip
-            # the legacy path needed before the io_binding bind_input call.
+            # 预分配的 per-worker letterbox 缓冲 (1, 3, H, W) float32。
+            # 跨调用复用它省掉了每帧 torch.zeros 的分配器开销；端到端保持
+            # 规范的 (1, 3, H, W) shape，也免掉了旧路径在 io_binding
+            # bind_input 调用前所需的 HWC↔CHW permute + .contiguous() 往返。
             det_img = self._get_retinaface_input_buffer(input_size[0])
-            # Zero the previous frame's letterbox padding. zero_() on the
-            # cached buffer is one kernel and small; restricting to the
-            # padding strips would need more launches than just clearing
-            # the whole thing.
+            # 清零上一帧的 letterbox 填充。在缓存缓冲上 zero_() 只是一个
+            # 小 kernel；只清那几条填充带反而需要更多次 launch，不如整体
+            # 清一遍。
             det_img.zero_()
-            # BGR swap + uint8→float + normalize + slice-write fused into
-            # one chained expression. img_resized[[2, 1, 0]] is the BGR
-            # reindex (advanced indexing returns a contiguous copy);
-            # .float() materializes a float32 buffer; .sub_()/.div_() are
-            # in-place on that fresh buffer (no extra allocations); .copy_()
-            # writes the result into det_img's letterbox slot. Total: one
-            # gather + one type-cast + two in-place ops + one copy_, vs the
-            # legacy six-op chain (zero, slice, BGR, sub, div, contiguous).
+            # BGR 交换 + uint8→float + 归一化 + 分片写入融合进一条链式
+            # 表达式。img_resized[[2, 1, 0]] 是 BGR 重索引（高级索引会返回
+            # 连续副本）；.float() 落地一个 float32 缓冲；.sub_()/.div_()
+            # 在那个新缓冲上原地做（无额外分配）；.copy_() 把结果写进
+            # det_img 的 letterbox 槽位。合计: 一次 gather + 一次类型转换
+            # + 两次原地操作 + 一次 copy_，而旧路径是六步链（zero、slice、
+            # BGR、sub、div、contiguous）。
             det_img[0, :, :new_height, :new_width].copy_(
                 img_resized[[2, 1, 0]].float().sub_(127.5).div_(128.0)
             )
 
         with nvtx_range("rf_ort_run"):
-            # det_10g has 9 outputs — 3 scores, 3 bbox deltas, 3 kps deltas
-            # at strides 8/16/32, declared in that order (names vary by
-            # export). The downstream loop consumes them by index.
+            # det_10g 有 9 个输出——3 个 score、3 个 bbox delta、3 个 kps
+            # delta，分别在 stride 8/16/32 上，按这个顺序声明（各导出的
+            # 名字不同）。下游循环按索引消费它们。
 
-            # Pre-allocate output buffers on GPU. Shapes are deterministic
-            # from input_size + stride (det_10g has 2 anchors per cell).
-            # Binding them as buffer_ptr lets ORT write directly into our
-            # torch tensors, so the entire post-processing stays on GPU —
-            # no copy_outputs_to_cpu, no host round-trip before NMS.
+            # 在 GPU 上预分配输出缓冲。shape 由 input_size + stride 完全
+            # 确定（det_10g 每格 2 个 anchor）。把它们作为 buffer_ptr 绑定，
+            # ORT 就能直接写进我们的 torch tensor，于是整个后处理都留在 GPU
+            # ——没有 copy_outputs_to_cpu，NMS 前也没有主机往返。
             input_height = det_img.shape[2]
             input_width = det_img.shape[3]
             strides = (8, 16, 32)
@@ -2014,23 +2047,21 @@ class Models():
                     buffer_ptr=buf.data_ptr(),
                 )
 
-            # Conditional torch-stream drain. Skipped when the session was
-            # built with user_compute_stream pointing at the worker's
-            # current torch stream (Per-Thread + worker stream): same
-            # stream means implicit ordering.
+            # 有条件的 torch-stream drain。当 session 是用指向 worker 当前
+            # torch stream 的 user_compute_stream 构建时（Per-Thread +
+            # worker stream）跳过: 同一条 stream 意味着隐式顺序。
             if self._should_drain_syncvec():
                 self.syncvec.cpu()
             retinaface_session.run_with_iobinding(io_binding)
 
         with nvtx_range("rf_postprocess"):
-            # ===== GPU-side post-processing =====
-            # Everything from here runs in torch on the worker's CUDA
-            # stream — bbox decode, kps decode, score threshold, cross-
-            # stride concat, sort, scale-back, NMS. The GIL is released
-            # during the CUDA kernels, so other workers don't queue up
-            # waiting for it during the bulk of detect_retinaface's tail
-            # (which was the dominant source of "User Request" GIL waits
-            # in the 2026-05-21 nsys trace).
+            # ===== GPU 侧后处理 =====
+            # 从这里开始全部在 torch 里、worker 的 CUDA stream 上运行——
+            # bbox 解码、kps 解码、score 阈值、跨 stride 拼接、排序、
+            # 尺度还原、NMS。CUDA kernel 执行期间 GIL 是释放的，所以其他
+            # worker 不会在 detect_retinaface 尾段的大头上排队等它
+            # （那是 2026-05-21 nsys trace 里 "User Request" GIL 等待的
+            # 主要来源）。
             scores_list = []
             bboxes_list = []
             kpss_list = []
@@ -2046,8 +2077,8 @@ class Models():
 
                 pos_mask = scores_t >= score
 
-                # Bbox decode: anchor ± delta. Sign pattern [-x1, -y1, +x2,
-                # +y2] matches det_10g's FCOS-style face regression head.
+                # Bbox 解码: anchor ± delta。符号模式 [-x1, -y1, +x2, +y2]
+                # 对应 det_10g 的 FCOS 式人脸回归头。
                 ax = anchor_centers[:, 0]
                 ay = anchor_centers[:, 1]
                 bboxes = torch.stack(
@@ -2060,9 +2091,9 @@ class Models():
                     dim=-1,
                 )                                                # (N, 4)
 
-                # KPS decode: 5 (x, y) pairs per anchor, all sharing the
-                # same anchor offset. The numpy original looped over pairs;
-                # vectorized this is `view + broadcast-add`.
+                # KPS 解码: 每个 anchor 5 个 (x, y) 对，共用同一个 anchor
+                # 偏移。numpy 原版是逐对循环；向量化后就是
+                # `view + broadcast-add`。
                 kpss = kps_preds.view(-1, 5, 2) + anchor_centers.unsqueeze(1)
 
                 scores_list.append(scores_t[pos_mask])
@@ -2076,10 +2107,9 @@ class Models():
             if all_scores.numel() == 0:
                 return np.zeros((0, 5, 2), dtype=np.float32)
 
-            # Sort by score descending (matches the np.argsort()[::-1] in
-            # the old code), then NMS in IoU space. det_scale division
-            # rescales from the letterboxed model space back to original
-            # image coordinates.
+            # 按 score 降序排（与旧代码里的 np.argsort()[::-1] 一致），然后
+            # 在 IoU 空间做 NMS。除以 det_scale 把坐标从 letterbox 后的
+            # 模型空间还原回原图坐标系。
             order = torch.argsort(all_scores, descending=True)
             all_scores = all_scores[order]
             all_bboxes = all_bboxes[order] / det_scale
@@ -2087,12 +2117,10 @@ class Models():
 
             keep = torchvision.ops.nms(all_bboxes, all_scores, iou_threshold=0.4)
 
-            # max_num truncation with area-minus-center-distance weighting,
-            # matches the legacy heuristic. Preserves the original's quirk
-            # of using det_img.shape[0]/[1] (the batch and channel dims of
-            # the (1, 3, H, W) tensor — values 0 and 1) as the "image
-            # center"; the center-distance term is small relative to area
-            # so the practical difference is negligible.
+            # max_num 截断，权重是"面积 - 中心距"，与旧启发式一致。保留了
+            # 原实现的一个怪癖: 把 det_img.shape[0]/[1]（即 (1, 3, H, W)
+            # tensor 的 batch 与 channel 维——值为 0 和 1）当作"图像中心"；
+            # 中心距项相对面积很小，实际差别可以忽略。
             if max_num > 0 and keep.shape[0] > max_num:
                 kept_bboxes = all_bboxes[keep]
                 area = (kept_bboxes[:, 2] - kept_bboxes[:, 0]) * (
@@ -2107,20 +2135,19 @@ class Models():
                 bindex = torch.argsort(values, descending=True)[:max_num]
                 keep = keep[bindex]
 
-            # Single device boundary at the very end. Everything before
-            # was queued on the worker's CUDA stream.
+            # 最末尾唯一一次设备边界。在此之前的一切都只是排在 worker 的
+            # CUDA stream 上。
             return all_kpss[keep].cpu().numpy()
 
     def detect_scrdf(self, img, max_num, score, input_size=640):
-        # Resize image to fit within the input_size. Model is fully
-        # convolutional so it accepts any multiple-of-32 edge length;
-        # smaller input → linearly less compute → faster detect at the
-        # cost of recall on small faces.
+        # 把图缩放到 input_size 之内。模型是全卷积的，所以任何 32 的
+        # 倍数边长都接受；输入越小 → 计算量线性越少 → 检测越快，代价是
+        # 小脸的召回率下降。
         input_size = (int(input_size), int(input_size))
-        # Plain Python float math — the previous torch.div on int args
-        # wrapped both in CUDA tensors for a single scalar divide, paid
-        # tensor-allocation overhead, and forced a downstream sync via
-        # `.numpy()`. None of that is needed; these are scalars.
+        # 纯 Python 浮点运算——此前在 int 参数上用 torch.div 会为了
+        # 一次标量除法把两边都包成 CUDA tensor，付出 tensor 分配的
+        # 开销，还通过 `.numpy()` 强制了一次下游同步。这些都不必要；
+        # 它们只是标量。
         im_ratio = float(img.size()[1]) / float(img.size()[2])
 
         model_ratio = float(input_size[1]) / input_size[0]
@@ -2132,8 +2159,7 @@ class Models():
             new_height = int(new_width * im_ratio)
         det_scale = float(new_height) / float(img.size()[1])
 
-        # Functional form avoids constructing a fresh v2.Resize
-        # transform object on every call.
+        # 用函数式而不是 transform 对象，避免每次调用都新建一个 v2.Resize。
         img = v2.functional.resize(
             img, [new_height, new_width], antialias=True,
         )
@@ -2142,13 +2168,13 @@ class Models():
         det_img = torch.zeros((input_size[1], input_size[0], 3), dtype=torch.float32, device='cuda:0')
         det_img[:new_height,:new_width,  :] = img
 
-        # Switch to BGR and normalize
+        # 转成 BGR 并归一化
         det_img = det_img[:, :, [2,1,0]]
         det_img = torch.sub(det_img, 127.5)
         det_img = torch.div(det_img, 128.0)
         det_img = det_img.permute(2, 0, 1) #3,128,128
         
-        # Prepare data and find model parameters 
+        # 准备数据并查找模型参数
         det_img = torch.unsqueeze(det_img, 0).contiguous()
         input_name = self.scrdf_model.get_inputs()[0].name
         
@@ -2163,7 +2189,7 @@ class Models():
         for i in range(len(output_names)):
             io_binding.bind_output(output_names[i], 'cuda') 
         
-        # Sync and run model
+        # 同步并运行模型
         syncvec = self.syncvec.cpu()        
         self.scrdf_model.run_with_iobinding(io_binding)
         
@@ -2227,16 +2253,16 @@ class Models():
         scores_ravel = scores.ravel()
         order = scores_ravel.argsort()[::-1]
 
-        # det_scale is a Python float now (used to be a torch tensor
-        # forced through .numpy() here, which was a hidden sync point).
+        # det_scale 现在是 Python float（过去是 torch tensor，要在这里
+        # 强制过一遍 .numpy()，那是个隐藏的同步点）。
         bboxes = np.vstack(bboxes_list) / det_scale
 
         kpss = np.vstack(kpss_list) / det_scale
         pre_det = np.hstack((bboxes, scores)).astype(np.float32, copy=False)
         pre_det = pre_det[order, :]
-        
-        # torchvision.ops.nms (CUDA): see detect_retinaface for the
-        # bit-exactness note on the +1 area convention.
+
+        # torchvision.ops.nms（CUDA）: +1 面积约定的位精确性说明见
+        # detect_retinaface。
         thresh = 0.4
         if pre_det.shape[0] == 0:
             keep = []
@@ -2272,16 +2298,16 @@ class Models():
 
     def recognize(self, img, face_kps, dim):
         with nvtx_range("rec_preprocess"):
-            # Find transform
+            # 求变换
             dst = self.arcface_dst.copy() * dim
 
             tform = trans.SimilarityTransform.from_estimate(face_kps, dst)
 
-            # Transform
+            # 施加变换
             img = v2.functional.affine(img, tform.rotation*57.2958, (tform.translation[0], tform.translation[1]) , tform.scale, 0, center = (0,0) )
             img = v2.functional.crop(img, 0,0, dim*112, dim*112)
 
-            # Switch to BGR and normalize
+            # 转成 BGR 并归一化
             img = img.permute(1,2,0) #112,112,3
             cropped_image = img
             img = img[:, :, [2,1,0]]
@@ -2314,7 +2340,7 @@ class Models():
                     recognition_session.run_with_iobinding(io_binding)
                     temp_holder.append(torch.squeeze(output).cpu().numpy())
 
-            # Return embedding
+            # 返回 embedding
             out = np.mean(temp_holder, 0)
             return out, cropped_image
         
