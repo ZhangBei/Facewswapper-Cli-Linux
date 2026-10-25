@@ -1,6 +1,6 @@
 # Faceswapper 无界面换脸 CLI
 
-基于 insightface `inswapper` 模型的命令行换脸工具，面向 **Ubuntu +
+基于 insightface `inswapper` 模型的命令行换脸工具，面向 **Ubuntu 24.04 +
 NVIDIA GPU** 的云端/服务器环境。没有图形界面，不需要桌面环境，通过 SSH
 即可运行。
 
@@ -13,79 +13,35 @@ NVIDIA GPU** 的云端/服务器环境。没有图形界面，不需要桌面环
 - 图片换脸：单张、批量、多人脸或只处理最大人脸
 - 视频换脸：替换所有人，或只替换参考图指定的目标人物
 - 多张源脸合并为一个身份
-- 自动下载缺失模型、多下载源、SHA-256 完整性校验
+- 换脸模型可选 inswapper_128（polyphase 拼接到 256/512）或 hyperswap-256
+- 按需下载模型、多下载源、完整性校验
 - 可选人脸修复、遮罩、色彩匹配等参数
 
 ## 目录
 
-0. [快速开始](#0-快速开始)
-1. [环境要求](#1-环境要求)
-2. [安装](#2-安装)
-3. [准备模型文件](#3-准备模型文件)
-4. [环境自检](#4-环境自检)
-5. [图片换脸](#5-图片换脸)
-6. [视频换脸](#6-视频换脸)
-7. [常用参数](#7-常用参数)
-8. [常见问题](#8-常见问题)
-9. [项目结构](#9-项目结构)
-10. [免责声明](#10-免责声明)
+1. [环境准备](#1-环境准备)
+2. [安装步骤](#2-安装步骤)
+3. [使用方法](#3-使用方法)
+4. [常见问题](#4-常见问题)
+5. [免责声明](#5-免责声明)
 
 ---
 
-## 0. 快速开始
+## 1. 环境准备
 
-在一台新的 Ubuntu 24.04 + NVIDIA GPU 云主机上，按顺序执行：
-
-```bash
-# 1. 安装 Miniconda（已有 conda 可跳过）
-curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
-    -o /tmp/miniconda.sh
-bash /tmp/miniconda.sh -b -p "$HOME/miniconda3"
-source "$HOME/miniconda3/bin/activate"
-
-# 2. 创建 conda 环境（含 CUDA、FFmpeg、libGL）
-cd /path/to/Faceswapper-Cli
-conda env create -f environment.yml
-conda activate faceswapper
-python -m pip install --upgrade pip
-
-# 3. 安装 CUDA Python 运行时（驱动较旧时改用 cu126 或 cu124）
-python tools/install.py cu128
-
-# 4. 下载并校验模型（可省略，首次换脸会自动下载）
-python -m faceswapper.cli --models ./models download-models
-
-# 5. 环境自检
-python tools/check_env.py --models ./models
-
-# 6. 图片换脸
-python -m faceswapper.cli --models ./models swap \
-    --source face.jpg \
-    --target target.jpg \
-    --output out.jpg
-```
-
-每一步的详细说明见后续章节。
-
----
-
-## 1. 环境要求
+### 1.1 环境要求
 
 | 项目 | 要求 |
 |---|---|
 | 操作系统 | Ubuntu 24.04；其他 Linux 理论可用 |
 | Python | 3.11 或更高 |
 | GPU | NVIDIA GPU；4 GB 显存可尝试低配参数，推荐 8 GB 以上 |
-| NVIDIA 驱动 | 支持所选 CUDA wheel；cu128 建议驱动 570+ |
-| FFmpeg | 6.x，包含 `libx264` 和 `ffprobe` |
+| NVIDIA 驱动 | cu128 需 570+，cu126 需 560+，cu124 需 550+ |
+| FFmpeg | 6.1 或更高，包含 `libx264` 和 `ffprobe` |
 | 网络工具 | `curl`，用于模型下载 |
 | 磁盘 | 基础模型约 450 MB，另需缓存和输出空间 |
 
-> **当前推理代码必须使用 NVIDIA GPU。** ONNX Runtime、PyTorch 张量、
-> `io_binding` 和视频处理路径固定使用 CUDA。纯 CPU 需要先完成设备抽象改造，
-> 目前没有可靠的 `--device cpu` 参数。
-
-先确认 GPU：
+先确认 GPU 和驱动：
 
 ```bash
 nvidia-smi
@@ -93,41 +49,22 @@ nvidia-smi
 
 能够正常打印 GPU 型号和驱动版本即可继续。
 
----
+> **当前推理代码必须使用 NVIDIA GPU。** ONNX Runtime、PyTorch 张量、
+> `io_binding` 和视频处理路径固定使用 CUDA。纯 CPU 需要先完成设备抽象改造，
+> 目前没有可靠的 `--device cpu` 参数。
 
-## 2. 安装
-
-### 2.0 两种安装方式
-
-本项目支持两种环境方案，任选其一：
-
-| 方案 | 适用场景 | 章节 |
-|---|---|---|
-| Conda（推荐） | 云主机没有 root，或想统一管理 CUDA、FFmpeg | [2.1](#21-方式一conda推荐) |
-| venv + apt | 有 root 权限，希望轻量安装 | [2.4](#24-方式二venv--apt) |
-
-两种方式的 Python 依赖完全相同，都通过 `pip` 安装；模型下载和换脸命令也
-完全一致。
-
----
-
-
-### 2.1 方式一：Conda（推荐）
+### 1.2 安装系统工具
 
 ```bash
 sudo apt update
-sudo apt install -y python3.11-venv ffmpeg curl
+sudo apt install -y curl
 ```
 
-验证：
+`curl` 是模型下载器断点续传所需的唯一系统工具，FFmpeg 由 conda 提供（见下）。
 
-```bash
-ffmpeg -version
-ffprobe -version
-curl --version
-```
+### 1.3 安装 Miniconda
 
-安装 Miniconda（如尚未安装）：
+已有 conda 可跳过这一步：
 
 ```bash
 curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
@@ -136,8 +73,7 @@ bash /tmp/miniconda.sh -b -p "$HOME/miniconda3"
 source "$HOME/miniconda3/bin/activate"
 ```
 
-创建环境。`environment.yml` 会安装 Python 3.11、FFmpeg、CUDA 运行时和
-OpenCV 所需的 `libGL`：
+### 1.4 创建 conda 环境
 
 ```bash
 cd /path/to/Faceswapper-Cli
@@ -146,57 +82,39 @@ conda activate faceswapper
 python -m pip install --upgrade pip
 ```
 
+`environment.yml` 只安装**原生依赖**，Python 包统一留给 pip：
+
+| 依赖 | 来源 | 用途 |
+|---|---|---|
+| `python=3.11` | conda | 运行时不拆分 |
+| `ffmpeg>=6.1` | conda | 视频 mux 走系统 ffmpeg；自检需要 `libx264` |
+| `cuda-toolkit=12.8` | conda | CUDA 运行时库 |
+| `libgl` / `libglib` | conda | headless OpenCV 仍链接它们 |
+| `curl` | conda | 模型下载的断点续传 |
+| `pip` | conda | Python 包统一由 pip 安装 |
+
 > **驱动版本不匹配怎么办？**
-> `environment.yml` 默认使用 `cuda-toolkit=12.8`，需要驱动 570+。驱动较旧时
-> 先修改该行，再创建环境：
+> `environment.yml` 默认 `cuda-toolkit=12.8`，需要驱动 570+。驱动较旧时先改
+> 这一行，再创建环境：
 >
 > ```bash
 > sed -i 's/cuda-toolkit=12.8/cuda-toolkit=12.6/' environment.yml
 > ```
 >
-> 或改用 `12.4`。CUDA 小版本必须与后面 `tools/install.py` 使用的
-> `cu126` / `cu124` 通道一致。
+> 或改用 `12.4`。CUDA 小版本要和后面 `tools/install.py` 的通道一致
+> （12.8→`cu128`，12.6→`cu126`，12.4→`cu124`）。
 
-安装 Python 依赖：
-
-```bash
-python tools/install.py cu128
-```
-
-驱动较旧时选择对应通道：
+验证 FFmpeg 可用且带 `libx264`：
 
 ```bash
-python tools/install.py cu126
-python tools/install.py cu124
+ffmpeg -version
+ffmpeg -hide_banner -encoders 2>&1 | grep -o 'enable-libx264'
+ffprobe -version
 ```
 
-安装器会：
+### 1.5 替代方案：venv + apt
 
-1. 先卸载 CPU、DirectML、OpenVINO 等其他 ONNX Runtime 变体
-2. 安装对应 CUDA 版本的 PyTorch
-3. 安装 `requirements.txt`
-4. 安装 headless OpenCV、ONNX Runtime GPU、PyAV 等依赖
-
-只查看将要执行的命令，不实际安装：
-
-```bash
-python tools/install.py cu128 --dry-run
-```
-
-已单独安装 PyTorch 时：
-
-```bash
-python tools/install.py cu128 --skip-torch
-```
-
-> **为什么 Python 包仍然走 pip？**
-> conda 和 pip 各自提供 `onnxruntime`，混装是 "没有 CUDAExecutionProvider"
-> 最常见的原因。因此 `environment.yml` 只安装原生依赖（CUDA、FFmpeg、
-> `libGL`），Python 包统一由 pip 安装，保证只有一个 ONNX Runtime 构建。
-
-### 2.4 方式二：venv + apt
-
-不想使用 conda 时，用系统包加 venv：
+不想用 conda、且有 root 权限时，可以用系统包加 venv：
 
 ```bash
 sudo apt update
@@ -206,44 +124,147 @@ cd /path/to/Faceswapper-Cli
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python tools/install.py cu128
 ```
 
-这种方式需要 root 或 sudo 权限安装系统包。
+两种方案的 Python 依赖完全相同，都通过 pip 安装；模型下载和换脸命令也
+完全一致。
 
 ---
 
-## 3. 准备模型文件
+## 2. 安装步骤
 
-ONNX 模型不能通过 `pip install` 安装。项目现在提供自动下载器，不需要手工
-复制文件。
+### 2.1 安装 Python 依赖
 
-### 3.1 自动下载基础模型
+**推荐：自动检测环境**
+
+```bash
+python tools/install.py default
+```
+
+它会读 `nvidia-smi` 拿到驱动版本，据此选 CUDA 通道，然后**只装缺的
+部分**：
+
+| 驱动 | 选中的通道 |
+|---|---|
+| 570+ | `cu128` |
+| 560-569 | `cu126` |
+| 550-559 | `cu124` |
+
+torch 始终从 **pip 自己的源**安装（即 `PIP_INDEX_URL` 或 PyPI），和模型
+下载一样不写死任何地址。需要指定 CUDA 专用 wheel 通道时显式传
+`--index-url`：
+
+```bash
+python tools/install.py default \
+    --index-url https://download.pytorch.org/whl/cu126
+```
+
+已经装好的东西不会被动：torch 能用 CUDA 就跳过安装，onnxruntime 已有
+CUDAExecutionProvider 就不卸载（卸载只发生在真要装之前），
+`requirements.txt` 里已有的包不会重装。环境已满足时直接退出并提示
+去跑 `check_env.py`。
+
+找不到 `nvidia-smi` 或驱动低于 550 时会明确报错并告诉你怎么办，不会
+猜一个通道装错东西。
+
+**也可以显式指定通道**（行为与之前完全一致，适合你比 `nvidia-smi` 更清楚
+该用哪个源的情况——比如系统已装 CUDA toolkit、或要用镜像）：
+
+```bash
+python tools/install.py cu128
+python tools/install.py cu126
+python tools/install.py cu124
+```
+
+显式指定时 torch 走 pip 自己的源，除非加 `--index-url`。
+
+安装器按顺序做的事：
+
+1. 卸载 CPU、DirectML、OpenVINO 等其他 ONNX Runtime 变体
+2. 安装 PyTorch 和 torchvision
+3. 安装 `requirements.txt`
+4. 完成 headless OpenCV、ONNX Runtime GPU、PyAV 等依赖安装
+
+常用选项：
+
+```bash
+# 只看会执行什么命令，不实际安装
+python tools/install.py default --dry-run
+
+# torch 已单独装好，只装其余依赖
+python tools/install.py default --skip-torch
+
+# 忽略检测结果，全部重装
+python tools/install.py default --force-reinstall
+```
+
+### 2.2 依赖从哪个源安装
+
+torch 默认走 **pip 自己的源**（即 `PIP_INDEX_URL` 或 PyPI），项目不写死任何
+地址。需要指定 CUDA 专用 wheel 通道时显式传 `--index-url`：
+
+```bash
+python tools/install.py cu128 --index-url https://download.pytorch.org/whl/cu128
+```
+
+> **为什么 Python 包统一走 pip？**
+> conda 和 pip 各自提供 `onnxruntime`，混装是"没有 CUDAExecutionProvider"
+> 最常见的原因。所以 `environment.yml` 只装原生依赖，Python 包全部由 pip
+> 安装，保证环境里只有一个 ONNX Runtime 构建。
+
+`requirements.txt` 中的关键依赖：
+
+| 包 | 作用 |
+|---|---|
+| `onnxruntime-gpu` | 模型推理（CUDA EP / TensorRT EP） |
+| `onnx` | 读取 ONNX 图（提取 emap 投影矩阵） |
+| `opencv-python-headless` | 图像读写、颜色转换 |
+| `torch` / `torchvision` | 逐帧 warp、mask 混合等张量运算 |
+| `av` | PyAV：视频解封装与解码 |
+| `scikit-image` | 相似变换估计 |
+| `pillow` / `numpy` | 图像与数组基础 |
+
+> PyAV 需要 `>=13.0,<19.0`：14 及以上版本要求 `add_stream(rate=...)` 传
+> `Fraction` 而不是 float，代码已按此实现。
+
+### 2.3 模型下载
+
+模型文件不能通过 pip 安装。项目带自动下载器，不需要手工复制文件。
+
+**下载基础模型：**
 
 ```bash
 python -m faceswapper.cli --models ./models download-models
 ```
 
-默认下载并校验以下 3 个模型：
+基础模型共 3 个，约 450 MB：
 
 | 本地文件 | 用途 | 大小 |
 |---|---|---:|
-| `det_10g.onnx` | RetinaFace 人脸检测 | 约 16 MiB |
-| `w600k_r50.onnx` | ArcFace 人脸识别 | 约 166 MiB |
-| `inswapper_128.fp16.onnx` | 128 分辨率换脸 | 约 265 MiB |
+| `det_10g.onnx` | RetinaFace 人脸检测 | 16.1 MiB |
+| `w600k_r50.onnx` | ArcFace 人脸识别 | 166.3 MiB |
+| `inswapper_128.fp16.onnx` | 128 分辨率换脸 | 264.8 MiB |
 
-下载时使用 SHA-256 验证。校验失败会尝试下一个下载源，最终不会留下未验证的
-模型文件。
+下载完成后校验完整性，失败会尝试下一个下载源，不会留下未验证的文件。
 
-### 3.2 选择下载源
+#### 选择下载源
 
-支持三个来源：
+**没有内置默认下载源。** 不指定时读取系统环境变量 `HF_ENDPOINT`（与
+`huggingface_hub` 使用同一个变量，配一次镜像全局生效）；未设置则直接报错，
+不会暗中回退到某个地址。
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+python -m faceswapper.cli --models ./models download-models
+```
+
+也可以按命令显式指定，支持三种具名来源：
 
 - `huggingface`：Hugging Face 官方仓库
 - `hf-mirror`：Hugging Face 国内镜像
 - `github`：FaceFusion GitHub Release
 
-按指定顺序下载：
+按指定顺序尝试，前者失败自动用下一个：
 
 ```bash
 python -m faceswapper.cli --models ./models download-models \
@@ -251,85 +272,67 @@ python -m faceswapper.cli --models ./models download-models \
     --provider github
 ```
 
-显式指定只使用一个来源：
+`--provider` 还接受完整 URL，指向任意自建镜像（按 Hugging Face 布局拼接）：
 
 ```bash
 python -m faceswapper.cli --models ./models download-models \
-    --provider github
+    --provider https://your-mirror.example.com
 ```
 
-### 3.3 下载可选模型
+例如上面这条会请求
+`https://your-mirror.example.com/facefusion/models-3.0.0/resolve/main/retinaface_10g.onnx`。
 
-GFPGAN 人脸修复：
+#### 可选模型
+
+下载器管理的全部模型：
+
+| `--model` | 本地文件 | 必需 | 上游发布 |
+|---|---|---|---|
+| `retinaface` | `det_10g.onnx` | 是 | `models-3.0.0` |
+| `arcface` | `w600k_r50.onnx` | 是 | `models-3.0.0` |
+| `inswapper` | `inswapper_128.fp16.onnx` | 是 | `models-3.0.0` |
+| `hyperswap` | `hyperswap_1a_256.onnx` | 否 | `models-3.3.0` |
+| `gfpgan` | `GFPGANv1.4.onnx` | 否 | `models-3.0.0` |
+| `gpen256` | `GPEN-BFR-256.onnx` | 否 | `models-3.0.0` |
+| `gpen512` | `GPEN-BFR-512.onnx` | 否 | `models-3.0.0` |
+| `codeformer` | `codeformer_fp16.onnx` | 否 | `models-3.0.0` |
+| `xseg` | `occluder.onnx` | 否 | `models-3.1.0` |
+| `faceparser` | `faceparser_resnet34.onnx` | 否 | `models-3.0.0` |
+| `dflxseg` | `dfl_xseg.onnx` | 否 | `models-3.0.0` |
+| `all` | 以上全部 | — | — |
+
+下载单个可选模型：
 
 ```bash
-python -m faceswapper.cli --models ./models download-models \
-    --model gfpgan
+python -m faceswapper.cli --models ./models download-models --model hyperswap
+python -m faceswapper.cli --models ./models download-models --model gfpgan
 ```
 
-SCRFD 备用人脸检测器：
+**只登记不下载**的文件（上游没有对应发布，需要自行提供）：
 
-```bash
-python -m faceswapper.cli --models ./models download-models \
-    --model scrfd
-```
+- `res50.onnx` — ResNet50 检测器
+- `inswapper_256_phase1.onnx` — 256 原生 inswapper
+- `inswapper_512_level2.onnx` — 512 原生 inswapper
 
-也可以同时指定：
+这三个 `check-models` 会报告是否存在，缺失只提示不报错；基础换脸用不到。
 
-```bash
-python -m faceswapper.cli --models ./models download-models \
-    --model gfpgan \
-    --model scrfd \
-    --provider huggingface
-```
+#### 按需自动下载
 
-当前自动下载器管理以下模型：
+换脸命令会在推理前，按本次运行的**参数快照**算出真正需要的模型集合，缺失或
+损坏时自动下载。因此可以跳过手动下载直接跑换脸。集合规则：
 
-| `--model` 参数 | 本地文件 | 是否必需 |
-|---|---|---|
-| `retinaface` | `det_10g.onnx` | 是 |
-| `arcface` | `w600k_r50.onnx` | 是 |
-| `inswapper` | `inswapper_128.fp16.onnx` | 是 |
-| `gfpgan` | `GFPGANv1.4.onnx` | 否 |
-| `scrfd` | `scrfd_2.5g_bnkps.onnx` | 否 |
+| 条件 | 额外下载 |
+|---|---|
+| 始终 | 3 个基础模型 |
+| `--detect-type SCRDF` | `scrfd_2.5g_bnkps.onnx` |
+| `--swapper-model hyperswap-256` | `hyperswap_1a_256.onnx` |
+| `--restorer [模型]` | 对应的修复模型 |
+| `--occluder` | `occluder.onnx` |
+| `--xseg` | `dfl_xseg.onnx` |
+| `--face-parser` | `faceparser_resnet34.onnx` |
 
-以下高级模型暂未纳入自动下载器，需要自行提供：
-
-- `inswapper_256_phase1.onnx`
-- `inswapper_512_level2.onnx`
-- GPEN、CodeFormer、XSeg、FaceParser 等
-
-基础图片和视频换脸不需要这些文件。
-
-### 3.4 检查模型
-
-完整计算并校验 SHA-256：
-
-```bash
-python -m faceswapper.cli --models ./models check-models
-```
-
-使用文件大小和本地缓存快速检查：
-
-```bash
-python -m faceswapper.cli --models ./models check-models --quick
-```
-
-输出：
-
-```text
-valid    det_10g.onnx                16.1 MiB  RetinaFace detector
-valid    w600k_r50.onnx             166.3 MiB  ArcFace recognition
-valid    inswapper_128.fp16.onnx     264.8 MiB  Inswapper 128 face swapper
-```
-
-校验结果缓存在 `models/.faceswapper-models.json`。文件内容、大小或修改时间变化时会
-重新计算 SHA-256。
-
-### 3.5 首次换脸自动下载
-
-图片和视频命令会在推理前自动检查 3 个基础模型。模型缺失或损坏时自动下载，
-因此也可以跳过第 3 章，直接运行换脸命令。
+也就是说，不打开开关就只下载基础模型，不会为了用不到的功能拉几百 MB。
+已存在且校验通过的文件不会重复下载。
 
 禁用自动下载：
 
@@ -338,59 +341,102 @@ python -m faceswapper.cli --no-auto-download --models ./models swap \
     --source face.jpg --target target.jpg --output out.jpg
 ```
 
-无网络、模型缺失或损坏时，命令会明确失败，不会进入推理后才报晦涩错误。
+#### 检查模型
 
-### 3.6 模型来源
+```bash
+# 完整校验（计算 SHA-256 / CRC32）
+python -m faceswapper.cli --models ./models check-models
 
-模型托管在 FaceFusion 模型资产仓库：
+# 快速检查（只比大小和缓存）
+python -m faceswapper.cli --models ./models check-models --quick
 
-- Hugging Face：`facefusion/models-3.0.0`
-- GitHub：`facefusion/facefusion-assets`
+# 只看列表不校验
+python -m faceswapper.cli --models ./models download-models --list
+```
 
-SHA-256 和文件大小已经写入项目模型清单。模型许可证与代码许可证不同，
-请同时遵守对应模型的上游许可。
+输出示例：
 
----
+```text
+valid    det_10g.onnx                16.1 MiB  RetinaFace detector
+valid    w600k_r50.onnx             166.3 MiB  ArcFace recognition
+valid    inswapper_128.fp16.onnx     264.8 MiB  Inswapper 128 face swapper
+```
 
-## 4. 环境自检
+校验结果缓存在 `models/.faceswapper-models.json`，文件内容、大小或修改时间
+变化时才重新计算。
+
+强制重新下载：
+
+```bash
+python -m faceswapper.cli --models ./models download-models --force
+python -m faceswapper.cli --models ./models download-models --model inswapper --force
+```
+
+> **校验方式**
+> 大部分模型按 SHA-256 校验。`hyperswap_1a_256.onnx` 上游只发布 CRC32，因此
+> 按 CRC32 校验——这是 FaceFusion 自己对新版模型使用的校验方式。
+
+> **HyperSwap 许可**
+> `hyperswap_1a_256.onnx` 采用 ResearchRAIL 许可，**仅限非商业用途**。商用请
+> 继续使用 inswapper_128。
+
+### 2.4 环境检测
 
 ```bash
 python tools/check_env.py --models ./models
 ```
 
-自检内容：
+按顺序检查：
 
-- Python 版本
-- NVIDIA 驱动
-- `ffmpeg`、`ffprobe`、`curl`
-- PyTorch CUDA 是否可用
-- ONNX Runtime 是否包含 `CUDAExecutionProvider`
-- Python 运行时依赖
-- 必需模型及 SHA-256
-- CLI 模块能否导入
+1. Python 版本
+2. NVIDIA 驱动 / `nvidia-smi`
+3. `ffmpeg`、`ffprobe`、`curl`
+4. PyTorch 与 CUDA 是否可用
+5. ONNX Runtime 是否包含 `CUDAExecutionProvider`
+6. Python 运行时依赖是否齐全
+7. 模型文件及校验值
+8. CLI 模块能否导入
 
-成功输出：
-
-```text
-all checks passed
-```
+全部通过时输出 `all checks passed`。可选模型缺失只警告，不影响退出码。
+每一项失败都会打印对应的修复命令。
 
 ---
 
-## 5. 图片换脸
+## 3. 使用方法
 
-### 5.1 最基础命令
+所有命令都要带 `--models ./models` 指定模型目录。换脸前先准备好：
+
+- 源人脸图片：`face.jpg`，清晰、正面、光线均匀，只取最大的一张脸
+- 目标：一张图片、一个图片文件夹，或一个视频文件
+
+### 3.1 快速开始
+
+**图片换脸** —— 替换目标图中检测到的所有人脸：
 
 ```bash
 python -m faceswapper.cli --models ./models swap \
     --source face.jpg \
     --target target.jpg \
-    --output out.png
+    --output out.jpg
 ```
 
-默认替换目标图中检测到的所有人脸。
+**视频换脸** —— 替换视频中检测到的所有人脸，音频一并保留：
 
-只替换最大的一张脸：
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg \
+    --target input.mp4 \
+    --output output.mp4
+```
+
+这两条就是完整可用的最小命令。首次运行会自动下载缺失的基础模型
+（来源见 [2.3](#23-模型下载)）。下面按场景给出带参数的版本。
+
+### 3.2 图片换脸
+
+#### 只替换最大的一张脸
+
+目标图里有多人、只想换最突出的那个时：
 
 ```bash
 python -m faceswapper.cli --models ./models swap \
@@ -400,7 +446,11 @@ python -m faceswapper.cli --models ./models swap \
     --face-policy largest
 ```
 
-### 5.2 低显存配置
+`--face-policy` 取 `all`（默认，替换全部）或 `largest`。
+
+#### 低显存 / 最快配置
+
+4 GB 显存或想先快速验证链路时：
 
 ```bash
 python -m faceswapper.cli --models ./models swap \
@@ -408,32 +458,18 @@ python -m faceswapper.cli --models ./models swap \
     --target target.jpg \
     --output out.jpg \
     --face-policy largest \
-    --swapper-size 128 \
-    --detect-input-size 320
-```
-
-### 5.3 最快配置
-
-```bash
-python -m faceswapper.cli --models ./models swap \
-    --source face.jpg \
-    --target target.jpg \
-    --output out.jpg \
-    --face-policy largest \
-    --swapper-size 128 \
-    --detect-input-size 320
+    --swapper-model inswapper-128
 ```
 
 加速因素：
 
-- `--swapper-size 128`
-- `--detect-input-size 320`
-- `--face-policy largest`
-- 输出 `.jpg` 而不是 `.png`
-- 只传一张源脸
+- `--swapper-model inswapper-128`：换脸模型跑 128×128，比 256/512 快得多
+- `--face-policy largest`：少一次换脸
+- 输出 `.jpg` 而不是 `.png`：省一次无损编码
+- 只传一张源脸：跳过 embedding 合并
 - 不启用修复、遮罩、色彩匹配等可选功能
 
-### 5.4 多张源脸合并
+#### 多张源脸合并为一个身份
 
 ```bash
 python -m faceswapper.cli --models ./models swap \
@@ -444,9 +480,10 @@ python -m faceswapper.cli --models ./models swap \
     --merge Sph
 ```
 
-合并方式支持 `Mean`、`Median`、`Sph`、`Geo`、`Qual`。
+合并方式支持 `Mean`、`Median`、`Sph`、`Geo`、`Qual`，默认 `Mean`。
+`--source` 也可指向一个文件夹，里面的每张图各取最大人脸。
 
-### 5.5 批量处理
+#### 批量处理整个文件夹
 
 ```bash
 python -m faceswapper.cli --models ./models swap \
@@ -455,19 +492,67 @@ python -m faceswapper.cli --models ./models swap \
     --output-dir ./output
 ```
 
-输出文件命名为 `<原文件名>_swapped.<扩展名>`。
+`--target-dir` 与 `--output-dir` 成对使用，输出文件命名为
+`<原文件名>_swapped.<扩展名>`，已存在的文件会被覆盖。批量模式下
+`--output` 不适用。
 
-### 5.6 检测目标图片中的脸
+#### 使用 HyperSwap 换脸模型
+
+```bash
+python -m faceswapper.cli --models ./models swap \
+    --source face.jpg \
+    --target target.jpg \
+    --output out.png \
+    --swapper-model hyperswap-256
+```
+
+首次使用会自动下载模型，也可以先手动下载：
+
+```bash
+python -m faceswapper.cli --models ./models download-models --model hyperswap
+```
+
+与 inswapper 的区别：
+
+| | inswapper-128 | hyperswap-256 |
+|---|---|---|
+| 前向方式 | 128×128 输出，NxN polyphase 拼到 256/512 | 原生 256×256 单次前向 |
+| 身份 latent | L2 归一化 → emap 投影 → 归一化 | 只做 L2 归一化，跳过 emap 投影 |
+| 输入值域 | 0-1 | -1 ~ 1（在 pass 内部转换） |
+| 许可 | 随 insightface | **ResearchRAIL，仅非商业** |
+
+两者的身份 latent 都受 `scale` 参数缩放，差别只在有没有 emap 投影那一步。
+
+HyperSwap 只在 `--swapper-model hyperswap-256` 下生效，默认值
+`inswapper-128` 行为不变。
+
+#### 换脸模型取值怎么读
+
+`--swapper-model` 同时决定**用哪个模型**和**输出多大**，四个取值：
+
+| 取值 | 实际加载的模型 | 输出 |
+|---|---|---|
+| `inswapper-128`（默认） | `inswapper_128.fp16.onnx` | 128×128 |
+| `inswapper-256` | `inswapper_128.fp16.onnx` | 256×256，NxN polyphase 拼成 |
+| `inswapper-512` | `inswapper_128.fp16.onnx` | 512×512，NxN polyphase 拼成 |
+| `hyperswap-256` | `hyperswap_1a_256.onnx` | 原生 256×256 单次前向 |
+
+注意 `inswapper-256` / `inswapper-512` 里的数字是**输出分辨率**，不是模型
+本身——三者跑的都是同一个 128 模型，靠 polyphase 拼出更大的输出。想要
+原生单次前向的大模型，用 `hyperswap-256`。
+
+#### 查看目标图里检测到了哪些脸
 
 ```bash
 python -m faceswapper.cli --models ./models inspect --target target.jpg
 ```
 
----
+输出每张脸的编号和 `scale`（两眼间距，反映该脸在画面里有多大），便于确认
+`--face-policy largest` 会选中哪一张、以及 `--detect-score` 该取什么值。
 
-## 6. 视频换脸
+### 3.3 视频换脸
 
-### 6.1 只替换指定人物
+#### 只替换指定的那个人
 
 需要三份输入：
 
@@ -490,11 +575,9 @@ python -m faceswapper.cli --models ./models video \
 1. 从 `--source` 提取源人物特征
 2. 从 `--target-face` 提取目标人物参考特征
 3. 逐帧检测所有脸并计算身份相似度
-4. 只替换与参考人物相似度达到阈值的脸
+4. 只替换与参考人物相似度达到 `--target-threshold` 的脸
 
-其他人脸保持不变。
-
-可以传多张目标人物参考图：
+其他人脸保持不变。可以传多张目标人物参考图提高匹配稳定性：
 
 ```bash
 python -m faceswapper.cli --models ./models video \
@@ -505,7 +588,7 @@ python -m faceswapper.cli --models ./models video \
     --output output.mp4
 ```
 
-### 6.2 匹配阈值
+#### 匹配阈值
 
 ```bash
 python -m faceswapper.cli --models ./models video \
@@ -516,21 +599,11 @@ python -m faceswapper.cli --models ./models video \
     --target-threshold 60
 ```
 
-- 范围为 `0-100`
-- 默认值为 `55`
-- 调高更严格，减少换错人风险
-- 调低更容易匹配，但可能换到相似人物
+- 范围 `0-100`，默认 `55`
+- 调高更严格，减少换错人的风险
+- 调低更容易匹配，但可能换到长相相似的人
 
-### 6.3 替换视频中所有人脸
-
-```bash
-python -m faceswapper.cli --models ./models video \
-    --source new_face.jpg \
-    --target input.mp4 \
-    --output output.mp4
-```
-
-### 6.4 低显存配置
+#### 低显存 / 快速验证配置
 
 ```bash
 python -m faceswapper.cli --models ./models video \
@@ -538,32 +611,20 @@ python -m faceswapper.cli --models ./models video \
     --target-face person_in_video.jpg \
     --target input.mp4 \
     --output output.mp4 \
-    --swapper-size 128 \
-    --detect-input-size 320 \
+    --swapper-model inswapper-128 \
     --preset ultrafast \
     --crf 23
 ```
 
-### 6.5 最快配置
+- `--preset`：x264 速度/质量档位，`ultrafast` ~ `veryslow`，默认 `medium`
+- `--crf`：H.264 质量，数值越低质量越高、文件越大，默认 `18`
 
-```bash
-python -m faceswapper.cli --models ./models video \
-    --source new_face.jpg \
-    --target-face person_in_video.jpg \
-    --target input.mp4 \
-    --output output.mp4 \
-    --swapper-size 128 \
-    --detect-input-size 320 \
-    --preset ultrafast \
-    --crf 23
-```
+进一步压榨速度：
 
-额外优化：
-
-- 不需要音频时增加 `--no-audio`
-- 目标人物只需要一张最清晰的参考图
+- 不需要音频时加 `--no-audio`，省一次音频 mux
+- 目标人物只给一张最清晰的参考图
 - 4K 或大码率视频先降到 720p
-- 首次验证可以用 `--every-nth 20`
+- 验证阶段用 `--every-nth 20` 抽样处理
 
 降到 720p：
 
@@ -573,31 +634,22 @@ ffmpeg -i input.mp4 -vf scale=-2:720 \
     -c:a copy input_720p.mp4
 ```
 
-`--every-nth 20` 只用于验证链路，并不是完整的逐帧换脸结果：
+`--every-nth 20` 只处理第 20 的倍数帧、其余原样透传，用于快速验证链路，
+**不是完整的逐帧换脸结果**：
 
 ```bash
 python -m faceswapper.cli --models ./models video \
     --source new_face.jpg \
     --target test.mp4 \
     --output test_out.mp4 \
-    --swapper-size 128 \
-    --detect-input-size 320 \
+    --swapper-model inswapper-128 \
     --preset ultrafast \
     --every-nth 20
 ```
 
-### 6.6 视频时序处理
+### 3.4 参数总览
 
-视频处理使用 PyAV 逐帧解码，并保留每帧原始 PTS。可变帧率视频的帧间距不会被
-强制改写。音频使用 FFmpeg 从源视频复制，并恢复视频流和音频流各自的起始偏移。
-
-因此在源视频同步正常的情况下，输出会保持原有音画关系。
-
----
-
-## 7. 常用参数
-
-全局参数必须写在子命令前面：
+全局参数必须写在子命令**前面**：
 
 ```bash
 python -m faceswapper.cli \
@@ -609,45 +661,160 @@ python -m faceswapper.cli \
 | 全局参数 | 说明 |
 |---|---|
 | `--models DIR` | 模型目录，默认 `./models` |
-| `--model-provider` | 自动下载源，可重复 |
+| `--model-provider` | 自动下载源（URL 或 `github`/`huggingface`/`hf-mirror`），可重复。不指定时读 `$HF_ENDPOINT` |
 | `--no-auto-download` | 禁用模型自动下载 |
 
-图片和视频共同参数：
+`swap` / `video` / `inspect` 共同参数：
 
 | 参数 | 说明 | 默认值 |
 |---|---|---|
-| `--params FILE` | 加载旧参数文件 | 无 |
+| `--params FILE` | 加载 GUI 时代保存的 `saved_parameters.json` | 无 |
 | `--detect-type` | `Retinaface` 或 `SCRDF` | `Retinaface` |
 | `--detect-input-size` | `320/416/480/640` | `640` |
 | `--detect-score` | 检测阈值 `1-100` | `50` |
 | `--merge` | 多源脸合并方式 | `Mean` |
-| `--swapper-size` | `128/256/512` | `128` |
+| `--swapper-model` | `inswapper-128`/`inswapper-256`/`inswapper-512`/`hyperswap-256` | `inswapper-128` |
 | `--color-match` | 启用 LAB 色彩匹配 | 关闭 |
 | `--backend` | `cuda` 或 `trt` | `cuda` |
 
-查看所有参数默认值：
+> **`--detect-input-size` 不要随便调小。** 它只影响检测器输入分辨率，
+> 不影响换脸质量——调小是纯速度交易：`480` ≈ 1.8× 快，`416` ≈ 2.4×，
+> `320` ≈ 4× 快但源帧里小于约 36 px 的人脸开始漏检。视频路径上漏检的
+> 表现不是崩溃，而是**该换的脸没被换掉**（逐帧相似度掉到
+> `--target-threshold` 以下，或压根没检测到脸）。低显存配置请优先调
+> `--swapper-model`，检测分辨率保持 `640` 最稳。
+
+功能开关（打开后才会下载对应模型，见 [2.3](#23-模型下载)）：
+
+| 参数 | 说明 | 下载的模型 |
+|---|---|---|
+| `--restorer [模型]` | 人脸修复，`GFPGAN`/`CF`/`GPEN256`/`GPEN512`，省略值为 `GFPGAN` | 对应的修复模型 |
+| `--occluder` | 遮挡遮罩 | `occluder.onnx` |
+| `--xseg` | DeepFaceLab XSeg 遮挡遮罩 | `dfl_xseg.onnx` |
+| `--face-parser` | 背景遮罩 | `faceparser_resnet34.onnx` |
+
+```bash
+python -m faceswapper.cli --models ./models swap \
+    --source face.jpg --target target.jpg --output out.png \
+    --restorer GPEN256 --occluder
+```
+
+`swap` 专有参数：
+
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| `--source` | 源脸图片，可重复或指向文件夹 | 必填 |
+| `--target` | 目标图片，可重复或指向文件夹 | 必填 |
+| `--target-dir` | 目标图片文件夹（批量模式） | 无 |
+| `--output` | 输出图片路径（单个目标） | 无 |
+| `--output-dir` | 输出文件夹（批量模式） | 无 |
+| `--face-policy` | `all` 或 `largest` | `all` |
+
+`video` 专有参数：
+
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| `--source` | 源脸图片，可重复或指向文件夹 | 必填 |
+| `--target-face` | 视频中要替换的人物参考图，可重复。省略则替换所有脸 | 无 |
+| `--target-threshold` | 人物匹配相似度阈值 `0-100` | `55` |
+| `--target` | 输入视频文件 | 必填 |
+| `--output` | 输出视频文件 | 必填 |
+| `--crf` | H.264 质量，越低越好 | `18` |
+| `--preset` | x264 档位 | `medium` |
+| `--no-audio` | 不复制源音频轨 | 关闭 |
+| `--every-nth` | 只处理第 N 帧，其余透传 | `1` |
+
+查看全部已知参数及默认值：
 
 ```bash
 python -m faceswapper.cli params
 ```
 
+> 部分参数只在 `--params saved_parameters.json` 里可配，没有对应命令行开关，
+> 例如修复结果与原图的混合方式（`RestorerDetTypeTextSel`：
+> Original/Blend/Reference）。命令行开关的值优先于参数文件。
+
+### 3.5 视频时序
+
+视频处理用 PyAV 逐帧解码，重新编码时**保留每帧原始 PTS**，可变帧率视频的
+帧间距不会被强制改写。音频用系统 ffmpeg 从源视频复制，并对两条流分别恢复
+起始偏移。因此在源视频本身音画同步正常的情况下，输出会保持原有音画关系。
+
 ---
 
-## 8. 常见问题
+## 4. 常见问题
 
-### 8.1 首次运行会自动下载模型吗
+### 4.1 安装问题
 
-会。缺少或损坏基础模型时，`swap` 和 `video` 会自动下载。若希望离线运行或
-完全控制模型来源，增加 `--no-auto-download`。
+#### `AttributeError: 'float' object has no attribute 'numerator'`
 
-### 8.2 模型下载到一半中断
+PyAV 14 及以上版本不再接受 float 作为 `add_stream(rate=...)` 的参数，只接受
+`Fraction`。确认 PyAV 版本在 `requirements.txt` 声明的范围内：
 
-再次运行下载命令即可。已存在的 `.part` 文件支持继续传输，完整下载后会进行
-SHA-256 校验。
+```bash
+python -c "import av; print(av.__version__)"
+```
 
-### 8.3 Hugging Face 下载较慢
+版本低于 13.0 或高于 19.0 时重新安装：
 
-使用镜像：
+```bash
+python -m pip install 'av>=13.0,<19.0'
+```
+
+#### `torch.cuda.is_available()` 返回 False
+
+按顺序检查：
+
+1. `nvidia-smi` 是否正常，是否看得到 GPU
+2. 驱动版本是否匹配所选的 `cu128`/`cu126`/`cu124`
+3. 是否装成了 CPU 版 PyTorch：
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda)"
+```
+
+`torch.version.cuda` 为 `None` 说明是 CPU wheel，重新选择通道：
+
+```bash
+python tools/install.py cu126
+```
+
+#### ONNX Runtime 没有 `CUDAExecutionProvider`
+
+```bash
+python -c "import onnxruntime as ort; print(ort.get_available_providers())"
+```
+
+输出必须包含 `CUDAExecutionProvider`。缺失说明装成了 CPU 版，或被 conda 版
+`onnxruntime` 覆盖。先清理再重装：
+
+```bash
+conda list onnxruntime
+pip show onnxruntime-gpu
+conda remove --force onnxruntime
+python tools/install.py cu128
+```
+
+#### 提示没有模型下载源
+
+项目不内置下载地址。设置环境变量或显式指定：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+# 或
+python -m faceswapper.cli --models ./models download-models --provider huggingface
+```
+
+#### Hugging Face 下载很慢或中断
+
+用镜像，并对所有 huggingface 工具同时生效：
+
+```bash
+export HF_ENDPOINT=https://hf-mirror.com
+```
+
+中断后直接重跑同一条命令，已下载的 `.part` 文件支持续传，完成后会做完整性
+校验。也可以按顺序指定多个来源，失败自动切换：
 
 ```bash
 python -m faceswapper.cli --models ./models download-models \
@@ -655,108 +822,85 @@ python -m faceswapper.cli --models ./models download-models \
     --provider github
 ```
 
-### 8.4 `torch.cuda.is_available()` 返回 False
+#### 模型下载后仍报校验失败
 
-检查：
-
-1. `nvidia-smi` 是否正常
-2. 驱动版本是否匹配所选 `cu128/cu126/cu124`
-3. 是否安装了 CPU 版 PyTorch
-
-重新选择 CUDA 通道：
+文件可能被截断或损坏。强制重新下载：
 
 ```bash
-python tools/install.py cu126
+python -m faceswapper.cli --models ./models download-models --force
 ```
 
-### 8.5 ONNX Runtime 没有 CUDA Provider
-
-重新运行 CUDA 安装器。安装器会先卸载其他 ONNX Runtime 变体：
+只重下某一个：
 
 ```bash
-python tools/install.py cu128
+python -m faceswapper.cli --models ./models download-models \
+    --model inswapper --force
 ```
 
-确认：
+### 4.2 使用问题
 
-```bash
-python -c "import onnxruntime as ort; print(ort.get_available_providers())"
-```
-
-输出必须包含 `CUDAExecutionProvider`。
-
-### 8.6 没有检测到人脸
-
-尝试：
-
-- 使用清晰、正面、光线均匀的源脸
-- 降低 `--detect-score`
-- 图片保持 `--detect-input-size 640`
-- 目标人物脸部过小时先提高视频分辨率
-
-### 8.7 显存不足
+#### 没有检测到人脸
 
 依次尝试：
 
-1. `--swapper-size 128`
-2. `--detect-input-size 320`
-3. 关闭修复、遮罩和色彩匹配
-4. 将视频降到 720p
-5. 避免多个进程同时使用同一 GPU
+- 换一张清晰、正面、光线均匀的源脸
+- 降低 `--detect-score`（默认 50）
+- 图片保持 `--detect-input-size 640`，不要降到 320
+- 目标人物脸部太小先提高视频分辨率
+- 用 `inspect` 子命令确认到底检测到了什么：
 
-### 8.8 音画不同步
+```bash
+python -m faceswapper.cli --models ./models inspect --target target.jpg
+```
 
-先确认源文件本身是否同步。如果源视频已经错位，可先强制转为恒定帧率：
+#### 换错了人
+
+视频里用 `--target-face` 指定要替换的人物，并调高阈值：
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source new_face.jpg \
+    --target-face person.jpg \
+    --target input.mp4 \
+    --output output.mp4 \
+    --target-threshold 70
+```
+
+图片里人很多时用 `--face-policy largest` 只处理最突出的那张。
+
+#### 显存不足（CUDA out of memory）
+
+依次尝试：
+
+1. `--swapper-model inswapper-128`
+2. 关闭 `--restorer`、`--occluder`、`--xseg`、`--face-parser`、`--color-match`
+3. 视频降到 720p 再处理
+4. 确认没有多个进程同时占用同一张 GPU（`nvidia-smi`）
+5. 以上都无效才降 `--detect-input-size`（`480` → `320`）。这确实省
+   显存，但会漏检小人脸，属于拿结果换显存，见上面的警告
+
+#### 换脸结果模糊
+
+- `--swapper-model inswapper-256` 或 `inswapper-512`：换脸输出分辨率更高，显存和时间也更多
+- 换 `hyperswap-256`：原生 256×256 单次前向，不经 polyphase 拼接
+- 开 `--restorer` 做一次人脸修复
+- `--crf` 降到 16 左右减少编码损失
+
+#### 音画不同步
+
+先确认源文件本身是否同步。源视频已经错位时先强制转成恒定帧率并重采样音频：
 
 ```bash
 ffmpeg -i input.mp4 -fps_mode cfr -r 30 \
     -af aresample=async=1 input_cfr.mp4
 ```
 
-再用 `input_cfr.mp4` 作为 `--target`。
+再用 `input_cfr.mp4` 作为 `--target`。若输出仍不同步而源文件正常，请把
+`ffprobe -show_streams` 的输出和源视频片段一起反馈。
 
-### 8.9 如何强制重新下载模型
+#### conda 环境损坏
 
-```bash
-python -m faceswapper.cli --models ./models download-models --force
-```
-
-只强制某个模型：
-
-```bash
-python -m faceswapper.cli --models ./models download-models \
-    --model inswapper \
-    --force
-```
-
-### 8.10 conda 环境缺少 CUDA Provider
-
-如果环境里同时存在 conda 和 pip 安装的 `onnxruntime`，会出现这个错误。
-检查并清理：
-
-```bash
-conda list onnxruntime
-pip show onnxruntime-gpu
-```
-
-只保留 pip 版本：
-
-```bash
-conda remove --force onnxruntime
-python tools/install.py cu128
-```
-
-验证：
-
-```bash
-python -c "import onnxruntime as ort; print(ort.get_available_providers())"
-```
-
-输出必须包含 `CUDAExecutionProvider`。
-
-### 8.11 重建 conda 环境
-
-环境损坏或需要更换 CUDA 版本时：
+模型文件保存在 `models/` 下，重建环境不会删除，不需要重新下载：
 
 ```bash
 conda deactivate
@@ -767,16 +911,7 @@ conda activate faceswapper
 python tools/install.py cu126
 ```
 
-模型文件保存在 `models/`，不会被删除，不需要重新下载。
-
----|---|
-| `0` | 成功 |
-| `1` | 未预期错误，会打印 traceback |
-| `2` | 用户输入、模型或环境错误 |
-
----
-
-### 8.12 退出码
+### 4.3 退出码
 
 | 退出码 | 含义 |
 |---|---|
@@ -786,61 +921,16 @@ python tools/install.py cu126
 
 ---
 
-## 9. 项目结构
-
-```text
-faceswapper/
-  cli.py             CLI 入口
-  model_store.py     模型清单、下载和 SHA-256 校验
-  headless.py        图片和视频换脸管线
-  parameters.py      参数定义
-  parameters_io.py   参数文件读写
-  _default_data.py   参数默认值
-  VideoManager.py    单帧换脸核心
-  Models.py          ONNX Runtime 模型会话
-  EmbeddingMerge.py  多源脸合并
-  tests/             无需 GPU 的测试
-tools/
-  install.py         CUDA Python 依赖安装器
-  check_env.py       云端环境自检
-requirements.txt     headless Python 依赖
-environment.yml      Conda 原生依赖环境
-```
-
-### 运行测试
-
-这些测试不需要 GPU、模型或 OpenCV：
-
-```bash
-python -m pytest -q
-```
-
-也可以直接运行：
-
-```bash
-python -m faceswapper.tests.test_cli
-python -m faceswapper.tests.test_model_store
-python -m faceswapper.tests.test_target_match
-python -m faceswapper.tests.test_timing
-```
-
----
-
-## 10. 免责声明
+## 5. 免责声明
 
 本项目仅用于合法、负责任和合乎伦理的用途。使用他人肖像前必须获得明确同意。
 
 不得制作或传播伤害、诽谤、欺骗、骚扰他人的内容。使用者需要自行遵守所在地
 关于隐私、肖像、深度合成、版权和数据处理的法律法规。
 
-使用本项目即表示使用者理解并承担相应责任。项目作者不对误用、滥用或使用结果
-造成的后果负责。
+`hyperswap_1a_256.onnx` 采用 ResearchRAIL 许可，**仅限非商业用途**；
+其余模型请遵守各自的上游许可，模型许可证与代码许可证不同。
 
----
+使用本项目即表示使用者理解并承担相应责任。项目作者不对误用、滥用或使用
+结果造成的后果负责。
 
-## 相关链接
-
-- [FaceFusion](https://github.com/facefusion/facefusion)
-- [FaceFusion 模型资产](https://github.com/facefusion/facefusion-assets)
-- [Hugging Face 模型仓库](https://huggingface.co/facefusion/models-3.0.0)
-- [InsightFace](https://github.com/deepinsight/insightface)

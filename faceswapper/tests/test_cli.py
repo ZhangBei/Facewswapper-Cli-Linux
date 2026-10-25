@@ -21,7 +21,8 @@ from faceswapper.cli import (
     build_parser,
 )
 from faceswapper.errors import HeadlessError
-from faceswapper.parameters import PARAMETER_BY_NAME, default_values, seed_control_dict
+from faceswapper.parameters import PARAMETER_BY_NAME, default_values
+from faceswapper.parameters_io import _coerce
 from faceswapper.parameters_io import load as load_params
 from faceswapper.parameters_io import save as save_params
 
@@ -154,6 +155,63 @@ def test_video_extensions_cover_common_containers() -> None:
     print(f"  ok  {len(VIDEO_EXTENSIONS)} video container extensions known")
 
 
+def test_feature_flags_map_to_parameters() -> None:
+    """The feature flags set the switches the model resolver reads."""
+    parser = build_parser()
+    args = parser.parse_args([
+        "--models", "/data/models", "swap",
+        "--source", "a.jpg", "--target", "t.jpg", "--output", "o.png",
+        "--restorer", "CF",
+        "--occluder", "--xseg", "--face-parser",
+    ])
+    overrides = _parameter_overrides(args)
+    assert overrides["RestorerSwitch"] is True, overrides
+    assert overrides["RestorerTypeTextSel"] == "CF", overrides
+    assert overrides["OccluderSwitch"] is True, overrides
+    assert overrides["DFLXSegSwitch"] is True, overrides
+    assert overrides["FaceParserSwitch"] is True, overrides
+
+    # --restorer with no value defaults to GFPGAN.
+    bare = parser.parse_args([
+        "swap", "--source", "a.jpg", "--target", "t.jpg",
+        "--restorer",
+    ])
+    bare_overrides = _parameter_overrides(bare)
+    assert bare_overrides["RestorerTypeTextSel"] == "GFPGAN", bare_overrides
+
+    # Nothing enabled means no optional model switch is set at all.
+    plain = parser.parse_args([
+        "swap", "--source", "a.jpg", "--target", "t.jpg",
+    ])
+    assert _parameter_overrides(plain) == {}, _parameter_overrides(plain)
+    print("  ok  feature flags map onto the parameter switches")
+
+
+def test_swapper_model_flag_maps_to_parameter() -> None:
+    """--swapper-model selects both the model and the output resolution, so
+    it lands on the single SwapperTypeTextSel parameter the pipeline reads."""
+    parser = build_parser()
+    args = parser.parse_args([
+        "swap", "--source", "a.jpg", "--target", "t.jpg", "--output", "o.png",
+        "--swapper-model", "hyperswap-256",
+    ])
+    assert args.swapper_model == "hyperswap-256", args.swapper_model
+    overrides = _parameter_overrides(args)
+    assert overrides["SwapperTypeTextSel"] == "hyperswap-256", overrides
+
+    # The old --swapper-size flag is gone, not aliased.
+    try:
+        parser.parse_args([
+            "swap", "--source", "a.jpg", "--target", "t.jpg",
+            "--swapper-size", "128",
+        ])
+    except SystemExit:
+        pass
+    else:
+        fail("--swapper-size should no longer parse")
+    print("  ok  --swapper-model maps to SwapperTypeTextSel")
+
+
 def test_parameters_roundtrip() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "saved_parameters.json"
@@ -169,12 +227,29 @@ def test_parameters_roundtrip() -> None:
     print("  ok  saved_parameters.json roundtrip")
 
 
+def test_legacy_swapper_values_are_mapped() -> None:
+    """A saved_parameters.json written before the rename carries bare
+    resolutions ('256', '512'); those must keep selecting the same model
+    they did before, not silently fall back to the default."""
+    for legacy, expected in (
+        ("128", "inswapper-128"),
+        ("256", "inswapper-256"),
+        ("512", "inswapper-512"),
+    ):
+        got = _coerce("SwapperTypeTextSel", legacy)
+        if got != expected:
+            fail(f"legacy {legacy!r} mapped to {got!r}, expected {expected!r}")
+    # An unknown value still falls back to the default.
+    if _coerce("SwapperTypeTextSel", "nonsense") != "inswapper-128":
+        fail("unknown swapper value should fall back to the default")
+    print("  ok  legacy swapper values map onto the renamed modes")
+
+
 def test_default_snapshots_have_vm_keys() -> None:
     """The VideoManager reads a fixed set of keys; the defaults must
     contain all of them or the first swap raises KeyError."""
-    # The GUI's parameters pane publishes one flat snapshot of every
-    # non-button parameter regardless of scope, and VideoManager seeds
-    # itself the same way - so that is the key set to check.
+    # VideoManager seeds self.parameters from default_values(), so this is
+    # exactly the key set swap_core indexes.
     params = default_values()
     required = [
         "DetectTypeTextSel",
@@ -182,15 +257,15 @@ def test_default_snapshots_have_vm_keys() -> None:
         "DetectInputSizeTextSel",
         "ThresholdSlider",
         "SwapperTypeTextSel",
-        "MergeTextSel",
     ]
     for key in required:
         if key not in params:
             fail(f"parameter default missing {key!r}")
-    control = seed_control_dict()
-    for key in ("SwapFacesButton", "MaskViewButton"):
-        if key not in control:
-            fail(f"control default missing {key!r}")
+    # MergeTextSel was removed: headless passes merge_mode straight to
+    # EmbeddingMerge.combine(), so the parameter was never read by the
+    # pipeline. Guard against it creeping back as a phantom knob.
+    if "MergeTextSel" in params:
+        fail("MergeTextSel is back in the schema but nothing reads it")
     if len(PARAMETER_BY_NAME) == 0:
         fail("no parameters registered")
     print("  ok  default snapshots carry the keys VideoManager needs")
@@ -212,7 +287,10 @@ def main() -> int:
     test_video_parser_flags()
     test_model_command_flags()
     test_video_extensions_cover_common_containers()
+    test_feature_flags_map_to_parameters()
+    test_swapper_model_flag_maps_to_parameter()
     test_parameters_roundtrip()
+    test_legacy_swapper_values_are_mapped()
     test_default_snapshots_have_vm_keys()
     test_headless_error_is_raisable()
     print("all tests passed")

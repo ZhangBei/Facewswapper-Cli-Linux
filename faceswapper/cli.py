@@ -1,6 +1,6 @@
-"""Command-line entry point for headless Faceswapper.
+"""headless Faceswapper 的命令行入口。
 
-Image:
+图片：
 
     python -m faceswapper.cli swap \
         --source face.jpg --target target.jpg --output out.png
@@ -8,16 +8,16 @@ Image:
     python -m faceswapper.cli swap \
         --source face.jpg --target-dir ./targets --output-dir ./out
 
-Video (one source identity, every face):
+视频（一个 source 身份，每一张脸）：
 
     python -m faceswapper.cli video \
         --source face.jpg --target clip.mp4 --output out.mp4
 
-Inspection:
+查看检测结果：
 
     python -m faceswapper.cli inspect --target target.jpg
 
-Models:
+模型：
 
     python -m faceswapper.cli download-models
     python -m faceswapper.cli check-models
@@ -33,34 +33,48 @@ from typing import Any
 
 from faceswapper.errors import HeadlessError
 from faceswapper.model_store import (
-    BASE_MODELS,
-    DEFAULT_PROVIDERS,
+    ENDPOINT_ENV,
     MODEL_SPECS,
     PROVIDER_LABELS,
     ensure_models,
     format_size,
     inspect_models,
     specs_for_names,
+    specs_for_parameters,
 )
 from faceswapper.parameters import PARAMETER_BY_NAME
 from faceswapper.parameters_io import load as load_params
 
 
-# Image extensions the CLI accepts for source faces and target images.
-# Kept here (instead of in faceswapper.headless) so the argument parser and the
-# --help text work without OpenCV / torch installed.
+# CLI 接受的图片扩展名，source 脸和 target 图片都算。放在这里（而不是
+# faceswapper.headless）是为了让 argument parser 和 --help 在没有装
+# OpenCV / torch 的机器上也能用。
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v", ".mpg", ".mpeg",
 }
 
+# `download-models --model` 和 `check-models --model` 接受的模型组/模型名。
+# 两边共用同一份列表，以保持步调一致。
+DOWNLOAD_MODEL_CHOICES = [
+    "base", "retinaface", "arcface", "inswapper", "gfpgan",
+    "scrfd", "hyperswap", "gpen256", "gpen512", "codeformer",
+    "xseg", "faceparser", "dflxseg", "resnet50", "all",
+]
+
+# 由 --model-provider（顶层）和 download-models --provider 共用。
+_PROVIDER_HELP = (
+    "download source: a URL, or one of "
+    + "/".join(sorted(PROVIDER_LABELS))
+    + f"; repeatable (default: ${ENDPOINT_ENV})"
+)
+
 
 def _headless():
-    """Import faceswapper.headless lazily.
+    """延迟导入 faceswapper.headless。
 
-    The heavy deps (OpenCV, torch, ONNX Runtime) are only needed once a
-    command actually swaps something, so `--help` and `params` stay
-    usable on a machine that has not finished installing the runtime.
+    重依赖（OpenCV、torch、ONNX Runtime）只在真正执行换脸的指令时才需要，
+    这样在还没装完运行时的机器上 `--help` 和 `params` 依然可用。
     """
     try:
         from faceswapper import headless
@@ -74,7 +88,7 @@ def _headless():
 
 
 def _collect_sources(values: list[str] | None) -> list[str]:
-    """Expand --source values: files, or directories of face images."""
+    """展开 --source：既可以是文件，也可以是装脸图的目录。"""
     out: list[str] = []
     for value in values or []:
         if os.path.isdir(value):
@@ -88,7 +102,7 @@ def _collect_sources(values: list[str] | None) -> list[str]:
 
 
 def _collect_targets(values: list[str] | None, target_dir: str | None) -> list[str]:
-    """Expand --target values plus everything inside --target-dir."""
+    """展开 --target，再加上 --target-dir 目录里的所有内容。"""
     out: list[str] = []
     for value in values or []:
         if os.path.isdir(value):
@@ -107,29 +121,36 @@ def _collect_targets(values: list[str] | None, target_dir: str | None) -> list[s
 
 
 def _parameter_overrides(args: argparse.Namespace) -> dict[str, Any]:
-    """Collect saved parameters plus explicit CLI flags into one dict."""
+    """把保存的 parameters 和显式给出的 CLI 旗标合并成一个 dict。"""
     overrides: dict[str, Any] = {}
     if getattr(args, "params", None):
         overrides.update(load_params(args.params))
 
-    # Explicit CLI flags win over the saved parameter file.
+    # 显式给出的 CLI 旗标优先于保存的 parameter 文件。
     if getattr(args, "detect_type", None):
         overrides["DetectTypeTextSel"] = args.detect_type
     if getattr(args, "detect_input_size", None):
         overrides["DetectInputSizeTextSel"] = str(args.detect_input_size)
     if getattr(args, "detect_score", None) is not None:
         overrides["DetectScoreSlider"] = args.detect_score * 100
-    if getattr(args, "merge", None):
-        overrides["MergeTextSel"] = args.merge
-    if getattr(args, "swapper_size", None):
-        overrides["SwapperTypeTextSel"] = args.swapper_size
+    if getattr(args, "swapper_model", None):
+        overrides["SwapperTypeTextSel"] = args.swapper_model
     if getattr(args, "color_match", False):
         overrides["ColorMatchSwitch"] = True
+    if getattr(args, "restorer", None):
+        overrides["RestorerSwitch"] = True
+        overrides["RestorerTypeTextSel"] = args.restorer
+    if getattr(args, "occluder", False):
+        overrides["OccluderSwitch"] = True
+    if getattr(args, "xseg", False):
+        overrides["DFLXSegSwitch"] = True
+    if getattr(args, "face_parser", False):
+        overrides["FaceParserSwitch"] = True
     return overrides
 
 
 def _build_options(args: argparse.Namespace, headless=None) -> "SwapOptions":
-    """Turn parsed args into SwapOptions, loading saved parameters."""
+    """把解析后的 args 变成 SwapOptions，并加载保存的 parameters。"""
     if headless is None:
         headless = _headless()
     SwapOptions = headless.SwapOptions
@@ -153,19 +174,28 @@ def _build_options(args: argparse.Namespace, headless=None) -> "SwapOptions":
 
 
 def _prepare_models(args: argparse.Namespace) -> None:
-    """Validate base models and download only missing/corrupt files."""
-    specs = list(BASE_MODELS)
-    if getattr(args, "detect_type", None) == "SCRDF":
-        scrfd = next(
-            (spec for spec in specs_for_names(["scrfd"]) if spec.name == "scrfd"),
-            None,
-        )
-        if scrfd is not None:
-            specs.append(scrfd)
+    """只下载本次运行真正会加载的模型。
+
+    选择依据是 parameter snapshot（保存的 parameters 加上覆盖它们的 CLI
+    旗标），所以打开 --restorer 或 --occluder 只会拉进那一个文件，而不是
+    所有可选模型。
+    """
+    parameters = dict(_parameter_overrides(args))
+    # swap pipeline 读的就是这份 snapshot，所以也把默认值填进去：一个从没提过
+    # RestorerSwitch 的 --params 文件，对默认关闭的 restorer 也能得到正确
+    # 答案。
+    try:
+        from faceswapper.parameters import default_values
+        merged = {**default_values(), **parameters}
+    except Exception:
+        merged = parameters
+    # 旗标已经折叠进上面的 snapshot，所以 spec 解析只读 snapshot——每个值
+    # 只有一个真相来源。
+    specs = specs_for_parameters(merged)
     ensure_models(
         args.models,
         specs,
-        providers=args.model_provider or DEFAULT_PROVIDERS,
+        providers=args.model_provider or None,
         allow_download=not args.no_auto_download,
     )
 
@@ -179,9 +209,11 @@ def _print_model_list(
     print(f"models: {os.path.abspath(models_dir)}")
     for spec in specs:
         status = statuses[spec.name]
+        # 用户自备的文件没有上游 size 可报。
+        size = format_size(spec.size) if spec.size else "  ?"
         print(
             f"{status:<8} {spec.local_name:<28} "
-            f"{format_size(spec.size):>10}  {spec.role}"
+            f"{size:>10}  {spec.role}"
         )
 
 
@@ -200,8 +232,7 @@ def _cmd_swap(args: argparse.Namespace) -> int:
         if not os.path.isfile(path):
             raise HeadlessError(f"target image not found: {path}")
 
-    # Import the heavy runtime only once the inputs are known to be sane,
-    # so a typo in a path fails fast with a clear message.
+    # 只在输入确认无误之后才导入重运行时，这样路径打错能以清晰的消息快速失败。
     _prepare_models(args)
     headless = _headless()
     options = _build_options(args, headless)
@@ -236,7 +267,7 @@ def _cmd_swap(args: argparse.Namespace) -> int:
 
 
 def _cmd_inspect(args: argparse.Namespace) -> int:
-    """List the faces found in a target image (no swapping)."""
+    """列出 target 图片里检测到的脸（不换脸）。"""
     if not os.path.isfile(args.target):
         raise HeadlessError(f"target image not found: {args.target}")
     _prepare_models(args)
@@ -247,13 +278,12 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         slots = swapper._detect_face_slots(rgb)
         print(f"{args.target}: {len(slots)} face(s) detected")
         for index, slot in enumerate(slots):
-            thumb = slot["Thumbnail"]
-            print(f"  [{index}] thumbnail {thumb.shape[1]}x{thumb.shape[0]}")
+            print(f"  [{index}] scale {slot['Scale']:.1f}")
     return 0
 
 
 def _cmd_video(args: argparse.Namespace) -> int:
-    """Swap one source identity into every face of a video."""
+    """把一个 source 身份换到视频里的每一张脸上。"""
     sources = _collect_sources(args.source)
     if not sources:
         raise HeadlessError("no source face supplied (use --source)")
@@ -277,7 +307,7 @@ def _cmd_video(args: argparse.Namespace) -> int:
 
     options = headless.VideoOptions(
         models_folder=args.models,
-        # Video CLI is deliberately single-source / all-faces only.
+        # video CLI 刻意只支持单 source / 换所有脸。
         face_policy="all",
         target_person_paths=target_faces,
         target_threshold=args.target_threshold,
@@ -316,10 +346,8 @@ def _cmd_video(args: argparse.Namespace) -> int:
 
 
 def _cmd_params(args: argparse.Namespace) -> int:
-    """Print the known parameter names and their defaults."""
+    """打印已知的 parameter 名及其默认值。"""
     for name, param in PARAMETER_BY_NAME.items():
-        if param.kind == "button":
-            continue
         try:
             default = param.default
         except KeyError:
@@ -336,7 +364,7 @@ def _cmd_download_models(args: argparse.Namespace) -> int:
     ensure_models(
         args.models,
         specs,
-        providers=args.provider or DEFAULT_PROVIDERS,
+        providers=args.provider or None,
         force=args.force,
     )
     _print_model_list(args.models, specs)
@@ -352,10 +380,12 @@ def _cmd_check_models(args: argparse.Namespace) -> int:
         verify=not args.quick,
     )
     _print_model_list(args.models, specs, statuses)
+    # 用户自备的 spec（上游没有 release、没有 checksum）只能报告为 present 或
+    # missing；缺一个只是提示，不算失败，因为它从不被下载，而且很少用得上。
     invalid = [
         spec for spec in specs
-        if statuses[spec.name] != "valid"
-        and (explicit_selection or spec.required)
+        if statuses[spec.name] not in ("valid", "present")
+        and (explicit_selection or spec.required) and spec.size
     ]
     if invalid:
         repair_args = " ".join(
@@ -367,7 +397,7 @@ def _cmd_check_models(args: argparse.Namespace) -> int:
             f"download-models {repair_args}"
         )
     if not args.quick:
-        print("all model SHA-256 checks passed")
+        print("all model checksum checks passed")
     return 0
 
 
@@ -379,141 +409,152 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--models",
         default="./models",
-        help="folder holding det_10g.onnx / w600k_r50.onnx / inswapper_*.onnx",
+        help="存放 det_10g.onnx / w600k_r50.onnx / inswapper_*.onnx 的目录",
     )
     parser.add_argument(
         "--model-provider",
         action="append",
-        choices=sorted(PROVIDER_LABELS),
         default=[],
-        help="model source used for automatic downloads; repeatable",
+        help=_PROVIDER_HELP,
     )
     parser.add_argument(
         "--no-auto-download",
         action="store_true",
-        help="fail instead of downloading missing/corrupt base models",
+        help="base 模型缺失或损坏时直接失败，不去下载",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_common(p: argparse.ArgumentParser) -> None:
         p.add_argument("--params", default=None,
-                       help="saved_parameters.json to load defaults from")
+                       help="从中加载默认值的 saved_parameters.json")
         p.add_argument("--detect-type", choices=["Retinaface", "SCRDF"],
-                       default=None, help="face detection model")
+                       default=None, help="人脸检测模型")
         p.add_argument("--detect-input-size", type=int, choices=[320, 416, 480, 640],
-                       default=None, help="detector input resolution")
+                       default=None, help="detector 输入分辨率")
         p.add_argument("--detect-score", type=int, default=None,
-                       help="detection score threshold, 1-100")
+                       help="检测分数阈值，1-100")
         p.add_argument("--merge",
                        choices=["Mean", "Median", "Sph", "Geo", "Qual"],
-                       default=None, help="how to combine several source faces")
-        p.add_argument("--swapper-size", choices=["128", "256", "512"],
-                       default=None, help="swapper output resolution")
+                       default=None, help="如何融合多个 source 脸")
+        p.add_argument("--swapper-model",
+                       choices=["inswapper-128", "inswapper-256", "inswapper-512", "hyperswap-256"],
+                       default=None, help="swapper 模型与输出分辨率")
         p.add_argument("--color-match", action="store_true",
-                       help="enable LAB color matching")
+                       help="启用 LAB 色彩匹配")
+        p.add_argument("--restorer", nargs="?", const="GFPGAN",
+                       choices=["GFPGAN", "CF", "GPEN256", "GPEN512"],
+                       default=None,
+                       help="用指定模型修复换好的脸（只下载那一个"
+                            "文件）；省略值则用 GFPGAN")
+        p.add_argument("--occluder", action="store_true",
+                       help="遮挡掩码（下载 occluder.onnx）")
+        p.add_argument("--xseg", action="store_true",
+                       help="DeepFaceLab XSeg 遮挡掩码（下载"
+                            "dfl_xseg.onnx）")
+        p.add_argument("--face-parser", action="store_true",
+                       help="用 face parser 生成背景掩码（下载"
+                            "faceparser_resnet34.onnx）")
         p.add_argument("--backend", choices=["cuda", "trt"], default="cuda",
-                       help="inference backend (default: cuda, no TensorRT)")
+                       help="推理后端（默认 cuda，不用 TensorRT）")
 
-    swap = sub.add_parser("swap", help="swap faces in one or more images")
+    swap = sub.add_parser("swap", help="换一张或多张图片里的脸")
     add_common(swap)
     swap.add_argument("--source", action="append", default=[],
-                       help="source face image (repeatable, or a folder)")
+                       help="source 脸图片（可重复，或给目录）")
     swap.add_argument("--target", action="append", default=[],
-                       help="target image (repeatable, or a folder)")
+                       help="target 图片（可重复，或给目录）")
     swap.add_argument("--target-dir", default=None,
-                       help="folder of target images to process")
+                       help="待处理的 target 图片目录")
     swap.add_argument("--output", default=None,
-                       help="output image path (single target only)")
+                       help="输出图片路径（仅单个 target）")
     swap.add_argument("--output-dir", default=None,
-                       help="output folder (batch mode)")
+                       help="输出目录（批量模式）")
     swap.add_argument("--face-policy", choices=["all", "largest"],
                        default="all",
-                       help="which target faces to swap (default: all)")
+                       help="换哪些 target 脸（默认 all）")
     swap.set_defaults(func=_cmd_swap)
 
     video = sub.add_parser(
-        "video", help="swap every face in a video to one source identity"
+        "video", help="把视频里每一张脸换成一个 source 身份"
     )
     add_common(video)
     video.add_argument("--source", action="append", default=[],
                        help="source face image (repeatable, or a folder)")
     video.add_argument("--target-face", action="append", default=[],
-                       help="reference image of the person to replace in the "
-                            "video (repeatable, or a folder). Omit to swap "
-                            "every detected face")
+                       help="视频里要被替换掉的人的参考图（可重复，"
+                            "或给目录）。省略则换掉每一张检测到的脸")
     video.add_argument("--target-threshold", type=float, default=55.0,
-                       help="similarity threshold (0-100) for matching the "
-                            "target person (default: 55)")
+                       help="匹配 target 人物的相似度阈值（0-100，"
+                            "默认 55）")
     video.add_argument("--target", required=True,
-                       help="input video file")
+                       help="输入视频文件")
     video.add_argument("--output", required=True,
-                       help="output video file (e.g. out.mp4)")
+                       help="输出视频文件（如 out.mp4）")
     video.add_argument("--crf", type=int, default=18,
-                       help="H.264 quality, lower is better (default: 18)")
+                       help="H.264 质量，越小越好（默认 18）")
     video.add_argument("--preset", default="medium",
                        choices=["ultrafast", "veryfast", "fast", "medium",
                                 "slow", "veryslow"],
-                       help="x264 speed/quality preset (default: medium)")
+                       help="x264 速度/质量预设（默认 medium）")
     video.add_argument("--no-audio", action="store_true",
-                       help="do not copy the source audio track")
+                       help="不拷贝源音频轨")
     video.add_argument("--every-nth", type=int, default=1,
-                       help="only swap every Nth frame, pass the rest "
-                            "through (1 = all frames; for timing tests)")
+                       help="只换第 N 帧，其余原样透传（1 = 全部帧；"
+                            "用于计时测试）")
     video.set_defaults(func=_cmd_video)
 
-    inspect = sub.add_parser("inspect", help="list faces detected in an image")
+    inspect = sub.add_parser("inspect", help="列出图片里检测到的脸")
     add_common(inspect)
-    inspect.add_argument("--target", required=True, help="image to inspect")
+    inspect.add_argument("--target", required=True, help="要查看的图片")
     inspect.set_defaults(func=_cmd_inspect)
 
-    params = sub.add_parser("params", help="print known parameters and defaults")
+    params = sub.add_parser("params", help="打印已知 parameter 及其默认值")
     params.set_defaults(func=_cmd_params)
 
     download = sub.add_parser(
         "download-models",
-        help="download missing or corrupt ONNX models",
+        help="下载缺失或损坏的 ONNX 模型",
     )
     download.add_argument(
         "--model",
         action="append",
-        choices=["base", "retinaface", "arcface", "inswapper", "gfpgan", "scrfd"],
+        choices=DOWNLOAD_MODEL_CHOICES,
         default=[],
-        help="model group or model name; repeatable (default: base)",
+        help="模型组或模型名；可重复（默认 base）",
     )
     download.add_argument(
         "--provider",
         action="append",
-        choices=sorted(PROVIDER_LABELS),
         default=[],
-        help="download source; repeatable (default: all in order)",
+        help=_PROVIDER_HELP,
     )
     download.add_argument(
         "--force",
         action="store_true",
-        help="download again even when the current file is valid",
+        help="即使当前文件有效也重新下载",
     )
     download.add_argument(
         "--list",
         action="store_true",
-        help="list selected models and local status without downloading",
+        help="只列出所选模型及本地状态，不下载",
     )
     download.set_defaults(func=_cmd_download_models)
 
     check_models = sub.add_parser(
         "check-models",
-        help="validate local model files and SHA-256 hashes",
+        help="校验本地模型文件及其 SHA-256 哈希",
     )
     check_models.add_argument(
         "--model",
         action="append",
-        choices=["base", "retinaface", "arcface", "inswapper", "gfpgan", "scrfd"],
+        choices=DOWNLOAD_MODEL_CHOICES,
         default=[],
-        help="model group or model name; repeatable (default: all)",
+        help="模型组或模型名；可重复（默认 all）",
     )
     check_models.add_argument(
         "--quick",
         action="store_true",
-        help="check existence, size, and cached hash only",
+        help="只检查存在性、size 与已缓存的哈希",
     )
     check_models.set_defaults(func=_cmd_check_models)
     return parser

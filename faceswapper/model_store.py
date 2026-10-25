@@ -1,7 +1,7 @@
-"""Model inventory, integrity checks, and multi-provider downloads.
+"""模型清单、完整性校验与多 provider 下载。
 
-This module deliberately depends only on the Python standard library so
-``download-models`` works before the GPU inference stack is installed.
+本模块刻意只依赖 Python 标准库，这样在 GPU 推理栈还没装好之前
+``download-models`` 也能用。
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import urllib.error
 import urllib.request
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
@@ -21,7 +22,10 @@ from faceswapper.errors import HeadlessError
 
 
 CACHE_FILE = ".faceswapper-models.json"
-DEFAULT_PROVIDERS = ("huggingface", "hf-mirror", "github")
+# 不硬编码下载源：--provider 和这个环境变量都没指定时，下载会失败并说明
+# 原因。HF_ENDPOINT 是 huggingface_hub 自己认的变量，所以给系统配一次
+# mirror，本工具也一并覆盖。
+ENDPOINT_ENV = "HF_ENDPOINT"
 PROVIDER_LABELS = {
     "github": "GitHub Release",
     "huggingface": "Hugging Face",
@@ -39,6 +43,9 @@ class ModelSpec:
     sha256: str
     role: str
     required: bool = False
+    # crc32（8 位十六进制）是上游 FaceFusion 发布里给较新模型提供的唯一
+    # checksum；有 sha256 的地方仍以它为准，crc32 是在 size 之外额外查的。
+    crc32: str = ""
 
 
 MODEL_SPECS: tuple[ModelSpec, ...] = (
@@ -100,6 +107,97 @@ MODEL_SPECS: tuple[ModelSpec, ...] = (
         ),
         role="SCRFD alternative face detector",
     ),
+    ModelSpec(
+        name="hyperswap",
+        local_name="hyperswap_1a_256.onnx",
+        remote_name="hyperswap_1a_256.onnx",
+        release="models-3.3.0",
+        size=402742682,
+        # 上游这个 release 没有发布 sha256，只有 FaceFusion 自己的
+        # hash_helper 用的那个 CRC32（zlib.crc32，8 位十六进制）。
+        sha256="",
+        crc32="79e50d4b",
+        role="HyperSwap 256 face swapper (ResearchRAIL, non-commercial)",
+    ),
+    # ---- 可选功能模型。普通换脸一个都不需要；每个都对应一个 CLI 已经暴露
+    # 出来的 parameter switch（--restorer / --occluder / --xseg / --face-parser）。
+    ModelSpec(
+        name="gpen256",
+        local_name="GPEN-BFR-256.onnx",
+        remote_name="gpen_bfr_256.onnx",
+        release="models-3.0.0",
+        size=75792988,
+        sha256=(
+            "bad8bf0426873828df2dbf4e3b3d9ababba9da7965b8b72426569486f7ae5c25"
+        ),
+        role="GPEN-BFR-256 face restorer (--restorer gpen256)",
+    ),
+    ModelSpec(
+        name="gpen512",
+        local_name="GPEN-BFR-512.onnx",
+        remote_name="gpen_bfr_512.onnx",
+        release="models-3.0.0",
+        size=284340240,
+        sha256=(
+            "d5f066b9068a8b74217f9712e28e875a6144629b108a6f7355acbdb3a2832c54"
+        ),
+        role="GPEN-BFR-512 face restorer (--restorer gpen512)",
+    ),
+    ModelSpec(
+        name="codeformer",
+        local_name="codeformer_fp16.onnx",
+        remote_name="codeformer.onnx",
+        release="models-3.0.0",
+        size=376951650,
+        sha256=(
+            "21710e7ab61c82683576c428e9c1b6fe1ed419586b7b39e394c3449c294b550f"
+        ),
+        role="CodeFormer face restorer (--restorer codeformer)",
+    ),
+    ModelSpec(
+        name="xseg",
+        local_name="occluder.onnx",
+        remote_name="xseg_2.onnx",
+        release="models-3.1.0",
+        size=70324286,
+        sha256=(
+            "cd9a0879eaf43841d765472cf1f8c330dbf9dcb03da0eace93e95f3bcc399042"
+        ),
+        role="XSeg occlusion mask (--occluder)",
+    ),
+    ModelSpec(
+        name="faceparser",
+        local_name="faceparser_resnet34.onnx",
+        remote_name="bisenet_resnet_34.onnx",
+        release="models-3.0.0",
+        size=93632546,
+        sha256=(
+            "4a0b8c958a3c938913bd06a8365dbb3c8761afba6ecbf0d14b3b1f77eb230c96"
+        ),
+        role="BiSeNet face parser (--face-parser)",
+    ),
+    ModelSpec(
+        name="dflxseg",
+        local_name="dfl_xseg.onnx",
+        remote_name="dfl_xseg.onnx",
+        release="models-3.0.0",
+        size=70343569,
+        sha256=(
+            "af105ae257170fdbc6a03460327b88d5c0b9a659aa4384fb8686ceead7294ad8"
+        ),
+        role="DeepFaceLab XSeg occlusion mask (--xseg)",
+    ),
+    ModelSpec(
+        name="resnet50",
+        local_name="res50.onnx",
+        remote_name="res50.onnx",
+        release="models-3.0.0",
+        # FaceFusion 没有单独托管 res50，所以这个文件始终由用户自备：
+        # 没有 checksum 意味着它只会被报告，不会被下载。
+        size=0,
+        sha256="",
+        role="ResNet50 detector (--restorer-align reference, user-supplied)",
+    ),
 )
 
 MODEL_BY_NAME = {spec.name: spec for spec in MODEL_SPECS}
@@ -107,7 +205,12 @@ BASE_MODELS = tuple(spec for spec in MODEL_SPECS if spec.required)
 
 
 def build_download_url(provider: str, spec: ModelSpec) -> str:
-    """Build one provider URL for a model."""
+    """为某个模型拼出一个 provider URL。
+
+    provider 要么是已知的名字，要么是一个完整的 http(s) URL——它会被当作
+    Hugging Face endpoint 的基址，所以任何 mirror（包括 $HF_ENDPOINT 指向的
+    那个）不用在这里登记也能用。
+    """
     if provider == "github":
         return (
             "https://github.com/facefusion/facefusion-assets/releases/download/"
@@ -123,14 +226,30 @@ def build_download_url(provider: str, spec: ModelSpec) -> str:
             "https://hf-mirror.com/facefusion/"
             f"{spec.release}/resolve/main/{spec.remote_name}"
         )
+    if provider.startswith(("http://", "https://")):
+        return f"{provider}/facefusion/{spec.release}/resolve/main/{spec.remote_name}"
     raise HeadlessError(f"unknown model download provider: {provider}")
 
 
-def normalize_providers(providers: Iterable[str] | None) -> tuple[str, ...]:
-    values = tuple(providers or DEFAULT_PROVIDERS)
+def default_providers() -> tuple[str, ...]:
+    """调用方没指定来源时用哪些：$HF_ENDPOINT，没有就空着。"""
+    endpoint = (os.environ.get(ENDPOINT_ENV) or "").strip().rstrip("/")
+    return (endpoint,) if endpoint else ()
+
+
+def normalize_providers(providers: Iterable[str]) -> tuple[str, ...]:
+    values = tuple(providers)
     if not values:
-        raise HeadlessError("at least one model download provider is required")
-    unknown = [value for value in values if value not in PROVIDER_LABELS]
+        raise HeadlessError(
+            "no model download source given: pass --provider with a URL or a "
+            f"known source ({', '.join(sorted(PROVIDER_LABELS))}), "
+            f"or set ${ENDPOINT_ENV}"
+        )
+    unknown = [
+        value for value in values
+        if value not in PROVIDER_LABELS
+        and not value.startswith(("http://", "https://"))
+    ]
     if unknown:
         raise HeadlessError(
             "unknown model download provider(s): " + ", ".join(unknown)
@@ -144,6 +263,34 @@ def sha256_file(path: str | os.PathLike[str]) -> str:
         for chunk in iter(lambda: model_file.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def crc32_file(path: str | os.PathLike[str]) -> str:
+    """CRC32，8 位小写十六进制——上游拿不出 sha256 的那些模型，FaceFusion
+    发布的就是这个 checksum。"""
+    checksum = 0
+    with open(path, "rb") as model_file:
+        for chunk in iter(lambda: model_file.read(1024 * 1024), b""):
+            checksum = zlib.crc32(chunk, checksum)
+    return format(checksum & 0xFFFFFFFF, "08x")
+
+
+def _checksum_mismatch(path: str | os.PathLike[str], spec: ModelSpec) -> str | None:
+    """文件的 checksum 与 spec 相符时返回 None，否则返回一段描述。
+
+    上游发布了 sha256 的地方以它为准；只带 CRC32 的模型退回到 CRC32。
+    两者都没有的 spec（用户自备）永远不会判定为不匹配。
+    """
+    if spec.sha256:
+        actual = sha256_file(path)
+        if actual != spec.sha256:
+            return f"SHA-256 mismatch: {actual}, expected {spec.sha256}"
+        return None
+    if spec.crc32:
+        actual = crc32_file(path)
+        if actual != spec.crc32:
+            return f"CRC32 mismatch: {actual}, expected {spec.crc32}"
+    return None
 
 
 def _read_cache(models_dir: str | os.PathLike[str]) -> dict:
@@ -163,8 +310,8 @@ def _write_cache(models_dir: str | os.PathLike[str], cache: dict) -> None:
             encoding="utf-8",
         )
     except OSError:
-        # A read-only or full model volume must not block inference when
-        # the model itself is valid; the cache is only an optimization.
+        # 模型卷只读或写满时，不该在模型本身有效的情况下挡住推理；cache 只是
+        # 个优化手段。
         pass
 
 
@@ -183,6 +330,7 @@ def _cache_matches(
     return (
         entry.get("size") == spec.size
         and entry.get("sha256") == spec.sha256
+        and entry.get("crc32") == spec.crc32
         and entry.get("mtime_ns") == stat.st_mtime_ns
     )
 
@@ -202,6 +350,7 @@ def _record_cache(
         "size": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
         "sha256": spec.sha256,
+        "crc32": spec.crc32,
     }
     _write_cache(models_dir, cache)
 
@@ -212,7 +361,13 @@ def inspect_model(
     *,
     verify: bool = False,
 ) -> str:
-    """Return ``valid``, ``missing``, or ``corrupt`` for one model."""
+    """对单个模型返回 ``valid``、``missing`` 或 ``corrupt``。"""
+    # 既没有上游 checksum 也没有已知 size 的 spec，按定义就是用户自备的
+    # （FaceFusion 的 asset 仓库里没有对应文件）。它只被如实报告、从不下载，
+    # 所以 `res50.onnx` 显示为 missing，而不会让整个清单检查失败。
+    if not spec.size:
+        path = Path(models_dir) / spec.local_name
+        return "present" if path.is_file() else "missing"
     path = Path(models_dir) / spec.local_name
     if not path.is_file():
         return "missing"
@@ -226,7 +381,7 @@ def inspect_model(
     cache = _read_cache(models_dir)
     if not verify and _cache_matches(cache, spec, path):
         return "valid"
-    if sha256_file(path) != spec.sha256:
+    if _checksum_mismatch(path, spec) is not None:
         return "corrupt"
     _record_cache(models_dir, cache, spec, path)
     return "valid"
@@ -332,7 +487,14 @@ def download_model(
     on_event: Callable[[str], None] | None = print,
     downloader: Callable[[str, Path, int], None] | None = None,
 ) -> str:
-    """Download and atomically install one model, trying providers in order."""
+    """按顺序尝试各个 provider，下载并原子地安装一个模型。"""
+    if not spec.size:
+        # 没什么可下的：没有任何上游 release 发布这个文件，所以既拼不出 URL，
+        # 也没有 checksum 可校验。
+        raise HeadlessError(
+            f"{spec.local_name} is user-supplied; no upstream release "
+            "publishes it, so it cannot be downloaded"
+        )
     models_path = Path(models_dir)
     models_path.mkdir(parents=True, exist_ok=True)
     final_path = models_path / spec.local_name
@@ -347,9 +509,9 @@ def download_model(
     for provider in providers:
         url = build_download_url(provider, spec)
         if on_event:
+            label = PROVIDER_LABELS.get(provider, provider)
             on_event(
-                f"[model] {spec.local_name}: downloading via "
-                f"{PROVIDER_LABELS[provider]}"
+                f"[model] {spec.local_name}: downloading via {label}"
             )
         try:
             if downloader is not None:
@@ -364,12 +526,9 @@ def download_model(
                     f"downloaded size {partial_path.stat().st_size}, "
                     f"expected {spec.size}"
                 )
-            actual_sha256 = sha256_file(partial_path)
-            if actual_sha256 != spec.sha256:
-                raise HeadlessError(
-                    f"SHA-256 mismatch: {actual_sha256}, "
-                    f"expected {spec.sha256}"
-                )
+            mismatch = _checksum_mismatch(partial_path, spec)
+            if mismatch is not None:
+                raise HeadlessError(mismatch)
 
             os.replace(partial_path, final_path)
             cache = _read_cache(models_path)
@@ -404,24 +563,32 @@ def ensure_models(
     models_dir: str | os.PathLike[str],
     specs: Iterable[ModelSpec] = BASE_MODELS,
     *,
-    providers: Iterable[str] | None = DEFAULT_PROVIDERS,
+    providers: Iterable[str] | None = None,
     force: bool = False,
     verify: bool = False,
     allow_download: bool = True,
     on_event: Callable[[str], None] | None = print,
     downloader: Callable[[str, Path, int], None] | None = None,
 ) -> dict[str, str]:
-    """Ensure all requested models are valid, downloading when permitted."""
+    """确保所有请求的模型都有效，允许时就地下载。"""
     selected = tuple(specs)
+    # providers=None 表示"没有指定来源"：退回到 $HF_ENDPOINT。
     provider_values = (
-        DEFAULT_PROVIDERS if providers is None else tuple(providers)
+        tuple(providers) if providers is not None else default_providers()
     )
-    if provider_values:
+    # 空列表只有在真的要下载时才要紧；--no-auto-download 会先一步用它自己
+    # 那条不同的消息失败掉。
+    if provider_values or allow_download:
         provider_values = normalize_providers(provider_values)
     results: dict[str, str] = {}
 
     for spec in selected:
         status = inspect_model(models_dir, spec, verify=verify or force)
+        # 用户自备的文件（上游没有 release）只报告、不下载。缺一个只是警告，
+        # 不是致命错误，因为只有对应的 parameter switch 打开时它才要紧。
+        if not spec.size:
+            results[spec.name] = status
+            continue
         if status == "valid" and not force:
             if on_event:
                 on_event(f"[model] {spec.local_name}: valid")
@@ -445,6 +612,8 @@ def ensure_models(
 
 def specs_for_names(names: Iterable[str]) -> tuple[ModelSpec, ...]:
     values = tuple(names)
+    if "all" in values:
+        return MODEL_SPECS
     if not values or "base" in values:
         return BASE_MODELS
     unknown = [value for value in values if value not in MODEL_BY_NAME]
@@ -453,6 +622,60 @@ def specs_for_names(names: Iterable[str]) -> tuple[ModelSpec, ...]:
     selected: dict[str, ModelSpec] = {}
     for value in values:
         selected[MODEL_BY_NAME[value].name] = MODEL_BY_NAME[value]
+    return tuple(selected.values())
+
+
+# parameter switch -> 它会拉进来的模型文件。只有对应功能真的启用时 CLI 才
+# 需要某个模型，所以推理类命令是从 parameter snapshot 推导这个集合的，而不是
+# 一律要求所有可选文件都在。
+FEATURE_MODELS: dict[str, tuple[str, ...]] = {
+    "OccluderSwitch": ("xseg",),
+    "DFLXSegSwitch": ("dflxseg",),
+    "FaceParserSwitch": ("faceparser",),
+}
+
+# RestorerTypeTextSel -> 它选中的模型文件。四个 restorer 共用同一个 switch，
+# 只需要被选中那一个。
+RESTORER_MODELS: dict[str, str] = {
+    "GFPGAN": "gfpgan",
+    "CF": "codeformer",
+    "GPEN256": "gpen256",
+    "GPEN512": "gpen512",
+}
+
+
+def specs_for_parameters(
+    parameters: dict[str, object],
+) -> tuple[ModelSpec, ...]:
+    """从 parameter snapshot 推出一次运行需要的模型集合。
+
+    始终包含 base 模型，再加上被启用的功能所选中的那些。
+    """
+    selected: dict[str, ModelSpec] = {
+        spec.name: spec for spec in BASE_MODELS
+    }
+
+    def add(name: str) -> None:
+        spec = MODEL_BY_NAME.get(name)
+        if spec is not None and spec.name not in selected:
+            selected[spec.name] = spec
+
+    if str(parameters.get("DetectTypeTextSel") or "") == "SCRDF":
+        add("scrfd")
+
+    swapper = str(parameters.get("SwapperTypeTextSel") or "")
+    if swapper == "hyperswap-256":
+        add("hyperswap")
+
+    # RestorerSwitch 决定用哪一族，RestorerTypeTextSel 决定具体哪个文件。
+    if parameters.get("RestorerSwitch"):
+        add(RESTORER_MODELS.get(
+            str(parameters.get("RestorerTypeTextSel") or ""), "gfpgan"
+        ))
+    for switch, names in FEATURE_MODELS.items():
+        if parameters.get(switch):
+            for name in names:
+                add(name)
     return tuple(selected.values())
 
 

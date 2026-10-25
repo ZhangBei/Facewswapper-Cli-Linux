@@ -1,20 +1,18 @@
-"""Load / save helpers for saved_parameters.json files.
+"""saved_parameters.json 的读写辅助函数。
 
-The on-disk format is a flat {name: value} JSON - unchanged from the
-original desktop GUI, so a file exported from it still loads here.
-"Migration" therefore means "validate the keys are known, drop the rest":
-keys belonging to the removed GUI-only parameters are silently ignored.
+磁盘格式是扁平的 {name: value} JSON——和最初的桌面 GUI 完全一致，所以从它
+导出的文件在这里照样能加载。因此"迁移"的含义就是"校验 key 是否已知，其余
+丢掉"：属于已移除的 GUI-only parameter 的 key 会被静默忽略。
 
-Public surface:
+对外接口：
 
     load(path) -> dict[str, Any]
-        Reads the JSON, keeps only keys present in PARAMETER_BY_NAME, and
-        coerces values to the appropriate Python type using the param's
-        kind. Returns a dict ready to feed into the VideoManager.
+        读 JSON，只保留 PARAMETER_BY_NAME 里有的 key，并按 param 的 kind
+        把值强转成相应的 Python 类型。返回的 dict 可直接喂给 VideoManager。
 
     save(values, path) -> None
-        Writes {name: value} JSON. Keys not present in PARAMETER_BY_NAME
-        are dropped silently (defensive — same as legacy load behavior).
+        写 {name: value} JSON。不在 PARAMETER_BY_NAME 里的 key 会被静默丢弃
+        （防御性的——与旧版 load 的行为一致）。
 """
 
 from __future__ import annotations
@@ -26,14 +24,25 @@ from typing import Any
 from faceswapper.parameters import PARAMETER_BY_NAME, SelectParam
 
 
-def _coerce(name: str, value: Any) -> Any:
-    """Coerce a JSON-loaded value to the kind the param expects.
+# 桌面 GUI 在 swapper 模式改名之前写下的值——那时只有裸分辨率
+# （'128'/'256'/'512'），后来才改成带模型名的形式。没有这张表的话，一份
+# 写着 "256" 的旧 saved_parameters.json 会被静默降级成 128 基线，而不是
+# polyphase-256。
+_LEGACY_SWAPPER_MODES = {
+    "128": "inswapper-128",
+    "256": "inswapper-256",
+    "512": "inswapper-512",
+}
 
-    JSON gives us str/int/float/bool/list. The schema, however, expects:
-    - slider: float (current GUI stores ints sometimes, floats elsewhere)
-    - switch: bool
-    - select: str (must be in modes)
-    - entry: str
+
+def _coerce(name: str, value: Any) -> Any:
+    """把从 JSON 读到的值强转成 param 期望的 kind。
+
+    JSON 给我们的是 str/int/float/bool/list，而 schema 期望的是：
+    - slider：float（现在的 GUI 有时存 int，别处存 float）
+    - switch：bool
+    - select：str（必须在 modes 里）
+    - entry：str
     """
     p = PARAMETER_BY_NAME.get(name)
     if p is None:
@@ -46,9 +55,11 @@ def _coerce(name: str, value: Any) -> Any:
         except (TypeError, ValueError):
             return p.default
     if p.kind == "select":
-        # Must match a known mode, else fall back to default.
+        # 必须匹配某个已知 mode，否则回退到默认值。
         if isinstance(p, SelectParam) and value in p.modes:
             return value
+        if name == "SwapperTypeTextSel" and value in _LEGACY_SWAPPER_MODES:
+            return _LEGACY_SWAPPER_MODES[value]
         return p.default
     if p.kind == "entry":
         return "" if value is None else str(value)
@@ -56,10 +67,9 @@ def _coerce(name: str, value: Any) -> Any:
 
 
 def load(path: str | Path) -> dict[str, Any]:
-    """Read a saved_parameters.json and return a sanitized {name: value} dict.
+    """读一份 saved_parameters.json，返回清理过的 {name: value} dict。
 
-    Unknown keys are dropped. Type-coerced values are returned. If the file
-    doesn't exist, returns {}.
+    未知 key 会被丢掉，值会做类型强转。文件不存在时返回 {}。
     """
     p = Path(path)
     if not p.is_file():
@@ -78,6 +88,6 @@ def load(path: str | Path) -> dict[str, Any]:
 
 
 def save(values: dict[str, Any], path: str | Path) -> None:
-    """Write {name: value} JSON. Drops unknown keys defensively."""
+    """写 {name: value} JSON。防御性地丢掉未知 key。"""
     filtered = {k: v for k, v in values.items() if k in PARAMETER_BY_NAME}
     Path(path).write_text(json.dumps(filtered, indent=2), encoding="utf-8")

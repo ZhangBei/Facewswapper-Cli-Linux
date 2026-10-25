@@ -45,7 +45,6 @@ dist/
 # --- Repo-internal docs / design assets (not published to the public repo) ---
 CLAUDE.md
 torch.cuda.md
-ui_tiers.svg
 
 # --- Tooling caches ---
 .pytest_cache/

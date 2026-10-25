@@ -148,9 +148,9 @@ def detect_conda() -> str | None:
 def check_torch() -> str | None:
     if importlib.util.find_spec("torch") is None:
         return (
-            "torch is not installed. Install the CUDA build with:\n"
-            "  pip install torch torchvision "
-            "--index-url https://download.pytorch.org/whl/cu128"
+            "torch is not installed. Install with:\n"
+            "  python tools/install.py default\n"
+            "(add --index-url for a specific CUDA wheel channel)"
         )
     import torch
 
@@ -240,15 +240,12 @@ def check_models(models_dir: str) -> str | None:
                 f"model {spec.local_name}",
                 f"{statuses[spec.name]} (optional: {spec.role})",
             )
+    # Everything above is now in MODEL_SPECS; these two swapper variants
+    # are the only ones still left out because no upstream release
+    # publishes them, so they can never be downloaded.
     for filename, role in (
         ("inswapper_512_level2.onnx", "swapper 512"),
         ("inswapper_256_phase1.onnx", "swapper 256-native"),
-        ("GPEN-BFR-256.onnx", "restorer"),
-        ("GPEN-BFR-512.onnx", "restorer"),
-        ("codeformer_fp16.onnx", "restorer"),
-        ("occluder.onnx", "occlusion mask"),
-        ("faceparser_resnet34.onnx", "face parser"),
-        ("dfl_xseg.onnx", "DFL XSeg mask"),
     ):
         if not os.path.isfile(os.path.join(models_dir, filename)):
             warn(f"model {filename}", f"not present (optional: {role})")
@@ -300,8 +297,7 @@ def main() -> int:
         )
     check(
         "torch + cuda", check_torch,
-        "pip install torch torchvision --index-url "
-        "https://download.pytorch.org/whl/cu128",
+        "python tools/install.py default",
     )
     check("onnxruntime", check_onnxruntime, "pip install onnxruntime-gpu")
     check(

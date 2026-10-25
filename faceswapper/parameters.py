@@ -1,181 +1,145 @@
-"""Typed parameter schema for the headless CLI.
+"""headless CLI 的 typed parameter schema。
 
-Every entry maps to a key that faceswapper.VideoManager reads out of
-`self.parameters`. The on-disk format is unchanged: `saved_parameters.json`
-stays a flat {name: value} mapping, so a file exported from the original
-desktop GUI still loads here.
+每一项都对应一个 key，faceswapper.VideoManager 会从 `self.parameters` 里读
+它。磁盘格式没有变：`saved_parameters.json` 仍然是扁平的 {name: value} 映射，
+所以当初从桌面 GUI 导出的文件在这里照样能加载。
 
-Only parameters the CLI can actually honour are listed. The GUI-only
-entries (buttons, icons, timeline and capture controls) were removed
-along with the Qt frontend.
+key 的命名沿用 GUI 时代的 widget 后缀（`TextSel` / `Slider` / `Switch`）。
+这是磁盘契约的一部分，改名会让已有的参数文件失效——见
+docs/adr/0001-keep-gui-era-parameter-naming.md。
+
+每个 param 只需提供两样东西：`default`（写进 parameter snapshot 的初值）
+和 `kind`（决定 parameters_io 怎么把 JSON 值强转成 Python 类型）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Literal
+from typing import Literal
 
 from faceswapper._default_data import DEFAULT_DATA
-
-
-ParameterKind = Literal["slider", "switch", "select", "entry"]
 
 
 @dataclass(frozen=True)
 class SliderParam:
     name: str
-    label: str
     kind: Literal["slider"] = field(default="slider", init=False)
 
     @property
     def default(self) -> float: return DEFAULT_DATA[self.name + "Amount"]
-    @property
-    def min(self) -> float: return DEFAULT_DATA[self.name + "Min"]
-    @property
-    def max(self) -> float: return DEFAULT_DATA[self.name + "Max"]
-    @property
-    def inc(self) -> float: return DEFAULT_DATA[self.name + "Inc"]
-    @property
-    def info_text(self) -> str: return DEFAULT_DATA.get(self.name + "InfoText", "")
 
 
 @dataclass(frozen=True)
 class SwitchParam:
     name: str
-    label: str
     kind: Literal["switch"] = field(default="switch", init=False)
 
     @property
     def default(self) -> bool: return bool(DEFAULT_DATA.get(self.name + "State", False))
-    @property
-    def info_text(self) -> str: return DEFAULT_DATA.get(self.name + "InfoText", "")
 
 
 @dataclass(frozen=True)
 class SelectParam:
     name: str
-    label: str
     kind: Literal["select"] = field(default="select", init=False)
 
     @property
     def default(self) -> str: return DEFAULT_DATA[self.name + "Mode"]
     @property
     def modes(self) -> list[str]: return list(DEFAULT_DATA[self.name + "Modes"])
-    @property
-    def info_text(self) -> str: return DEFAULT_DATA.get(self.name + "InfoText", "")
 
 
 @dataclass(frozen=True)
 class EntryParam:
     name: str
-    label: str
     kind: Literal["entry"] = field(default="entry", init=False)
 
     @property
     def default(self) -> str: return DEFAULT_DATA.get(self.name, "")
-    @property
-    def info_text(self) -> str: return DEFAULT_DATA.get(self.name + "InfoText", "")
 
 
 Parameter = SliderParam | SwitchParam | SelectParam | EntryParam
 
 
-# The parameters the CLI exposes. Grouped the way the desktop GUI grouped
-# them, minus everything that was a pure GUI control.
+# CLI 暴露出来的 parameter。分组方式沿用桌面 GUI 的分组，去掉所有纯 GUI
+# 的控制项。
 PARAMETERS: list[Parameter] = [
     # ---- Restorer
-    SwitchParam("RestorerSwitch", "Restorer"),
-    SelectParam("RestorerTypeTextSel", "Restorer Type"),
-    SelectParam("RestorerDetTypeTextSel", "Detection Alignment"),
-    SliderParam("RestorerSlider", "Blend"),
+    SwitchParam("RestorerSwitch"),
+    SelectParam("RestorerTypeTextSel"),
+    SelectParam("RestorerDetTypeTextSel"),
+    SliderParam("RestorerSlider"),
 
-    # ---- Similarity threshold
-    SliderParam("ThresholdSlider", "Similarity Threshold"),
+    # ---- 相似度阈值
+    SliderParam("ThresholdSlider"),
 
-    # ---- Orientation
-    SwitchParam("OrientSwitch", "Orientation"),
-    SwitchParam("OrientAutoSwitch", "Auto-detect Orientation"),
-    SliderParam("OrientSlider", "Angle"),
+    # ---- 朝向
+    SwitchParam("OrientSwitch"),
+    SwitchParam("OrientAutoSwitch"),
+    SliderParam("OrientSlider"),
 
-    # ---- Strength
-    SwitchParam("StrengthSwitch", "Strength"),
-    SliderParam("StrengthSlider", "Amount"),
-    SwitchParam("ColorMatchSwitch", "Color Match (LAB)"),
+    # ---- 强度
+    SwitchParam("StrengthSwitch"),
+    SliderParam("StrengthSlider"),
+    SwitchParam("ColorMatchSwitch"),
 
-    # ---- Likeness / fidelity
-    SliderParam("LikenessSlider", "Likeness"),
-    SliderParam("EmbExtrapSlider", "Distinctiveness"),
-    SwitchParam("HighFidelitySwitch", "High Fidelity (2-pass)"),
-    SliderParam("HighFidelityAlphaSlider", "HF Correction"),
-    SelectParam("HighFidelityModeTextSel", "Mode:"),
+    # ---- 相似度 / 保真度
+    SliderParam("LikenessSlider"),
+    SliderParam("EmbExtrapSlider"),
+    SwitchParam("HighFidelitySwitch"),
+    SliderParam("HighFidelityAlphaSlider"),
+    SelectParam("HighFidelityModeTextSel"),
 
-    # ---- Border / blend
-    SliderParam("BorderTopSlider", "Top Border Distance"),
-    SliderParam("BorderSidesSlider", "Sides Border Distance"),
-    SliderParam("BorderBottomSlider", "Bottom Border Distance"),
-    SliderParam("BorderBlurSlider", "Border Blend"),
-    SliderParam("BlendSlider", "Overall Mask Blend"),
+    # ---- 边界 / 混合
+    SliderParam("BorderTopSlider"),
+    SliderParam("BorderSidesSlider"),
+    SliderParam("BorderBottomSlider"),
+    SliderParam("BorderBlurSlider"),
+    SliderParam("BlendSlider"),
 
-    # ---- Differencer / occluder / parsers
-    SwitchParam("DiffSwitch", "Differencing"),
-    SliderParam("DiffSlider", "Difference Amount"),
-    SwitchParam("OccluderSwitch", "Occluder"),
-    SliderParam("OccluderSlider", "Occluder Size"),
-    SwitchParam("DFLXSegSwitch", "DFL XSeg Mask"),
-    SliderParam("DFLXSegSizeSlider", "XSeg Size"),
-    SliderParam("DFLXSegBlurSlider", "XSeg Blur"),
-    SwitchParam("FaceParserSwitch", "Face Parser"),
-    SliderParam("FaceParserSlider", "Background"),
-    SliderParam("MouthParserSlider", "Mouth"),
+    # ---- differencer / occluder / parser
+    SwitchParam("DiffSwitch"),
+    SliderParam("DiffSlider"),
+    SwitchParam("OccluderSwitch"),
+    SliderParam("OccluderSlider"),
+    SwitchParam("DFLXSegSwitch"),
+    SliderParam("DFLXSegSizeSlider"),
+    SliderParam("DFLXSegBlurSlider"),
+    SwitchParam("FaceParserSwitch"),
+    SliderParam("FaceParserSlider"),
+    SliderParam("MouthParserSlider"),
 
-    # ---- Color
-    SwitchParam("ColorSwitch", "Color Adjustments"),
-    SliderParam("ColorRedSlider", "Red"),
-    SliderParam("ColorGreenSlider", "Green"),
-    SliderParam("ColorBlueSlider", "Blue"),
-    SliderParam("ColorGammaSlider", "Gamma"),
-    SliderParam("ColorContrastSlider", "Contrast"),
-    SliderParam("ColorSaturationSlider", "Saturation"),
+    # ---- 色彩
+    SwitchParam("ColorSwitch"),
+    SliderParam("ColorRedSlider"),
+    SliderParam("ColorGreenSlider"),
+    SliderParam("ColorBlueSlider"),
+    SliderParam("ColorGammaSlider"),
+    SliderParam("ColorContrastSlider"),
+    SliderParam("ColorSaturationSlider"),
 
-    # ---- Face adjustments
-    SwitchParam("FaceAdjSwitch", "Input Face Adjustments"),
-    SliderParam("KPSXSlider", "KPS - X"),
-    SliderParam("KPSYSlider", "KPS - Y"),
-    SliderParam("KPSScaleSlider", "KPS - Scale"),
-    SliderParam("FaceScaleSlider", "Face Scale"),
+    # ---- 脸部微调
+    SwitchParam("FaceAdjSwitch"),
+    SliderParam("KPSXSlider"),
+    SliderParam("KPSYSlider"),
+    SliderParam("KPSScaleSlider"),
+    SliderParam("FaceScaleSlider"),
 
-    # ---- Threading / detection
-    SliderParam("ThreadsSlider", "Threads"),
-    SelectParam("ModelSessionsTextSel", "Model Sessions"),
-    SelectParam("DetectTypeTextSel", "Detection Type"),
-    SelectParam("DetectInputSizeTextSel", "Detect Input Size"),
-    SliderParam("DetectScoreSlider", "Detect Score"),
-    SelectParam("MergeTextSel", "Merge Math"),
-    SelectParam("SwapperTypeTextSel", "Swapper Resolution"),
+    # ---- 检测
+    SliderParam("ThreadsSlider"),
+    SelectParam("DetectTypeTextSel"),
+    SelectParam("DetectInputSizeTextSel"),
+    SliderParam("DetectScoreSlider"),
+    SelectParam("SwapperTypeTextSel"),
 ]
 
 
 PARAMETER_BY_NAME: dict[str, Parameter] = {p.name: p for p in PARAMETERS}
 
 
-def parameters_by_kind(kind: str) -> Iterable[Parameter]:
-    return (p for p in PARAMETERS if p.kind == kind)
-
-
 def default_values() -> dict[str, Any]:
-    """Return a {name: default_value} snapshot of every parameter."""
+    """返回所有 parameter 的 {name: default_value} 快照。"""
     return {p.name: p.default for p in PARAMETERS}
 
 
-def seed_control_dict() -> dict[str, Any]:
-    """Control flags the core layer reads.
 
-    `SwapFacesButton` gates whether a frame is actually swapped, and
-    `MaskViewButton` would render a side-by-side mask preview instead of
-    the finished frame. The CLI always wants the finished frame, so both
-    are fixed here rather than exposed as user options.
-    """
-    return {
-        "SwapFacesButton": True,
-        "MaskViewButton": False,
-    }

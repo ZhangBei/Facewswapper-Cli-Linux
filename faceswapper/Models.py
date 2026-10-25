@@ -21,54 +21,6 @@ onnxruntime.set_default_logger_severity(4)
 DEFAULT_MODELS_FOLDER = './models'
 
 
-# 本应用可从 models folder 加载的模型文件清单。Settings tab 用它展示哪些
-# 文件在、哪些缺失，方便用户在选定一个文件夹后确认它是完整的。
-# 每条记录: (filename, human-readable role, required-for-basic-swap?)。
-# required = True 表示没有它连一次基础换脸都跑不了；False 的条目各自
-# 绑定一个具体功能（备用 detector、restorer、遮挡 mask 等）。
-MODEL_INVENTORY = (
-    ('det_10g.onnx',              'RetinaFace detector',                True),
-    ('scrfd_2.5g_bnkps.onnx',     'SCRFD detector (alt)',               False),
-    ('w600k_r50.onnx',            'ArcFace recognition (r50)',          True),
-    ('inswapper_128.fp16.onnx',   'Inswapper 128',                      True),
-    ('GFPGANv1.4.onnx',           'GFPGAN v1.4 restorer',               False),
-    ('GPEN-BFR-512.onnx',         'GPEN-BFR-512 restorer',              False),
-    ('GPEN-BFR-256.onnx',         'GPEN-BFR-256 restorer',              False),
-    ('codeformer_fp16.onnx',      'CodeFormer restorer',                False),
-    ('occluder.onnx',             'Occluder mask',                      False),
-    ('faceparser_resnet34.onnx',  'Face parser (ResNet34)',             False),
-    ('dfl_xseg.onnx',             'DeepFaceLab XSeg mask',              False),
-    ('res50.onnx',                'ResNet50 detector',                  False),
-)
-
-
-# Settings tab 用它渲染 Loaded / TRT 两列和每个模型的 Unload 按钮。键是
-# 源 ONNX 文件名（与 MODEL_INVENTORY[i][0] 相同）。
-#
-#   models_attr: 加载时被赋值的 Models 属性名；`is_model_loaded` /
-#                `unload_model` 接受这个字符串。None 表示这一行不对应
-#                任何被跟踪的 Models slot，因此该行不显示 Loaded 状态，
-#                也没有 Unload 按钮。
-#
-#   trt_engine:  由该 ONNX 构建出的 TRT engine 文件名（与 ONNX 同目录），
-#                没有 TRT 路径时为 None。"Build TensorRT" 按钮覆盖的是
-#                identity / detect / recognize 这一组: inswapper_128、
-#                inswapper_512、retinaface (det_10g)、arcface (w600k_r50)。
-MODEL_INVENTORY_DETAILS = {
-    'det_10g.onnx':              {'models_attr': 'retinaface_model',  'trt_engine': 'det_10g.engine'},
-    'scrfd_2.5g_bnkps.onnx':     {'models_attr': 'scrdf_model',       'trt_engine': None},
-    'w600k_r50.onnx':            {'models_attr': 'recognition_model', 'trt_engine': 'w600k_r50.engine'},
-    'inswapper_128.fp16.onnx':   {'models_attr': 'swapper_model',     'trt_engine': 'inswapper_128.engine'},
-    'GFPGANv1.4.onnx':           {'models_attr': 'GFPGAN_model',      'trt_engine': None},
-    'GPEN-BFR-512.onnx':         {'models_attr': 'GPEN_512_model',    'trt_engine': None},
-    'GPEN-BFR-256.onnx':         {'models_attr': 'GPEN_256_model',    'trt_engine': None},
-    'codeformer_fp16.onnx':      {'models_attr': 'codeformer_model',  'trt_engine': None},
-    'occluder.onnx':             {'models_attr': 'occluder_model',    'trt_engine': None},
-    'faceparser_resnet34.onnx':  {'models_attr': 'faceparser_model',  'trt_engine': None},
-    'dfl_xseg.onnx':             {'models_attr': 'dfl_xseg_model',    'trt_engine': None},
-    'res50.onnx':                {'models_attr': 'resnet50_model',    'trt_engine': None},
-}
-
 class Models():
     # 这些属性名被（重新）赋值即代表 VRAM 发生了变化。__setattr__ 在写入
     # 其中任何一个时把 vram_dirty 置位，Qt coordinator 于是可以在下一个
@@ -140,7 +92,7 @@ class Models():
         self.swapper_model_swap = []
         # TRT vs ONNX 状态。每个 "_uses_trt" 标志由对应的懒加载器
         # (_load_*_model) 置位，由对应的调用点读取。delete_models /
-        # unload_model 会把它重置为 False，这样下次调用会重新探测
+        # delete_models 会把它重置为 False，这样下次调用会重新探测
         # engine 是否存在。
         self._retinaface_uses_trt = False
         self._recognition_uses_trt = False
@@ -165,13 +117,6 @@ class Models():
         # 就归零。M =（本 phase 的模型数）× worker 数（Per-Thread）或
         # × 1（Shared）。计数溢出无妨——例如同一会话里同时加载
         # inswapper_128 和 _512 会显示 [2/1]。
-        self._load_lock = threading.Lock()
-        self._load_count = 0
-        self._load_expected = 0
-        self._load_phase = None
-        # 来自 VideoManager / ThreadsSlider 的 worker 数提示，用于计算
-        # Per-Thread 模式下的 M。默认为 1（起始是 Shared）。
-        self._workers_hint = 1
         # 按属性区分的后端偏好。键是同时有 ONNX 与 TRT 两条路径的
         # Models 属性名（'swapper_model'、'swapper_512_model'、
         # 'retinaface_model'、'recognition_model'）。值: 'trt'（强制
@@ -223,14 +168,6 @@ class Models():
             pass
         # 强制重载，让下次调用拿到新路径。
         self.delete_models()
-
-    def get_gpu_memory(self):
-        # 通过 torch 调 cudaMemGetInfo——微秒级，不起子进程。此前
-        # shell out 到 nvidia-smi 的做法每次会阻塞 GUI 事件循环
-        # 100-400 ms，被 Qt VRAM 指示器轮询时会造成肉眼可见的 1 Hz 卡顿。
-        free_bytes, total_bytes = torch.cuda.mem_get_info()
-        mib = 1024 * 1024
-        return (total_bytes - free_bytes) // mib, total_bytes // mib
 
     def run_detect(self, img, detect_mode='Retinaface', max_num=1, score=0.5, input_size=640):
         """跑一次人脸检测。`input_size` 是模型输入的正方形边长
@@ -289,39 +226,6 @@ class Models():
                     return True
         return False
 
-    def unload_model(self, attr_name):
-        """卸掉单个已加载模型。做的事与 delete_models() 对每个属性做的
-        一致（赋回 []/None），让用户只腾出一个 slot 而不用清空其余。
-        未知 / 未被跟踪的属性名直接忽略。"""
-        if attr_name not in self._VRAM_TRACKED_ATTRS:
-            return
-        if attr_name == 'swapper_model':
-            # 让 TRT/batch 标志与 delete_models 保持同步，这样下次换脸会
-            # 重新探测 engine 与 batch 能力。
-            self._swapper_uses_trt = False
-            self._swapper_batch_unsupported = False
-            # Per-Thread session 也要一并丢掉，卸载才真的能释放 VRAM——
-            # 光靠 TLS 会持有那些强引用，让它们跨着这次卸载泄漏出去。
-            self._sessions_tls = threading.local()
-            self.clear_per_thread_sessions('swapper')
-        elif attr_name == 'swapper_512_model':
-            self._swapper_512_uses_trt = False
-            self._swapper_512_batch_unsupported = False
-            self.clear_per_thread_sessions('swapper_512')
-        elif attr_name == 'swapper_256_model':
-            self._swapper_256_uses_trt = False
-            self.clear_per_thread_sessions('swapper_256')
-        elif attr_name == 'hyperswap_model':
-            self._hyperswap_uses_trt = False
-            self.clear_per_thread_sessions('hyperswap')
-        elif attr_name == 'retinaface_model':
-            self._retinaface_uses_trt = False
-            self.clear_per_thread_sessions('retinaface')
-        elif attr_name == 'recognition_model':
-            self._recognition_uses_trt = False
-            self.clear_per_thread_sessions('recognition')
-        setattr(self, attr_name, [])
-
     # 懒加载器会遵守 _backend_pref 的属性。其他模型只有 ONNX 一条路径，
     # 这个开关对它们没有意义。
     _BACKEND_PREF_ATTRS = frozenset([
@@ -349,8 +253,6 @@ class Models():
             self._backend_pref[attr_name] = backend
         else:
             return
-        if unload and self.is_model_loaded(attr_name):
-            self.unload_model(attr_name)
 
     def get_backend_preference(self, attr_name):
         """返回 'trt' / 'onnx' / None（auto）。"""
@@ -394,26 +296,13 @@ class Models():
             return embedding, cropped_image
     
 
-    def set_session_mean_embedding(self, mean):
-        """存放会话级的人脸平均 embedding，供 Distinctiveness 滑杆做
-        extrapolation。传 None 清除。调用方改完这个值后还应清掉 latent
-        缓存（缓存是按 raw source embedding 做键的，不是按生效后的
-        embedding）。"""
-        if mean is None:
-            self._mean_emb = None
-            return
-        m = np.asarray(mean, dtype=np.float32).reshape(-1)
-        n = float(np.linalg.norm(m))
-        if n > 0:
-            m = m / n  # 存归一化后的值，让 extrap_amount 的尺度可预期
-        self._mean_emb = m
-
     def calc_swapper_latent(self, source_embedding, *, scale=1.0, extrap_amount=0.0, latent_mode='emap'):
         """计算 swapper 的 conditioning latent。相比原始 insightface 公式
         多出来的几个旋钮：
             extrap_amount: 在 normalize -> emap -> normalize 这条管线之前，
                 把 source_embedding 推离会话均值（通过
-                set_session_mean_embedding 设置）。0 = 不改变。
+                目前没有任何调用方设置它，所以 extrapolation 恒为空转）。
+                0 = 不改变。
             scale: 乘在最终 latent 上。>1 会增强换脸结果里的身份强度。
             latent_mode: 'emap'（默认——insightface inswapper:
                 normalize -> emap 投影 -> normalize）或 'raw'
@@ -655,7 +544,7 @@ class Models():
         self._retinaface_engine_size_warned = False
         self._retinaface_io_names = (det_img_name, det_out)
         backend = 'TensorrtExecutionProvider' if self._retinaface_uses_trt else 'CUDAExecutionProvider'
-        print(f'{self._load_tag("find")} [Models] retinaface: {backend} (accepts input 320-640)')
+        print(f'[Models] retinaface: {backend} (accepts input 320-640)')
         return sess
 
     def _load_retinaface_model(self):
@@ -789,7 +678,7 @@ class Models():
         active = sess.get_providers()
         self._recognition_uses_trt = bool(active) and active[0] == 'TensorrtExecutionProvider'
         backend = 'TensorrtExecutionProvider' if self._recognition_uses_trt else 'CUDAExecutionProvider'
-        print(f'{self._load_tag("find")} [Models] arcface (w600k_r50): {backend}')
+        print(f'[Models] arcface (w600k_r50): {backend}')
         return sess
 
     def _load_recognition_model(self):
@@ -912,8 +801,6 @@ class Models():
 
         if sess is None:
             # inswapper_128 输入固定是 128×128，所以 EXHAUSTIVE 那一次性的
-            # conv benchmark 被启动时的 preload warm-up 吸收掉了
-            # （见 preload_pipeline_sessions）。
             cuda_options = self._cuda_ep_provider_options(cudnn_algo='EXHAUSTIVE')
             sess_options = self._make_session_options()
             sess = onnxruntime.InferenceSession(
@@ -949,7 +836,7 @@ class Models():
             self._swapper_batch_unsupported = False
         backend = 'TensorrtExecutionProvider' if self._swapper_uses_trt else 'CUDAExecutionProvider'
         batch_note = ' static-batch=1' if self._swapper_batch_unsupported else ''
-        print(f'{self._load_tag("swap")} [Models] inswapper: {backend} (io={self._swapper_io_dtype.__name__}{batch_note})')
+        print(f'[Models] inswapper: {backend} (io={self._swapper_io_dtype.__name__}{batch_note})')
         return sess
 
     # ===== 通用 per-thread session 分发器 =================================
@@ -1015,7 +902,7 @@ class Models():
             'EXHAUSTIVE'（默认）——benchmark 出最快的 conv 算法。稳态
                 最好；首次推理时按 shape 做一次 benchmark。适合输入
                 shape 固定的模型（swapper、arcface、inswapper_512），
-                它们的 warmup 由启动时的 preload 吸收掉了。
+
             'HEURISTIC'——用解析方式挑一个接近最优的算法，不做
                 benchmark。适合 retinaface，它的输入是动态的 320→640
                 profile（EXHAUSTIVE 会在每次 DetectInputSize 变化时
@@ -1061,41 +948,6 @@ class Models():
             so.intra_op_num_threads = max(2, min(8, cores // 2))
         return so
 
-    # 每个 phase 的模型数: 每个用户驱动阶段会加载多少个不同的模型。用于
-    # 计算 _load_tag 里的 M——Per-Thread 模式下再乘以 worker 数。
-    _PHASE_PER_WORKER = {
-        'find': 2,  # retinaface + arcface
-        'swap': 1,  # inswapper_128 或 inswapper_512（一次只有一个）
-    }
-
-    def update_load_expectation(self, threads):
-        """存下 worker 数提示并重置 phase 追踪。由
-        VideoManager._ensure_executor 在线程池重建时调用，也由
-        main_window 在每次参数变化时调用。下一次 session 创建会从全新
-        的 phase 计数开始。"""
-        threads = max(1, int(threads))
-        with self._load_lock:
-            self._workers_hint = threads
-            self._load_phase = None
-            self._load_count = 0
-            self._load_expected = 0
-
-    def _load_tag(self, phase):
-        """为下一次 session 创建的打印返回 '[N/M]'。`phase` 是 'find'
-        或 'swap'。phase 与上次不同时计数归零，M 按 _PHASE_PER_WORKER
-        × worker 数（Per-Thread）或 × 1（Shared）重新计算。"""
-        per_worker = self._PHASE_PER_WORKER.get(phase, 1)
-        with self._load_lock:
-            workers = self._workers_hint if self._model_session_mode == 'Per-Thread' else 1
-            if self._load_phase != phase:
-                self._load_phase = phase
-                self._load_count = 0
-                self._load_expected = per_worker * workers
-            self._load_count += 1
-            n = self._load_count
-            m = self._load_expected or n
-        return f'[{n}/{m}]'
-
     def clear_per_thread_sessions(self, name=None):
         """释放对 Per-Thread session 的强引用，让垂死 worker 的 session
         得以 GC。传 `name` 只清某个模型的 per-thread session；传 None
@@ -1110,39 +962,6 @@ class Models():
                 self._all_sessions.pop(name, None)
         self.vram_dirty = True
 
-    def set_model_session_mode(self, mode):
-        """在 'Shared'（每种模型所有 worker 共用一份 ORT session）与
-        'Per-Thread'（每种模型每个 worker 一份 session）之间切换。会
-        丢掉所有模型的全部已有 session，让新模式在下次推理调用时生效
-        ——活跃的 worker 会懒加载重来。"""
-        mode = str(mode)
-        if mode not in ('Shared', 'Per-Thread'):
-            return
-        if mode == self._model_session_mode:
-            return
-        self._model_session_mode = mode
-        # 全部丢掉——Shared 属性和 Per-Thread 引用都包括。切换模式会
-        # 重置 `_sessions_tls`，这一下就同时切断了每个线程的 slot
-        # （worker 下次访问时会重新创建）。Shared 单例则逐个清除。
-        self._sessions_tls = threading.local()
-        with self._sessions_lock:
-            self._all_sessions = {}
-        for shared_attr in (
-            'swapper_model',
-            'swapper_512_model',
-            'swapper_256_model',
-            'hyperswap_model',
-            'retinaface_model',
-            'recognition_model',
-        ):
-            if getattr(self, shared_attr, None):
-                setattr(self, shared_attr, None)
-        # 每个模型的 "uses TRT" / batch / engine-profile 缓存在下次构建
-        # session 时都会重新探测，所以无需清理——但要置 VRAM dirty，
-        # 让指示器能反映这次释放。
-        self.vram_dirty = True
-        print(f'[Models] model session mode -> {mode}')
-
     # ===== Inswapper session 粘合层 =======================================
     # Inswapper 是通用分发器上的第一个模型。保留 `_get_swapper_session`
     # 这个 helper 名，这样 run_swapper / run_swapper_batched 里已有的
@@ -1152,153 +971,6 @@ class Models():
         return self._get_model_session(
             'swapper', 'swapper_model', self._create_swapper_session,
         )
-
-    # ===== 启动 preload ===================================================
-    # 三个 per-thread 换脸管线 session，按 preload 构建它们的顺序排列:
-    # (ONNX 文件名, session-getter 方法名)。getter 都走
-    # _get_model_session，所以在 worker 线程上调用其中一个，就会填充该
-    # 线程的 per-thread slot（Per-Thread 模式）或共享单例（Shared 模式）
-    # ——与懒加载换脸时发生的事完全一致。识别器（arcface）无论用户选哪个
-    # detector / swapper 都是换脸必经的一环，所以它被无条件 preload。
-    _RECOGNITION_PRELOAD = ('w600k_r50.onnx', '_get_recognition_session')
-
-    # detector 选择（DetectTypeTextSel）→ (ONNX 文件名, 加载器)。只有
-    # Retinaface 走 per-thread ORT-TRT-EP getter（随线程数扩展，从
-    # preload 中获益最大）；SCRDF 是通过 _ensure_scrdf_model 预热一次的
-    # 共享单例。只 preload *被选中*的那个 detector（而不是其他），按钮
-    # 才算真正尊重"选的是哪个 detector"。
-    _DETECTOR_PRELOAD = {
-        'Retinaface': ('det_10g.onnx',          '_get_retinaface_session'),
-        'SCRDF':      ('scrfd_2.5g_bnkps.onnx', '_ensure_scrdf_model'),
-    }
-
-    # swapper 模型选择（SwapperTypeTextSel）→ (ONNX 文件名, getter)。
-    # inswapper-128/256/512 全都驱动 inswapper_128 做 polyphase 拼合；
-    # 只有 "inswapper-256" 用专门单次 pass 的 inswapper_256_phase1。
-    _SWAPPER_PRELOAD_128 = ('inswapper_128.fp16.onnx', '_get_swapper_session')
-    _SWAPPER_PRELOAD_NATIVE256 = ('inswapper_256_phase1.onnx', '_get_swapper_256_session')
-    _SWAPPER_PRELOAD_HYPERSWAP = ('hyperswap_1a_256.onnx', '_get_hyperswap_session')
-
-    def _detector_preload_for(self, detect_mode):
-        return self._DETECTOR_PRELOAD.get(
-            str(detect_mode), self._DETECTOR_PRELOAD['Retinaface'])
-
-    def _swapper_preload_for(self, swapper_type):
-        if str(swapper_type) == 'inswapper-256':
-            return self._SWAPPER_PRELOAD_NATIVE256
-        if str(swapper_type) == 'hyperswap-256':
-            return self._SWAPPER_PRELOAD_HYPERSWAP
-        return self._SWAPPER_PRELOAD_128
-
-    def _pipeline_preload_set(self, swapper_type='inswapper-128', detect_mode='Retinaface'):
-        """给定 detector + swapper 选择，要 preload 的 (文件名, getter)
-        组合，外加始终需要的 recognizer。"""
-        return [
-            self._detector_preload_for(detect_mode),
-            self._RECOGNITION_PRELOAD,
-            self._swapper_preload_for(swapper_type),
-        ]
-
-    def _ensure_scrdf_model(self):
-        """若尚未加载则加载共享的 SCRDF detector session。共享单例
-        （非 per-thread）——与 run_detect 里的懒加载保持一致，这样两条
-        路径构建出的东西完全相同。"""
-        if not self.scrdf_model:
-            self.scrdf_model = onnxruntime.InferenceSession(
-                self._mp('scrfd_2.5g_bnkps.onnx'), providers=self.providers)
-        return self.scrdf_model
-
-    # detector 选择（DetectTypeTextSel）→ is_model_loaded 检查其存活性的
-    # Models 属性。Retinaface 走 per-thread session 列表；SCRDF 是共享
-    # 单例。
-    _DETECTOR_LOADED_ATTR = {
-        'Retinaface': 'retinaface_model',
-        'SCRDF':      'scrdf_model',
-    }
-
-    def _pipeline_loaded_attrs(self, swapper_type='inswapper-128', detect_mode='Retinaface'):
-        """给定 detector + swapper 选择，跑一次换脸需要哪些 Models 属性的
-        session 是活的（与 _pipeline_preload_set 对应，但用的是
-        is_model_loaded 的 attr 词汇表）。"""
-        det_attr = self._DETECTOR_LOADED_ATTR.get(str(detect_mode), 'retinaface_model')
-        swapper_type = str(swapper_type)
-        if swapper_type == 'inswapper-256':
-            sw_attr = 'swapper_256_model'
-        elif swapper_type == 'hyperswap-256':
-            sw_attr = 'hyperswap_model'
-        else:
-            sw_attr = 'swapper_model'
-        return [det_attr, 'recognition_model', sw_attr]
-
-    def pipeline_sessions_loaded(self, swapper_type='inswapper-128', detect_mode='Retinaface'):
-        """当前选择需要的每个模型都有活 session 时为 True。GUI 用它把
-        Preload 按钮翻到已加载状态（也用来验证 preload 确实成功了）。"""
-        return all(self.is_model_loaded(a)
-                   for a in self._pipeline_loaded_attrs(swapper_type, detect_mode))
-
-    def swap_pipeline_files_present(self, swapper_type='inswapper-128', detect_mode='Retinaface'):
-        """仅当支撑 *被选中的* 可 preload 换脸管线 session 的每个 ONNX
-        都存在于当前 models folder 时为 True。为 False 时跳过 preload，
-        免得一个没有模型的安装刷出一堆加载错误。不带参数调用时复现
-        旧的 retinaface + inswapper_128 检查。"""
-        return all(os.path.exists(self._mp(f))
-                   for f, _ in self._pipeline_preload_set(swapper_type, detect_mode))
-
-    def preload_pipeline_sessions(self, swapper_type='inswapper-128', detect_mode='Retinaface'):
-        """在**调用线程**上构建（或直接返回已构建的）与用户当前选择匹配的
-        detector + recognizer + swapper session。设计上应在 VideoManager
-        的 worker 线程内、它的 `with torch.cuda.stream(...)` 块中运行，
-        这样 per-thread session 会绑到该 worker 的 stream 上，与
-        swap_video 懒加载它们时的方式一致。每个模型都有保护，单个模型
-        缺失/失败不会中断其余部分。
-
-        `swapper_type`（SwapperTypeTextSel）在 inswapper_128、native-256
-        模型和 hyperswap 之间选择；`detect_mode`（DetectTypeTextSel）选择
-        预热哪个 detector——所以按钮只构建当前选择真正会用到的东西。"""
-        for fname, getter in self._pipeline_preload_set(swapper_type, detect_mode):
-            if not os.path.exists(self._mp(fname)):
-                continue
-            try:
-                getattr(self, getter)()
-            except Exception as e:
-                print(f'[Models.preload_pipeline_sessions] {fname}: '
-                      f'{type(e).__name__}: {e}')
-
-        # 用一次丢弃式推理预热选中的 swapper，让 CUDA-EP 的 EXHAUSTIVE
-        # cuDNN conv benchmark（以及 workspace/handle 分配）发生在这里
-        # ——加载时、在这个 worker 的 stream 上——而不是让每个 worker 的
-        # 第一个真实换脸帧卡住。TRT 后端上这只是跑一遍已构建好的 engine，
-        # 很便宜。有保护，预热失败绝不会影响启动。run_swapper 内部会处理
-        # FP16/FP32 转换，所以直接给 FP32 零张量就行。
-        if str(swapper_type) == 'inswapper-256':
-            if os.path.exists(self._mp('inswapper_256_phase1.onnx')):
-                try:
-                    z_img = torch.zeros((1, 3, 256, 256), dtype=torch.float32, device='cuda')
-                    z_emb = torch.zeros((1, 512), dtype=torch.float32, device='cuda')
-                    z_out = torch.zeros((1, 3, 256, 256), dtype=torch.float32, device='cuda')
-                    self.run_swapper_256(z_img, z_emb, z_out)
-                except Exception as e:
-                    print(f'[Models.preload_pipeline_sessions] swapper_256 warm-up: '
-                          f'{type(e).__name__}: {e}')
-        elif str(swapper_type) == 'hyperswap-256':
-            if os.path.exists(self._mp('hyperswap_1a_256.onnx')):
-                try:
-                    z_img = torch.zeros((1, 3, 256, 256), dtype=torch.float32, device='cuda')
-                    z_emb = torch.zeros((1, 512), dtype=torch.float32, device='cuda')
-                    z_out = torch.zeros((1, 3, 256, 256), dtype=torch.float32, device='cuda')
-                    self.run_hyperswap(z_img, z_emb, z_out)
-                except Exception as e:
-                    print(f'[Models.preload_pipeline_sessions] hyperswap warm-up: '
-                          f'{type(e).__name__}: {e}')
-        elif os.path.exists(self._mp('inswapper_128.fp16.onnx')):
-            try:
-                z_img = torch.zeros((1, 3, 128, 128), dtype=torch.float32, device='cuda')
-                z_emb = torch.zeros((1, 512), dtype=torch.float32, device='cuda')
-                z_out = torch.zeros((1, 3, 128, 128), dtype=torch.float32, device='cuda')
-                self.run_swapper(z_img, z_emb, z_out)
-            except Exception as e:
-                print(f'[Models.preload_pipeline_sessions] swapper warm-up: '
-                      f'{type(e).__name__}: {e}')
 
     def _swapper_should_drain_syncvec(self):
         return self._should_drain_syncvec()
@@ -1508,7 +1180,7 @@ class Models():
             self._swapper_512_batch_unsupported = True
         backend = 'TensorrtExecutionProvider' if self._swapper_512_uses_trt else 'CUDAExecutionProvider'
         batch_note = ' static-batch=1' if self._swapper_512_batch_unsupported else ''
-        print(f'{self._load_tag("swap")} [Models] inswapper_512: {backend}{batch_note}')
+        print(f'[Models] inswapper_512: {backend}{batch_note}')
         return sess
 
     def _get_swapper_512_session(self):
@@ -1621,7 +1293,7 @@ class Models():
         uses_trt = bool(active) and active[0] == 'TensorrtExecutionProvider'
         setattr(self, uses_trt_attr, uses_trt)
         backend = 'TensorrtExecutionProvider' if uses_trt else 'CUDAExecutionProvider'
-        print(f'{self._load_tag("swap")} [Models] {label}: {backend}')
+        print(f'[Models] {label}: {backend}')
         return sess
 
     def _create_swapper_256_session(self):

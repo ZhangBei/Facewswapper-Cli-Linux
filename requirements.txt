@@ -6,7 +6,7 @@
 # dxcam) were removed along with the Qt frontend - nothing imports them.
 #
 # Install with the CUDA-aware helper:
-#   python tools/install.py cu128
+#   python tools/install.py default
 #   python tools/check_env.py --models ./models
 #
 # The cu128 wheels need an NVIDIA driver that supports CUDA 12.8
@@ -26,7 +26,7 @@ scikit-image>=0.22
 pillow>=10.0
 
 # --- Video -------------------------------------------------------------------
-av>=13.0                          # PyAV: demux + decode (CPU)
+av>=13.0,<19.0                     # PyAV: demux + decode (CPU); >=14 needs a Fraction rate (see headless._encode_video)
 # torchcodec>=0.4                 # optional: GPU-resident video decode
 # pynvvideocodec>=2.1             # optional: alternative NVDEC binding
 
