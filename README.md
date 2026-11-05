@@ -803,6 +803,14 @@ python -m faceswapper.cli --models ./models video \
 `found_faces` 匹配路径，同样不受影响。判定在 `recognize.py`，离线行为测试覆盖
 四种组合。真机收益未测。
 
+跨帧 batch（方案 7.2）的**适用性判定、有序分组与闸门**也已写进
+`cross_frame_batch.py`，但 `EXPERIMENTAL_CROSS_FRAME_BATCH=False` 且主流水线
+完全没有调用它。判据很硬：`workers >= 2`、不跳帧、仅 `inswapper-128`、
+每帧恰好一张脸、`pipeline_size` 恒为 128、`index` 连续、PTS 严格递增——
+最后两条保证 VFR 时序不被 batch 重排。推理侧的回填必须重构帧流水线并做逐帧
+PSNR 比对，因此没有写一段永不执行的半成品；接入点与五步解冻流程见
+[docs/gpu-utilization-plan.md 7.2](docs/gpu-utilization-plan.md)。
+
 #### 阶段 5：NVENC 编码开关
 
 ```bash
@@ -820,8 +828,22 @@ x264 档位的一一对应；较旧的 FFmpeg 可能不认 `p1..p7`，遇到未�
 `--encoder libx264`。NVENC 是独立硬件单元，**不提高 CUDA SM 利用率**，只解除
 CPU 编码瓶颈；PyAV 目前仍吃 CPU `rgb24` frame，那次 D2H 并没有省掉。
 
-GPU 常驻解码（torchcodec）仍未实现。真机可用性、`p1..p7` 是否被当前 FFmpeg
-接受、画质与体积对比均未验证。
+#### GPU 常驻解码 `--decoder gpu`（实验性）
+
+`--decoder pyav` 是默认，完全不 import torchcodec、也不碰 CUDA。显式
+`--decoder gpu` 时会先探测 `torchcodec>=0.4`、`VideoDecoder` 是否接受
+`device=`，以及 `torch.cuda.is_available()`；任一不满足直接报错并提示回退，
+**不静默回退**。通过后用 `VideoDecoder(video_path, device="cuda")` 产出
+CUDA tensor——`_swap_video_inner` 本来就能吃 CUDA tensor，于是省掉
+`torch.from_numpy(...).to('cuda')` 这次上传。
+
+torchcodec 各版本的 frame 字段与 PTS 单位不统一，适配层刻意**不猜**：取不到
+`data` / `frame`、拿不到 PTS、或 PTS 是小数（多半是秒）时一律明确报错，避免
+静默产出坏帧或错时序。首帧绝对 PTS 由 GPU 路径自己记录，音频 mux 的偏移照常
+恢复。判定与字段提取在 `decoder.py`，有离线行为测试。
+
+真机未验证：torchcodec 的实际 frame 布局、PTS 单位、VFR 与音画同步都需要在
+GPU 环境核对。不传该开关即回到原 PyAV 路径。
 
 完整的分阶段实施方案（现状瓶颈、详细实现步骤、验收清单、风险与回滚）见
 [docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md)。
@@ -944,6 +966,7 @@ python -m faceswapper.cli --models ./models swap \
 | `--crf` | H.264 质量，越低越好 | `18` |
 | `--preset` | x264 档位 | `medium` |
 | `--encoder` | `libx264`（默认）或 `nvenc`（需探测 `h264_nvenc` 可用） | `libx264` |
+| `--decoder` | `pyav`（默认，CPU 逐帧）或 `gpu`（torchcodec 常驻 CUDA，实验性） | `pyav` |
 | `--no-audio` | 不复制源音频轨 | 关闭 |
 | `--every-nth` | 只处理第 N 帧，其余透传 | `1` |
 | `--workers` | 并行处理帧的 worker 数，`>1` 时各 worker 独占一份模型 session | `1` |

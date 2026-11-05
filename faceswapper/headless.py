@@ -28,6 +28,7 @@ import numpy as np
 import torch
 
 from faceswapper.EmbeddingMerge import combine
+from faceswapper.decoder import DecoderPlan, frame_fields, resolve_decoder
 from faceswapper.encoder_probe import EncoderPlan, resolve_encoder
 from faceswapper.errors import HeadlessError
 from faceswapper.frame_order import ordered_swap_frames
@@ -359,6 +360,8 @@ class VideoOptions(SwapOptions):
     force_recognize: bool = False
     # 视频编码器：libx264（默认）或 nvenc（需探测 h264_nvenc 可用）。
     encoder: str = "libx264"
+    # 解码后端：pyav（默认，CPU 逐帧）或 gpu（torchcodec 常驻 CUDA，实验性）。
+    decoder: str = "pyav"
 
 
 @dataclass
@@ -435,6 +438,13 @@ class VideoSwapper(_SwapperBase):
         self.vm.target_face_embeddings = targets or None
         self.vm.target_face_threshold = self.options.target_threshold
 
+        # 阶段 5b：解析 --decoder。默认 pyav 分支不调用 probe，既不 import
+        # torchcodec 也不碰 CUDA；gpu 探测失败会明确报错，不静默回退。
+        decoder_plan = resolve_decoder(
+            getattr(self.options, "decoder", "pyav"),
+            self._gpu_decode_probe,
+        )
+
         container = av.open(video_path)
         try:
             stream = container.streams.video[0]
@@ -461,7 +471,7 @@ class VideoSwapper(_SwapperBase):
                 silent = os.path.join(tmp, "silent.mp4")
                 encoded = self._encode_video(
                     av, container, stream, silent, width, height, fps,
-                    total, on_progress,
+                    total, on_progress, video_path, decoder_plan,
                 )
                 # 源视频流的时间偏移，单位为秒。重建出的视频从 0 开始，
                 # 所以要把它挪回原视频相对音频所在的位置。
@@ -528,6 +538,78 @@ class VideoSwapper(_SwapperBase):
         except (TypeError, ValueError):
             return 0.0
 
+    @staticmethod
+    def _gpu_decode_probe() -> tuple[bool, str]:
+        """真机探测 torchcodec + CUDA 是否可用，供 resolve_decoder 注入。"""
+        import importlib.util
+        import inspect
+
+        if importlib.util.find_spec("torchcodec") is None:
+            return False, "torchcodec>=0.4 is not installed"
+        try:
+            from torchcodec.decoders import VideoDecoder
+            params = inspect.signature(VideoDecoder.__init__).parameters
+            if "device" not in params:
+                return False, "VideoDecoder has no device= parameter"
+        except Exception as exc:
+            return False, f"torchcodec import failed: {exc}"
+        if not torch.cuda.is_available():
+            return False, "torch.cuda.is_available() is False"
+        return True, "ok"
+
+    @staticmethod
+    def _normalize_gpu_rgb(data):
+        """把 torchcodec 的 frame data 归一成 HWC uint8 CUDA tensor。
+
+        兼容 CHW/HWC 与 float 0-1 / uint8 两种常见布局；非 tensor 直接报错，
+        不猜。
+        """
+        if not isinstance(data, torch.Tensor):
+            raise HeadlessError(
+                "GPU decoder frame data is not a torch.Tensor; "
+                "use the default --decoder pyav"
+            )
+        rgb = data
+        if rgb.device.type != "cuda":
+            rgb = rgb.to("cuda")
+        if rgb.dtype != torch.uint8:
+            rgb = (rgb.float().clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+        if rgb.ndim == 3 and rgb.shape[0] == 3:  # CHW -> HWC
+            rgb = rgb.permute(1, 2, 0)
+        return rgb.contiguous()
+
+    def _decoded_gpu(self, video_path: str, in_tb: Fraction, gpu_state: dict):
+        """实验性 GPU 常驻解码，产出 ``(index, rgb, pts)``。
+
+        **API 假设（需真机核对）**：``VideoDecoder(path, device="cuda")`` 可
+        迭代；frame 的 data 是 CUDA tensor；pts 是与 ``in_tb`` 同单位的整数
+        ticks。任何一条不满足都明确抛错，绝不静默用等间隔 PTS 兜底——那会
+        悄悄破坏 VFR 时序与音画同步。
+        """
+        from torchcodec.decoders import VideoDecoder
+
+        decoder = VideoDecoder(video_path, device="cuda")
+        index = 0
+        first_source_pts = None
+        for raw in decoder:
+            data, pts = frame_fields(raw)
+            if pts is None:
+                raise HeadlessError(
+                    "GPU decoder frame has no PTS; VFR-safe decode requires "
+                    "explicit timestamps — use --decoder pyav"
+                )
+            if isinstance(pts, float) and not pts.is_integer():
+                raise HeadlessError(
+                    "GPU decoder returned fractional PTS (likely seconds); "
+                    "unit conversion is not implemented — use --decoder pyav"
+                )
+            source_pts = int(pts)
+            if first_source_pts is None:
+                first_source_pts = source_pts
+                gpu_state["first_pts"] = source_pts
+            yield index, self._normalize_gpu_rgb(data), source_pts - first_source_pts
+            index += 1
+
     def _encode_video(
         self,
         av,
@@ -539,6 +621,8 @@ class VideoSwapper(_SwapperBase):
         fps: float,
         total: int,
         on_progress: Callable[[int, int], None] | None,
+        video_path: str,
+        decoder_plan: DecoderPlan,
     ) -> _EncodeResult:
         """解码每一帧、换脸，并按原始 PTS 编码。
 
@@ -555,6 +639,15 @@ class VideoSwapper(_SwapperBase):
         times_lock = threading.Lock()
         processed = 0
         workers = min(8, max(1, int(getattr(self.options, "workers", 1))))
+        # GPU 解码路径由自己的生成器负责记录首帧 PTS（PyAV 路径写在
+        # decoded() 的 nonlocal 里），两条路径的音画偏移都要能恢复。
+        gpu_state: dict = {"first_pts": None}
+
+        def resolved_first_pts() -> int:
+            if decoder_plan.backend == "gpu":
+                return gpu_state["first_pts"] or 0
+            return first_pts if first_pts is not None else 0
+
         parallel = workers > 1
         # 阶段 3 的 6.1：只有并行路径才有可解放的 worker；串行时推迟 D2H
         # 没有意义，自动退回原行为。同步本身一个都不删。
@@ -660,7 +753,11 @@ class VideoSwapper(_SwapperBase):
                     yield index, rgb, pts
                     index += 1
 
-            frames = decoded()
+            if decoder_plan.backend == "gpu":
+                # 实验性 GPU 常驻路径；默认 pyav 完全不触碰 torchcodec。
+                frames = self._decoded_gpu(video_path, in_tb, gpu_state)
+            else:
+                frames = decoded()
             if parallel:
                 # 调度器刻意放在 stdlib-only 的 frame_order.py，保序行为
                 # 由 tests/test_frame_order.py 用假 swap_fn 做行为测试。
@@ -694,7 +791,7 @@ class VideoSwapper(_SwapperBase):
                     add_time if profile else None, plan,
                 )
                 return _EncodeResult(
-                    first_pts=first_pts if first_pts is not None else 0,
+                    first_pts=resolved_first_pts(),
                     frames=processed,
                     profile=dict(times) if profile else None,
                 )
@@ -743,7 +840,7 @@ class VideoSwapper(_SwapperBase):
             if output is not None:
                 output.close()
         return _EncodeResult(
-            first_pts=first_pts if first_pts is not None else 0,
+            first_pts=resolved_first_pts(),
             frames=processed,
             profile=dict(times) if profile else None,
         )

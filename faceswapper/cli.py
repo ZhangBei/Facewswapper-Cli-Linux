@@ -373,6 +373,7 @@ def _cmd_video(args: argparse.Namespace) -> int:
         defer_d2h=args.defer_d2h,
         force_recognize=args.force_recognize,
         encoder=args.encoder,
+        decoder=args.decoder,
         arena_strategy=args.arena_strategy,
     )
 
@@ -565,6 +566,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="视频编码器：libx264（默认）或 h264_nvenc。"
                             "nvenc 会先探测可用性，不可用直接报错；CRF/preset "
                             "会映射成 CQ/p1-p7，语义不等价")
+    video.add_argument("--decoder", choices=["pyav", "gpu"],
+                       default="pyav",
+                       help="解码后端：pyav（默认，CPU 逐帧）或 gpu"
+                            "（torchcodec 常驻 CUDA，实验性；需探测通过，"
+                            "缺少 PTS 或单位不符会明确报错）")
     video.add_argument("--no-audio", action="store_true",
                        help="不拷贝源音频轨")
     video.add_argument("--every-nth", type=int, default=1,

@@ -16,8 +16,10 @@
   （`EXPERIMENTAL_FACE_BATCH=False`）；需 GPU 环境做多人脸 PSNR 比对后才能
   解冻，见 7.1 的五条阻断条件与解冻步骤。另实现了一条等价且更安全的优化：
   跳过没有读取方的逐脸 `run_recognize`，`--force-recognize` 可回滚。
-- 阶段 5 的编码侧（`--encoder libx264|nvenc`）已实现，默认 libx264；
-  GPU 常驻解码（torchcodec）与阶段 4 的 7.2 跨帧 batch 仍待实施。
+- 阶段 5 的编码侧（`--encoder libx264|nvenc`）与解码侧
+  （`--decoder pyav|gpu`）代码均已落地，两个默认值都不变；两者都需要真机
+  核对第三方 API/参数。阶段 4 的 7.2 已落地判定 / 分组 / 闸门（主流水线
+  未挂载），推理侧回填仍需真机逐帧 PSNR。
 - 当前环境没有 GPU 栈，以上均为代码层实现，**未做任何真机性能验证**；
   3.4 的基线矩阵仍是后续所有阶段的前置条件。
 
@@ -349,27 +351,76 @@ stdlib-only，传入 torch stream 会破坏这条约束；而 `wait_stream` 本�
 `tests/test_cli.py::test_recognize_wiring` 用 AST 守住接线与旧路径未删。
 **真机收益未测**；单人脸视频省 1 次识别，多人脸省 N 次。
 
-### 7.2 跨帧 batch
+### 7.2 跨帧 batch —— 判定与闸门已落地，推理侧待真机
 
 把 N 个 worker 的帧拼成一个 batch 一次 ORT Run，需要模型输入支持动态 batch
 （`_swapper_batch_unsupported` 已有探测），并重构整个帧流水线。会与 PTS 保序、
 `--every-nth`、可变人脸数冲突，**放在最后**，且必须做成独立开关与独立测试。
 
+按「代码先编写进入、不启用」的要求，已落地可离线验证的部分：
+
+- `faceswapper/cross_frame_batch.py`（stdlib-only）：
+  `FrameCandidate`、`cross_frame_batch_eligibility()`、`group_frames()`、
+  闸门 `EXPERIMENTAL_CROSS_FRAME_BATCH = False` 与
+  `resolve_cross_frame_batch()`（闸门 + 判定）。
+- **硬条件**：`workers >= 2`、`every_nth == 1`、仅 `inswapper-128`、
+  关闭 `StrengthSwitch` / `HighFidelitySwitch`、动态 batch 可用、每帧人脸数
+  恒为 1、`pipeline_size` 恒为 128、`index` 连续、**PTS 严格递增**。
+  最后两条是 VFR 时序的守门条件：batch 只能切，不能排序。
+- `group_frames()` 只做有序切片，保留不足一组的尾部；分组不允许排序。
+- `tests/test_cross_frame_batch.py`：7 项行为测试，覆盖上述全部条件、闸门、
+  分组保序，以及 AST 检查「`headless.py` / `frame_order.py` /
+  `VideoManager.py` 都没有调用被闸门保护的入口」。
+- **主流水线完全未挂载**：没有新 CLI flag，也没有改动任何帧路径。
+
+#### 推理侧为什么没写死代码
+
+一次跨帧 ORT Run 本身可以复用 7.1 的 `swap_core(batch_slot=...)` prepare
+钩子把各帧的 128×128 输入堆成 `(N,3,128,128)`，再调
+`run_swapper_batched`。难点在**回填**：每帧要把自己的输出按原顺序走
+postprocess 与 paste-back，同时保证 PTS、音画与 `--every-nth` 语义不变，
+这需要重构整个帧流水线，且只能靠真机逐帧 PSNR 判断等价性。在闸门关闭的
+前提下写一段永远不会执行的半成品没有价值，因此只交付判定/分组/闸门，
+把推理侧接入点写在这里：
+
+1. 有 GPU 环境后，用多人脸 + 单人险混合片段建立 `workers=1` 的逐帧 PSNR 基线。
+2. 在 `frame_order.ordered_swap_frames` 的消费侧，按 `resolve_cross_frame_batch`
+   的结果把连续帧分组；不适用或闸门关闭时逐字走原路径。
+3. 每组复用 7.1 的 prepare 钩子收集输入 → 一次 `run_swapper_batched` →
+   按组内顺序 finish 回填。
+4. 比对帧数、PTS、音画、PSNR；VFR 片段必须确认 PTS 未被重排。
+5. 任一步不满足即把闸门改回 `False`，无需回滚其它代码。
+
 ---
 
 ## 8. 阶段 5：GPU 解码 / NVENC 编码（编码侧已实现，GPU 解码待实施）
 
-### 8.1 GPU 常驻解码（仍待实施）
+### 8.1 GPU 常驻解码（代码已编写，实验性，默认关闭）
 
 依据：`requirements.txt` 里 `torchcodec` / `pynvvideocodec` 是注释掉的可选项；
 `VideoManager.py::_swap_video_inner` 已接受 CUDA tensor 输入并跳过 CPU 上传，
 说明 GPU 常驻解码是预留路径。
 
-1. 安装 `torchcodec>=0.4`，用 `VideoDecoder(..., device="cuda")` 解码出 GPU tensor。
-2. 让 `_swap_frame` / `decoded()` 直接产出 CUDA tensor，省掉
-   `torch.from_numpy(...).to('cuda')`。
+- `decoder.py`（stdlib-only）：`resolve_decoder(requested, probe)` 与
+  `frame_fields(raw)`。`pyav` 分支**完全不调用** probe，默认路径既不 import
+  torchcodec 也不碰 CUDA；`gpu` 探测失败抛 `HeadlessError`，不静默回退。
+  `tests/test_decoder.py` 覆盖探测成功/失败/异常、未知 backend、以及 dict /
+  属性两种 frame 布局（刻意避开 `bool(tensor)` 歧义）。
+- `VideoSwapper._gpu_decode_probe()`：检查 `torchcodec` 是否安装、
+  `VideoDecoder.__init__` 是否接受 `device=`、`torch.cuda.is_available()`。
+- `VideoSwapper._decoded_gpu()`：用 `VideoDecoder(path, device="cuda")` 产出
+  CUDA tensor，交给 `_swap_frame`，省掉 `torch.from_numpy(...).to('cuda')`。
+  首帧绝对 PTS 由该生成器记录，`resolved_first_pts()` 保证 GPU 与 PyAV 两条
+  路径的音频 mux 偏移都能恢复。
+- **适配层刻意不猜**：frame 缺 `data`/`frame`、没有 PTS、或 PTS 是小数
+  （多半是秒而非 ticks）时一律明确报错，绝不静默用等间隔兜底——那会悄悄
+  破坏 VFR 与音画同步。`_normalize_gpu_rgb()` 兼容 CHW/HWC、float 0-1 /
+  uint8，非 tensor 直接报错。
+- CLI `video --decoder pyav|gpu`，默认 `pyav`；`_encode_video` 按
+  `DecoderPlan` 选择帧源，`decoded()` 的 PyAV 路径一行未改。
 
-这一步要装可选依赖并改动解码路径，本地没有 GPU 栈无法验证，**本次未做**。
+**真机未验证**：torchcodec 各版本的 frame 布局与 PTS 单位、VFR 时序、音画
+同步、以及省掉上传后的实际收益。这些必须在 GPU 环境核对；不传开关即回原路径。
 
 ### 8.2 NVENC 编码开关（已实现，默认关闭）
 
@@ -420,8 +471,9 @@ stdlib-only，传入 torch stream 会破坏这条约束；而 `wait_stream` 本�
 | 3 | 延迟 D2H / arena 策略（保守版） | 未测（可能很小） | 代码已完成 | 低（未删同步） | 是 + nsys，未做 |
 | 4.1 | 单帧多脸 batch | 未测 | 代码已完成、闸门关闭 | 高（启用后会改像素） | 是，解冻前必须 |
 | 4.2 | 跳过无用的逐脸 recognize | 中（每帧省 N 次 ORT） | 代码已完成 | 极低 | 是 |
+| 4.3 | 跨帧 batch 判定 / 闸门 | — | 代码已完成、未挂载 | 高（推理侧回填） | 是 |
 | 5a | NVENC 编码开关 | 中（只解 CPU 编码瓶颈） | 代码已完成 | 中（画质 / 驱动） | 是 |
-| 5b | GPU 常驻解码（torchcodec） | 中 | 待实施 | 中 | 是 |
+| 5b | GPU 常驻解码（torchcodec） | 未测 | 代码已完成、默认关闭 | 中（frame/PTS 单位） | 是 |
 
 建议的**真机验证顺序**：`0 → 1 → 2 →（按 nsys 结果决定）3 → 阶段 4 的 7.1
 单帧多脸 batch → 5`。0–3 的代码已落地，但仍要按这个顺序逐个实测，不要
@@ -496,6 +548,8 @@ ffprobe -v error -select_streams v:0 -show_entries stream=profile,bit_rate \
 | 7.1 冻结依据 | `VideoManager.py::swap_core` 的输入 warp（约 571）与 paste_back（约 917–925） |
 | 7.1 实验实现 | `face_batch.py::batch_eligibility`；`VideoManager.py::swap_core_batched`、`_face_bbox`、`swap_core(batch_slot=...)` |
 | 编码器选择与 NVENC 探测 | `encoder_probe.py::resolve_encoder`；`encoder.py::encoder_worker(codec=...)`、`headless.py::_encode_video` |
+| GPU 解码探测与帧适配 | `decoder.py::resolve_decoder`、`frame_fields`；`headless.py::_gpu_decode_probe`、`_decoded_gpu` |
+| 跨帧 batch 判定 / 分组 | `cross_frame_batch.py::cross_frame_batch_eligibility`、`resolve_cross_frame_batch`、`group_frames` |
 | 帧解码与逐脸循环 | `headless.py::decoded()`（局部生成器）、`VideoManager.py::_swap_video_inner` |
 | session 共享策略 | `Models.py::_get_model_session`、`set_model_session_mode` |
 | 后端偏好（cuda 不碰 TRT） | `Models.py::set_backend_preference_for_all`、`headless.py::_SwapperBase.__init__` |

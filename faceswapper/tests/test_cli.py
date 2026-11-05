@@ -460,14 +460,14 @@ def test_all_new_video_flags_compose() -> None:
         "video", "--source", "face.jpg", "--target", "in.mp4",
         "--output", "out.mp4",
         "--workers", "4", "--profile", "--encode-thread", "--defer-d2h",
-        "--force-recognize", "--encoder", "nvenc",
+        "--force-recognize", "--encoder", "nvenc", "--decoder", "gpu",
         "--arena-strategy", "pow2", "--crf", "23", "--preset", "fast",
         "--every-nth", "2", "--no-audio", "--backend", "cuda",
     ])
     expected = {
         "workers": 4, "profile": True, "encode_thread": True,
         "defer_d2h": True, "force_recognize": True, "encoder": "nvenc",
-        "arena_strategy": "pow2", "crf": 23, "preset": "fast",
+        "decoder": "gpu", "arena_strategy": "pow2", "crf": 23, "preset": "fast",
         "every_nth": 2, "no_audio": True, "backend": "cuda",
     }
     for key, value in expected.items():
@@ -492,7 +492,8 @@ def test_switch_defaults_match_baseline() -> None:
     defaults = {
         "workers": 1, "profile": False, "encode_thread": False,
         "defer_d2h": False, "force_recognize": False,
-        "encoder": "libx264", "arena_strategy": "same",
+        "encoder": "libx264", "decoder": "pyav",
+        "arena_strategy": "same",
         "crf": 18, "preset": "medium", "every_nth": 1,
         "no_audio": False, "backend": "cuda",
     }
@@ -566,7 +567,7 @@ def test_headless_module_syntax() -> None:
         "SwapOptions": ("arena_strategy",),
         "VideoOptions": (
             "profile", "encode_thread", "defer_d2h", "force_recognize",
-            "encoder", "workers",
+            "encoder", "decoder", "workers",
         ),
     }
     for cls_name, required in expected_fields.items():
