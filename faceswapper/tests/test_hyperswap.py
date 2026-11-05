@@ -190,6 +190,30 @@ def test_session_is_wired() -> None:
     print("  ok  hyperswap session wired into registries, io binding and teardown")
 
 
+def test_cuda_backend_disables_trt_for_all_models() -> None:
+    """--backend cuda 必须覆盖所有可切换模型。
+
+    漏掉任何一个（ hyperswap 曾中招）都会让它仍去初始化 TensorRT EP；在
+    没有 libnvinfer.so.10 的机器上会打印 EP Error 再回退到 CUDA EP。
+    """
+    branch = _source(
+        "faceswapper/headless.py",
+        r'if options\.backend == "cuda":.*?(?=\n        self\.vm)',
+    )
+    if "set_backend_preference_for_all" not in branch:
+        fail("--backend cuda must apply the preference to every model")
+    if "swapper_model" in branch:
+        fail("--backend cuda still enumerates model attributes by hand")
+
+    helper = _source(
+        "faceswapper/Models.py",
+        r"def set_backend_preference_for_all\(.*?(?=\n    def )",
+    )
+    if "_BACKEND_PREF_ATTRS" not in helper:
+        fail("the all-model helper must iterate _BACKEND_PREF_ATTRS")
+    print("  ok  --backend cuda disables TRT for every model, including hyperswap")
+
+
 def main() -> int:
     print("faceswapper HyperSwap tests")
     test_mode_is_selectable()
@@ -198,6 +222,7 @@ def main() -> int:
     test_pass_normalizes_both_ways()
     test_normalization_roundtrips()
     test_session_is_wired()
+    test_cuda_backend_disables_trt_for_all_models()
     print("all tests passed")
     return 0
 

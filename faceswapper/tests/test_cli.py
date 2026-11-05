@@ -124,6 +124,54 @@ def test_video_parser_flags() -> None:
     print("  ok  video subcommand accepts its flags")
 
 
+def test_video_workers_flag() -> None:
+    """--workers 默认串行；>1 时启用多 worker 并行帧处理。"""
+    parser = build_parser()
+    plain = parser.parse_args([
+        "video", "--source", "face.jpg",
+        "--target", "in.mp4", "--output", "out.mp4",
+    ])
+    assert plain.workers == 1, plain.workers
+
+    parallel = parser.parse_args([
+        "video", "--source", "face.jpg",
+        "--target", "in.mp4", "--output", "out.mp4",
+        "--workers", "4",
+    ])
+    assert parallel.workers == 4, parallel.workers
+    print("  ok  --workers defaults to 1 and accepts a parallel value")
+
+
+def test_parallel_path_preserves_order() -> None:
+    """并行路径必须按解码顺序消费 future，并启用 Per-Thread session。"""
+    src = (Path(__file__).resolve().parents[1] / "headless.py").read_text(
+        encoding="utf-8")
+    body = src[src.index("def _parallel_swap_frames"):src.index("def _swap_frame")]
+    if "popleft()" not in body or "f.result()" not in body:
+        fail("parallel frame path must drain futures in decode order")
+    if 'set_model_session_mode("Per-Thread")' not in src:
+        fail("workers > 1 must switch to Per-Thread sessions")
+    print("  ok  parallel frames keep decode order with Per-Thread sessions")
+
+
+def test_format_elapsed() -> None:
+    """完成时的总用时要覆盖秒、分、小时且不能出现 60.0 秒这种进位错误。"""
+    from faceswapper.cli import _format_elapsed
+
+    cases = [
+        (0.0, "00:00:00.0"),
+        (5.26, "00:00:05.3"),
+        (154.6, "00:02:34.6"),
+        (3661.5, "01:01:01.5"),
+        (3599.99, "01:00:00.0"),
+    ]
+    for seconds, expected in cases:
+        got = _format_elapsed(seconds)
+        if got != expected:
+            fail(f"_format_elapsed({seconds}) = {got!r}, expected {expected!r}")
+    print("  ok  elapsed time is formatted as HH:MM:SS.s")
+
+
 def test_model_command_flags() -> None:
     parser = build_parser()
     download_args = parser.parse_args([
@@ -285,6 +333,9 @@ def main() -> int:
     test_parser_accepts_documented_flags()
     test_collect_expands_folders()
     test_video_parser_flags()
+    test_video_workers_flag()
+    test_parallel_path_preserves_order()
+    test_format_elapsed()
     test_model_command_flags()
     test_video_extensions_cover_common_containers()
     test_feature_flags_map_to_parameters()

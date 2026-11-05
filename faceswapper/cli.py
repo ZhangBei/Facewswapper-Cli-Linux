@@ -28,11 +28,13 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 import traceback
 from typing import Any
 
 from faceswapper.errors import HeadlessError
 from faceswapper.model_store import (
+    DEFAULT_PROVIDER,
     ENDPOINT_ENV,
     MODEL_SPECS,
     PROVIDER_LABELS,
@@ -44,6 +46,18 @@ from faceswapper.model_store import (
 )
 from faceswapper.parameters import PARAMETER_BY_NAME
 from faceswapper.parameters_io import load as load_params
+
+
+def _format_elapsed(seconds: float) -> str:
+    """把秒数格式化成 ``HH:MM:SS.s``。
+
+    先换成整数十分之一秒再做进位，避免 59.99 秒被浮点格式化成 ``60.0``。
+    """
+    tenths = max(0, round(float(seconds) * 10))
+    hours, tenths = divmod(tenths, 36000)
+    minutes, tenths = divmod(tenths, 600)
+    secs, tenth = divmod(tenths, 10)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}.{tenth}"
 
 
 # CLI 接受的图片扩展名，source 脸和 target 图片都算。放在这里（而不是
@@ -66,7 +80,8 @@ DOWNLOAD_MODEL_CHOICES = [
 _PROVIDER_HELP = (
     "download source: a URL, or one of "
     + "/".join(sorted(PROVIDER_LABELS))
-    + f"; repeatable (default: ${ENDPOINT_ENV})"
+    + f"; repeatable (default: {DEFAULT_PROVIDER}, "
+    f"or ${ENDPOINT_ENV} when set)"
 )
 
 
@@ -307,7 +322,8 @@ def _cmd_video(args: argparse.Namespace) -> int:
 
     options = headless.VideoOptions(
         models_folder=args.models,
-        # video CLI 刻意只支持单 source / 换所有脸。
+        # 多张源图会先合并成一个身份，整段视频只用这一个身份；且总是
+        # 替换所有通过 --target-face 筛选的脸。
         face_policy="all",
         target_person_paths=target_faces,
         target_threshold=args.target_threshold,
@@ -325,6 +341,7 @@ def _cmd_video(args: argparse.Namespace) -> int:
         preset=args.preset,
         keep_audio=not args.no_audio,
         every_nth=args.every_nth,
+        workers=args.workers,
     )
 
     def progress(index: int, total: int) -> None:
@@ -405,6 +422,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="faceswapper",
         description="Faceswapper - command-line face swapping.",
+        # 顶层有 --models / --model-provider。argparse 默认允许长选项缩写，
+        # 且在把参数交给子解析器之前会全局扫描一遍所有参数：子命令里的
+        # --model 会被主 parser 当成这两个顶层选项的歧义前缀并直接报错。
+        # 关掉缩写后 --model 才能原样传给子解析器。
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--models",
@@ -501,6 +523,10 @@ def build_parser() -> argparse.ArgumentParser:
     video.add_argument("--every-nth", type=int, default=1,
                        help="只换第 N 帧，其余原样透传（1 = 全部帧；"
                             "用于计时测试）")
+    video.add_argument("--workers", type=int, default=1,
+                       help="并行处理帧的 worker 数（默认 1 = 串行；>1 时每个 "
+                            "worker 各持一份模型 session，GPU 与显存占用随之"
+                            "上升，建议 2-8）")
     video.set_defaults(func=_cmd_video)
 
     inspect = sub.add_parser("inspect", help="列出图片里检测到的脸")
@@ -563,8 +589,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    started = time.monotonic()
     try:
-        return int(args.func(args))
+        result = int(args.func(args))
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 130
@@ -574,6 +601,11 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         traceback.print_exc()
         return 1
+    # 只有真正跑完换脸的命令才报总用时；失败和中途退出不打印，避免把
+    # 半个任务的时间误报成一次完整运行。
+    if args.command in ("swap", "video"):
+        print(f"elapsed: {_format_elapsed(time.monotonic() - started)}")
+    return result
 
 
 if __name__ == "__main__":

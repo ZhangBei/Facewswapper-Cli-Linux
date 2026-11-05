@@ -12,6 +12,7 @@ from pathlib import Path
 from faceswapper.errors import HeadlessError
 from faceswapper.model_store import (
     BASE_MODELS,
+    DEFAULT_PROVIDER,
     MODEL_SPECS,
     build_download_url,
     default_providers,
@@ -69,14 +70,14 @@ def test_provider_urls() -> None:
     print("  ok  GitHub, Hugging Face, and mirror URLs are constructed")
 
 
-def test_default_source_comes_from_env_only() -> None:
-    """No hardcoded fallback: nothing set = no source, env set = that source."""
+def test_default_source_is_huggingface_with_env_override() -> None:
+    """默认 huggingface；$HF_ENDPOINT 设置后整体覆盖，命令行参数优先级更高。"""
     import os
 
     saved = os.environ.pop("HF_ENDPOINT", None)
     try:
-        if default_providers() != ():
-            fail("expected no download source when HF_ENDPOINT is unset")
+        if default_providers() != (DEFAULT_PROVIDER,):
+            fail(f"expected huggingface as default source: {default_providers()}")
         try:
             normalize_providers(())
         except HeadlessError as exc:
@@ -96,7 +97,7 @@ def test_default_source_comes_from_env_only() -> None:
         os.environ.pop("HF_ENDPOINT", None)
         if saved is not None:
             os.environ["HF_ENDPOINT"] = saved
-    print("  ok  default download source is $HF_ENDPOINT, never hardcoded")
+    print("  ok  default source is huggingface, overridable by $HF_ENDPOINT")
 
 
 def test_missing_and_corrupt_detection() -> None:
@@ -168,6 +169,92 @@ def test_ensure_allows_offline_failure() -> None:
         else:
             fail("offline mode should fail when models are missing")
     print("  ok  --no-auto-download fails clearly before inference")
+
+
+def test_ensure_skips_download_when_models_are_valid() -> None:
+    """模型齐全时不触发下载，也不联网，即使默认源是 huggingface。"""
+    import os
+
+    content = b"good"
+    spec = replace(
+        MODEL_SPECS[0],
+        size=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+
+    def must_not_download(url: str, destination: Path, expected_size: int) -> None:
+        fail(f"valid models must not trigger a download: {url}")
+
+    saved = os.environ.pop("HF_ENDPOINT", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / spec.local_name).write_bytes(content)
+            statuses = ensure_models(
+                tmp, (spec,), providers=None,
+                allow_download=True, on_event=None,
+                downloader=must_not_download,
+            )
+            if statuses != {spec.name: "valid"}:
+                fail(f"unexpected statuses: {statuses}")
+    finally:
+        os.environ.pop("HF_ENDPOINT", None)
+        if saved is not None:
+            os.environ["HF_ENDPOINT"] = saved
+    print("  ok  valid local models run without any download")
+
+
+def test_missing_model_uses_default_huggingface_source() -> None:
+    """不指定来源时，缺模型自动走默认的 Hugging Face 官方源。"""
+    import os
+
+    content = b"good"
+    spec = replace(
+        MODEL_SPECS[0],
+        size=len(content),
+        sha256=hashlib.sha256(content).hexdigest(),
+    )
+    attempted: list[str] = []
+
+    def downloader(url: str, destination: Path, expected_size: int) -> None:
+        attempted.append(url)
+        destination.write_bytes(content[:expected_size])
+
+    saved = os.environ.pop("HF_ENDPOINT", None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            statuses = ensure_models(
+                tmp, (spec,), providers=None,
+                allow_download=True, on_event=None,
+                downloader=downloader,
+            )
+            if statuses != {spec.name: "downloaded"}:
+                fail(f"unexpected statuses: {statuses}")
+            if len(attempted) != 1 or "huggingface.co" not in attempted[0]:
+                fail(f"default source was not huggingface: {attempted}")
+    finally:
+        os.environ.pop("HF_ENDPOINT", None)
+        if saved is not None:
+            os.environ["HF_ENDPOINT"] = saved
+    print("  ok  missing models download from the default huggingface source")
+
+
+def test_ensure_rejects_explicitly_empty_provider_list() -> None:
+    """调用方显式清空来源时仍给出可操作的报错，不会静默联网。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            ensure_models(
+                tmp, BASE_MODELS[:1], providers=(),
+                allow_download=True, on_event=None,
+            )
+        except HeadlessError as exc:
+            message = str(exc)
+            if "no model download source given" not in message:
+                fail(f"unexpected no-source error: {message}")
+            if "--model-provider" not in message or "$HF_ENDPOINT" not in message:
+                fail(f"no-source error lacks actionable flags: {message}")
+        else:
+            fail("an explicitly empty provider list should be rejected")
+    print("  ok  explicitly empty provider list is rejected")
 
 
 def test_specs_for_parameters_tracks_enabled_features() -> None:
@@ -288,10 +375,13 @@ def main() -> int:
     print("faceswapper model store tests")
     test_inventory_is_complete()
     test_provider_urls()
-    test_default_source_comes_from_env_only()
+    test_default_source_is_huggingface_with_env_override()
     test_missing_and_corrupt_detection()
     test_download_falls_back_between_providers()
     test_ensure_allows_offline_failure()
+    test_ensure_skips_download_when_models_are_valid()
+    test_missing_model_uses_default_huggingface_source()
+    test_ensure_rejects_explicitly_empty_provider_list()
     test_crc32_only_model_verifies()
     test_specs_for_parameters_tracks_enabled_features()
     test_user_supplied_models_are_reported_not_downloaded()

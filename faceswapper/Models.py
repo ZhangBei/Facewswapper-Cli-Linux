@@ -254,6 +254,25 @@ class Models():
         else:
             return
 
+    def set_backend_preference_for_all(self, backend, *, unload=True):
+        """把后端偏好应用到所有支持切换的模型上。
+
+        CLI 的 --backend 是全局开关；逐个枚举属性容易在新增模型时漏项
+        （hyperswap 就曾因此仍在 --backend cuda 下去初始化 TRT EP）。
+        """
+        for attr_name in self._BACKEND_PREF_ATTRS:
+            self.set_backend_preference(attr_name, backend, unload=unload)
+
+    def set_model_session_mode(self, mode: str) -> None:
+        """切换 ORT session 的共享策略，必须在任何模型加载前调用。
+
+        'Per-Thread' 让每个 worker 线程各持一份 session 与 CUDA stream，
+        是 --workers > 1 真正并行占用 GPU 的前提。
+        """
+        if mode not in ("Shared", "Per-Thread"):
+            raise ValueError(f"unknown model session mode: {mode}")
+        self._model_session_mode = mode
+
     def get_backend_preference(self, attr_name):
         """返回 'trt' / 'onnx' / None（auto）。"""
         return self._backend_pref.get(attr_name)

@@ -249,16 +249,22 @@ python -m faceswapper.cli --models ./models download-models
 
 #### 选择下载源
 
-**没有内置默认下载源。** 不指定时读取系统环境变量 `HF_ENDPOINT`（与
-`huggingface_hub` 使用同一个变量，配一次镜像全局生效）；未设置则直接报错，
-不会暗中回退到某个地址。
+**默认下载源是 `huggingface`（Hugging Face 官方仓库）**，只有真的需要下载
+模型时才会用到它：本地模型齐全时，`swap` / `video` / `inspect` 直接离线运行，
+不联网、也不要求任何配置。优先级从高到低：
+
+1. 命令行 `--model-provider`（全局）或 `download-models --provider`
+2. 环境变量 `HF_ENDPOINT`（与 `huggingface_hub` 使用同一个变量，配一次镜像全局生效）
+3. 默认 `huggingface`
+
+改用国内镜像：
 
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
 python -m faceswapper.cli --models ./models download-models
 ```
 
-也可以按命令显式指定，支持三种具名来源：
+显式按命令指定时会覆盖上面的默认源，支持三种具名来源：
 
 - `huggingface`：Hugging Face 官方仓库
 - `hf-mirror`：Hugging Face 国内镜像
@@ -288,9 +294,11 @@ python -m faceswapper.cli --models ./models download-models \
 
 | `--model` | 本地文件 | 必需 | 上游发布 |
 |---|---|---|---|
+| `base` | 3 个基础模型（省略 `--model` 时的默认） | — | — |
 | `retinaface` | `det_10g.onnx` | 是 | `models-3.0.0` |
 | `arcface` | `w600k_r50.onnx` | 是 | `models-3.0.0` |
 | `inswapper` | `inswapper_128.fp16.onnx` | 是 | `models-3.0.0` |
+| `scrfd` | `scrfd_2.5g_bnkps.onnx` | 否 | `models-3.0.0` |
 | `hyperswap` | `hyperswap_1a_256.onnx` | 否 | `models-3.3.0` |
 | `gfpgan` | `GFPGANv1.4.onnx` | 否 | `models-3.0.0` |
 | `gpen256` | `GPEN-BFR-256.onnx` | 否 | `models-3.0.0` |
@@ -299,6 +307,7 @@ python -m faceswapper.cli --models ./models download-models \
 | `xseg` | `occluder.onnx` | 否 | `models-3.1.0` |
 | `faceparser` | `faceparser_resnet34.onnx` | 否 | `models-3.0.0` |
 | `dflxseg` | `dfl_xseg.onnx` | 否 | `models-3.0.0` |
+| `resnet50` | `res50.onnx` | 否 | 无（仅登记，需自备） |
 | `all` | 以上全部 | — | — |
 
 下载单个可选模型：
@@ -308,9 +317,16 @@ python -m faceswapper.cli --models ./models download-models --model hyperswap
 python -m faceswapper.cli --models ./models download-models --model gfpgan
 ```
 
+> **三个 `--model*` 参数不要混淆，且必须写全名。**
+> `--models DIR`（全局，模型目录）和 `--model-provider`（全局，下载源）写在
+> 子命令**前面**；`--model`（`download-models` / `check-models` 专属，选择要
+> 下载或校验的模型）写在子命令**后面**。CLI 已关闭 argparse 的长选项缩写，
+> `--mod`、`--model-p` 这类简写一律不接受，也不会再把 `--model` 误判成
+> `--models` / `--model-provider` 的歧义前缀。
+
 **只登记不下载**的文件（上游没有对应发布，需要自行提供）：
 
-- `res50.onnx` — ResNet50 检测器
+- `res50.onnx` — ResNet50 检测器（对应 `--model resnet50`）
 - `inswapper_256_phase1.onnx` — 256 原生 inswapper
 - `inswapper_512_level2.onnx` — 512 原生 inswapper
 
@@ -429,8 +445,9 @@ python -m faceswapper.cli --models ./models video \
     --output output.mp4
 ```
 
-这两条就是完整可用的最小命令。首次运行会自动下载缺失的基础模型
-（来源见 [2.3](#23-模型下载)）。下面按场景给出带参数的版本。
+这两条就是完整可用的最小命令。首次运行会自动下载缺失的基础模型，默认从
+Hugging Face 官方仓库获取（来源见 [2.3](#23-模型下载)）。下面按场景给出
+带参数的版本。
 
 ### 3.2 图片换脸
 
@@ -588,6 +605,29 @@ python -m faceswapper.cli --models ./models video \
     --output output.mp4
 ```
 
+#### 用多张源图合成一个身份
+
+`--source` 可以直接指向文件夹，也可以重复传多次。所有源图各取最大人脸、
+提取 embedding，再按 `--merge` 合并成**一个**身份用于整段视频——与 3.2 节
+「多张源脸合并为一个身份」是同一套逻辑，不需要额外的 `--source-folder`
+之类参数：
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source /path/to/face10/ \
+    --target-face person_in_video.jpg \
+    --target input.mp4 \
+    --output output.mp4 \
+    --merge Qual
+```
+
+合并方式 `Mean` / `Median` / `Sph` / `Geo` / `Qual`，默认 `Mean`；源图质量
+参差时 `Qual` 会让清晰照片占更大权重。目录只扫描一层，支持
+`.jpg/.jpeg/.png/.bmp/.webp/.tif/.tiff`。**每张图都必须能检测到人脸**，
+否则会直接报 `no face detected in source image: ...` 而不是跳过。源图建议
+都是同一个人、不同角度与光线；混入其他人会把身份平均歪。多张源图只增加
+启动阶段的特征提取耗时，逐帧推理仍只用那一个合并后的 embedding。
+
 #### 匹配阈值
 
 ```bash
@@ -647,6 +687,67 @@ python -m faceswapper.cli --models ./models video \
     --every-nth 20
 ```
 
+#### 为什么 GPU / 显存占用很低
+
+这是当前流水线结构决定的，不是参数没调满：
+
+- 解码（PyAV，CPU）、GPU 推理、libx264 编码都在**同一个线程逐帧串行**
+  （`headless.py` 的 `_encode_video`），任意时刻只有一帧在推进；
+- 每次 ORT 调用前有 `syncvec.cpu()` 的 CPU↔GPU 同步，每帧结束还有一次
+  `result.cpu().numpy()` 回拷；
+- 换脸按脸逐次执行，没有跨帧 batch；ORT session 是单份 `Shared`，CUDA EP
+  用 `kSameAsRequested` 按需分配显存。
+
+所以单纯调大显存池不会提速，`saved_parameters.json` 里的 `ThreadsSlider`
+是没有读取方的遗留参数，改它无效。前面「低显存 / 最快配置」里列的
+`--preset ultrafast`、降分辨率、关掉可选功能等仍然有效，但它们是减少总
+耗时，不会让 GPU 吃满。`--every-nth` 是抽样验证、不是加速；`--target-face`
+只影响人脸筛选，每帧的识别 embedding 仍会计算，去掉它提速有限。
+
+要真正提高 GPU 利用率和显存占用，需要增加并发。下面第二档已落地为
+`--workers N`（默认 `1`，走原来的串行路径）：
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target input.mp4 --output output.mp4 \
+    --workers 4
+```
+
+`N` 个 worker 各持一份 ORT session 和一条 CUDA stream，解码/编码留在主线程，
+换脸推理在线程池里并行；输出仍严格按解码顺序，PTS、VFR 时序和音画对齐与
+串行路径一致。显存约为 `N × 3 份模型 session`，建议从 2 开始逐步加，用
+`nvidia-smi` 观察利用率和显存，别一次开到 8。
+
+| 方案 | 效果 | 状态 |
+|---|---|---|
+| `--workers N` 多 worker 并行帧 | GPU 利用率和显存随 N 上升 | **已实现，默认关闭** |
+| 编码移到独立线程，与推理重叠 | 进一步解除 CPU 编码阻塞 | 未实现，可与上者叠加 |
+| 跨帧 batch 推理 / NVENC 硬件编码 | 上限最高 | 未实现，可能影响 PTS 与画质 |
+
+`--workers > 1` 会启用 Per-Thread session，此时不要打开 `OrientAutoSwitch`
+（自动朝向）：它维护跨帧共享状态，多线程下会竞态。默认参数是关闭的，
+正常使用不受影响。
+
+先用 `nvidia-smi dmon -s u -d 1` 看利用率是否周期性归零：归零说明还卡在
+CPU 编码或同步上，此时叠加 `--preset ultrafast` 收益更明显。
+
+完整的分阶段实施方案（现状瓶颈、详细实现步骤、验收清单、风险与回滚）见
+[docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md)。
+
+#### 完成后的总用时
+
+换脸命令成功结束后会打印整条命令的总用时（从参数校验、模型准备、源特征
+提取到编码与音频 mux），格式为 `HH:MM:SS.s`：
+
+```text
+frame 4731/4731 (100.0%)
+done: 4731 frame(s) at 24.000 fps, 720x1280, audio=yes -> output.mp4
+elapsed: 00:02:34.6
+```
+
+图片换脸 `swap` 同样会在末尾打印这一行；失败或 `Ctrl+C` 中断时不打印，
+避免把半个任务的时间误报成一次完整运行。
+
 ### 3.4 参数总览
 
 全局参数必须写在子命令**前面**：
@@ -661,8 +762,14 @@ python -m faceswapper.cli \
 | 全局参数 | 说明 |
 |---|---|
 | `--models DIR` | 模型目录，默认 `./models` |
-| `--model-provider` | 自动下载源（URL 或 `github`/`huggingface`/`hf-mirror`），可重复。不指定时读 `$HF_ENDPOINT` |
+| `--model-provider` | 自动下载源（URL 或 `github`/`huggingface`/`hf-mirror`），可重复；默认 `huggingface`，设置 `$HF_ENDPOINT` 时以它为准，仅在实际发生模型下载时生效 |
 | `--no-auto-download` | 禁用模型自动下载 |
+
+> **所有选项都必须写完整名称**，CLI 不接受长选项缩写：`--mod`、`--model-p`
+> 这类简写会被判为未识别参数。这样做是为了让子命令的 `--model` 不被
+> argparse 误判成 `--models` / `--model-provider` 的歧义前缀（见
+> [2.3 模型下载](#23-模型下载)）。选项的位置规则同上：全局参数在子命令前，
+> 子命令专属参数在子命令后。
 
 `swap` / `video` / `inspect` 共同参数：
 
@@ -675,7 +782,7 @@ python -m faceswapper.cli \
 | `--merge` | 多源脸合并方式 | `Mean` |
 | `--swapper-model` | `inswapper-128`/`inswapper-256`/`inswapper-512`/`hyperswap-256` | `inswapper-128` |
 | `--color-match` | 启用 LAB 色彩匹配 | 关闭 |
-| `--backend` | `cuda` 或 `trt` | `cuda` |
+| `--backend` | `cuda`（纯 CUDA EP，不尝试 TensorRT）或 `trt`（需 TensorRT 10 运行时） | `cuda` |
 
 > **`--detect-input-size` 不要随便调小。** 它只影响检测器输入分辨率，
 > 不影响换脸质量——调小是纯速度交易：`480` ≈ 1.8× 快，`416` ≈ 2.4×，
@@ -723,6 +830,7 @@ python -m faceswapper.cli --models ./models swap \
 | `--preset` | x264 档位 | `medium` |
 | `--no-audio` | 不复制源音频轨 | 关闭 |
 | `--every-nth` | 只处理第 N 帧，其余透传 | `1` |
+| `--workers` | 并行处理帧的 worker 数，`>1` 时各 worker 独占一份模型 session | `1` |
 
 查看全部已知参数及默认值：
 
@@ -795,19 +903,53 @@ conda remove --force onnxruntime
 python tools/install.py cu128
 ```
 
-#### 提示没有模型下载源
+#### 启动时报 `libnvinfer.so.10` / TensorRT `EP Error`
 
-项目不内置下载地址。设置环境变量或显式指定：
+日志形如 `Failed to load library ...libonnxruntime_providers_tensorrt.so
+with error: libnvinfer.so.10: cannot open shared object file`，随后是
+`EP Error ... RegisterTensorRTPluginsAsCustomOps` 和
+`Falling back to ['CUDAExecutionProvider', 'CPUExecutionProvider']`。
+
+含义：ONNX Runtime 尝试加载 TensorRT EP，但环境里没有 TensorRT 10 的运行时
+库，于是自动回退到 CUDA EP。**推理结果不受影响**——只要后面打印
+`[Models] ...: CUDAExecutionProvider`，就说明实际在 GPU 上跑。
+
+- 默认 `--backend cuda` 不应再出现这段日志。早期版本只给部分模型设了 CUDA
+  偏好，`hyperswap` 仍会去初始化 TRT EP；当前版本已让 cuda 模式覆盖全部
+  模型，若仍看到说明运行的是旧代码。
+- 确实想用 TensorRT 加速：先安装 TensorRT 10 运行时（提供
+  `libnvinfer.so.10`，例如 `pip install tensorrt`，并确保库在
+  `LD_LIBRARY_PATH` 中），再传 `--backend trt`；没装好仍会回退到 CUDA EP。
+
+#### 更换模型下载源
+
+默认源是 `huggingface`（Hugging Face 官方仓库），只有本次运行需要的模型
+**缺失或损坏**、确实要联网下载时才会用到。先确认到底缺哪个文件：
+
+```bash
+python -m faceswapper.cli --models ./models check-models --quick
+```
+
+改用镜像或自建源时，设置环境变量，或按命令显式指定（注意全局参数要写在
+子命令前面）：
 
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
-# 或
-python -m faceswapper.cli --models ./models download-models --provider huggingface
+# 或：全局自动下载（swap / video / inspect）
+python -m faceswapper.cli --models ./models --model-provider hf-mirror swap \
+    --source face.jpg --target target.jpg --output out.jpg
+# 或：download-models 子命令
+python -m faceswapper.cli --models ./models download-models --provider github
 ```
+
+> 旧版本没有内置默认源，会报 `no model download source given`；早期版本
+> 即使模型齐全也会无条件校验下载源。两种情况更新
+> `faceswapper/model_store.py` 后即可解决。
 
 #### Hugging Face 下载很慢或中断
 
-用镜像，并对所有 huggingface 工具同时生效：
+默认源就是 Hugging Face 官方仓库。国内访问慢或中断时设置镜像，对所有
+huggingface 工具同时生效：
 
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
@@ -838,6 +980,26 @@ python -m faceswapper.cli --models ./models download-models \
 ```
 
 ### 4.2 使用问题
+
+#### `ambiguous option: --model could match --models, --model-provider`
+
+旧版本 CLI 的参数解析问题：顶层同时有 `--models` 和 `--model-provider`，
+argparse 默认允许长选项缩写，会先把子命令里的 `--model` 当成这两个选项的
+歧义前缀，在参数交给 `download-models` / `check-models` 之前就报错退出。
+当前版本已在顶层 parser 关闭缩写（`allow_abbrev=False`），`--model` 会原样
+传给子解析器，文中所有带 `--model` 的示例均可直接使用。
+
+如果仍看到这条报错，说明运行的不是更新后的代码（例如环境里装着旧版
+`faceswapper` 包，或 `python -m` 没有从当前项目目录加载）。更新
+`faceswapper/cli.py` 后，用只列状态、不下载的命令验证参数解析：
+
+```bash
+python -m faceswapper.cli --models ./models download-models --model hyperswap --list
+```
+
+在旧版本上也可以先省略 `--model`，直接跑换脸命令，让
+`--swapper-model hyperswap-256` 等开关触发按需自动下载（见 2.3 节
+「按需自动下载」）。注意 `--model=hyperswap` 同样绕不过这个歧义。
 
 #### 没有检测到人脸
 

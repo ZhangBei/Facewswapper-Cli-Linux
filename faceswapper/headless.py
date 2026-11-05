@@ -17,6 +17,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any, Callable
@@ -99,9 +101,14 @@ class _SwapperBase:
         if options.backend == "cuda":
             # 这里的 "onnx" 指的是 faceswapper.Models 里那条纯 CUDA
             # ExecutionProvider 路径，不是 CPU provider。这个命名继承自
-            # GUI 的 per-model 后端开关。
-            for attr in ("swapper_model", "retinaface_model", "recognition_model"):
-                self.models.set_backend_preference(attr, "onnx", unload=False)
+            # GUI 的 per-model 后端开关。必须覆盖全部可切换模型：漏掉
+            # 任何一个（例如 hyperswap）都会让它仍去初始化 TensorRT EP，
+            # 在没有 libnvinfer.so.10 的机器上打印 EP Error 再回退。
+            self.models.set_backend_preference_for_all("onnx", unload=False)
+        if getattr(options, "workers", 1) > 1:
+            # Shared 会把多个 worker 串行化在同一份 session 上；Per-Thread
+            # 才能让它们各自占用 GPU（代价是每 worker 多一份显存）。
+            self.models.set_model_session_mode("Per-Thread")
         self.vm = VideoManager(self.models)
         self._apply_parameters()
 
@@ -319,6 +326,9 @@ class VideoOptions(SwapOptions):
     # 除了每第 N 帧之外都跳过换脸，原样透传其余帧。用于快速计时测试；
     # 输出仍保留每一帧，时长与音频因此保持同步。
     every_nth: int = 1
+    # 并行处理帧的 worker 数。1 = 原来的单线程串行路径；>1 时每个 worker
+    # 各持有一份 ORT session 和一条 CUDA stream，GPU 与显存占用随之上升。
+    workers: int = 1
 
 
 def _find_ffmpeg() -> str:
@@ -528,35 +538,53 @@ class VideoSwapper(_SwapperBase):
             # 通过 -itsoffset 补回一次；在这里也补一次会让位移翻倍。
             first_source_pts: int | None = None
             next_pts: int | None = None
-            index = 0
             step = max(1, int(self.options.every_nth))
+            workers = min(8, max(1, int(getattr(self.options, "workers", 1))))
+            parallel = workers > 1
 
-            for frame in container.decode(in_stream):
-                rgb = frame.to_ndarray(format="rgb24")
-                if index % step == 0:
-                    rgb = self._swap_frame(rgb)
+            def decoded():
+                """按解码顺序产出 (index, rgb, pts)。
 
+                PTS 算法与串行路径完全一致；串行时换脸也在这里做，并行时
+                交给 _parallel_swap_frames 提前提交给 worker 线程池。
+                """
+                nonlocal first_pts, first_source_pts, next_pts
+                index = 0
+                for frame in container.decode(in_stream):
+                    rgb = frame.to_ndarray(format="rgb24")
+                    if not parallel and index % step == 0:
+                        rgb = self._swap_frame(rgb)
+                    if frame.pts is not None:
+                        source_pts = int(frame.pts)
+                        if first_source_pts is None:
+                            first_source_pts = source_pts
+                            first_pts = source_pts
+                        # 相对时间戳: 第一帧 -> 0，其余帧保持精确的间距
+                        # （因而也保留了 VFR 时序）。
+                        pts = source_pts - first_source_pts
+                        next_pts = source_pts + fallback_step
+                    elif next_pts is not None:
+                        source_pts = next_pts
+                        pts = source_pts - (first_source_pts or 0)
+                        next_pts = source_pts + fallback_step
+                    else:
+                        # 连第一帧也没有 PTS；直接从 0 开始。
+                        pts = 0
+                        first_source_pts = 0
+                        next_pts = fallback_step
+                    yield index, rgb, pts
+                    index += 1
+
+            frames = decoded()
+            if parallel:
+                frames = self._parallel_swap_frames(
+                    frames, workers, step, self._swap_frame,
+                )
+
+            for index, rgb, pts in frames:
                 new_frame = av.VideoFrame.from_ndarray(
                     np.ascontiguousarray(rgb), format="rgb24",
                 )
-                if frame.pts is not None:
-                    source_pts = int(frame.pts)
-                    if first_source_pts is None:
-                        first_source_pts = source_pts
-                        first_pts = source_pts
-                    # 相对时间戳: 第一帧 -> 0，其余帧保持精确的间距
-                    # （因而也保留了 VFR 时序）。
-                    pts = source_pts - first_source_pts
-                    next_pts = source_pts + fallback_step
-                elif next_pts is not None:
-                    source_pts = next_pts
-                    pts = source_pts - (first_source_pts or 0)
-                    next_pts = source_pts + fallback_step
-                else:
-                    # 连第一帧也没有 PTS；直接从 0 开始。
-                    pts = 0
-                    first_source_pts = 0
-                    next_pts = fallback_step
                 new_frame.pts = int(round(pts * pts_scale))
                 new_frame.time_base = out_tb
                 for packet in out_stream.encode(new_frame):
@@ -573,6 +601,29 @@ class VideoSwapper(_SwapperBase):
         finally:
             output.close()
         return first_pts if first_pts is not None else 0
+
+    @staticmethod
+    def _parallel_swap_frames(frames, workers, step, swap_fn):
+        """把换脸预提交给 worker 线程池，仍严格按解码顺序 yield。
+
+        窗口最多 2*workers 帧：主线程编码队首时，后续帧已并行在 GPU 上
+        推进，CPU 编解码与 GPU 推理得以重叠。每个 worker 各持有一份 ORT
+        session / CUDA stream，所以显存占用也随 workers 上升。
+        """
+        pending = deque()
+        limit = workers * 2
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for index, rgb, pts in frames:
+                future = (
+                    pool.submit(swap_fn, rgb) if index % step == 0 else None
+                )
+                pending.append((index, rgb, pts, future))
+                if len(pending) >= limit:
+                    i, original, p, f = pending.popleft()
+                    yield i, (f.result() if f is not None else original), p
+            while pending:
+                i, original, p, f = pending.popleft()
+                yield i, (f.result() if f is not None else original), p
 
     def _swap_frame(self, rgb: np.ndarray) -> np.ndarray:
         result = self.vm.swap_video(rgb, 0)

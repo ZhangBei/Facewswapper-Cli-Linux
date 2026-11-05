@@ -22,10 +22,11 @@ from faceswapper.errors import HeadlessError
 
 
 CACHE_FILE = ".faceswapper-models.json"
-# 不硬编码下载源：--provider 和这个环境变量都没指定时，下载会失败并说明
-# 原因。HF_ENDPOINT 是 huggingface_hub 自己认的变量，所以给系统配一次
-# mirror，本工具也一并覆盖。
+# 默认下载源是 Hugging Face 官方仓库。HF_ENDPOINT 是 huggingface_hub 自己
+# 认的变量，设置后整体覆盖默认源，所以给系统配一次 mirror，本工具也一并
+# 覆盖；命令行 --model-provider / --provider 的优先级最高。
 ENDPOINT_ENV = "HF_ENDPOINT"
+DEFAULT_PROVIDER = "huggingface"
 PROVIDER_LABELS = {
     "github": "GitHub Release",
     "huggingface": "Hugging Face",
@@ -232,19 +233,30 @@ def build_download_url(provider: str, spec: ModelSpec) -> str:
 
 
 def default_providers() -> tuple[str, ...]:
-    """调用方没指定来源时用哪些：$HF_ENDPOINT，没有就空着。"""
+    """调用方没指定来源时：$HF_ENDPOINT 优先，否则用 Hugging Face 官方源。"""
     endpoint = (os.environ.get(ENDPOINT_ENV) or "").strip().rstrip("/")
-    return (endpoint,) if endpoint else ()
+    return (endpoint,) if endpoint else (DEFAULT_PROVIDER,)
+
+
+def no_source_message() -> str:
+    """调用方显式清空来源时的提示（CLI 路径下有默认源，一般不会触发）。
+
+    自动下载走全局 `--model-provider`，`download-models` 走子命令的
+    `--provider`，两个名字都要给，否则用户会按提示去写一个当前命令不存在
+    的参数。
+    """
+    return (
+        "no model download source given: pass --model-provider (global) or "
+        "--provider (download-models) with a URL or a known source "
+        f"({', '.join(sorted(PROVIDER_LABELS))}), or set ${ENDPOINT_ENV}; "
+        f"the default is {DEFAULT_PROVIDER}"
+    )
 
 
 def normalize_providers(providers: Iterable[str]) -> tuple[str, ...]:
     values = tuple(providers)
     if not values:
-        raise HeadlessError(
-            "no model download source given: pass --provider with a URL or a "
-            f"known source ({', '.join(sorted(PROVIDER_LABELS))}), "
-            f"or set ${ENDPOINT_ENV}"
-        )
+        raise HeadlessError(no_source_message())
     unknown = [
         value for value in values
         if value not in PROVIDER_LABELS
@@ -572,13 +584,14 @@ def ensure_models(
 ) -> dict[str, str]:
     """确保所有请求的模型都有效，允许时就地下载。"""
     selected = tuple(specs)
-    # providers=None 表示"没有指定来源"：退回到 $HF_ENDPOINT。
+    # providers=None 表示"没有指定来源"：用默认源（huggingface 或
+    # $HF_ENDPOINT）；显式传空列表则是调用方刻意禁用下载源。
     provider_values = (
         tuple(providers) if providers is not None else default_providers()
     )
-    # 空列表只有在真的要下载时才要紧；--no-auto-download 会先一步用它自己
-    # 那条不同的消息失败掉。
-    if provider_values or allow_download:
+    # 模型齐全时整个运行不联网，也不会碰到下载源。非空来源在这里校验
+    # 合法性；真的要下载却没有来源时，再到下面的分支报错。
+    if provider_values:
         provider_values = normalize_providers(provider_values)
     results: dict[str, str] = {}
 
@@ -594,11 +607,13 @@ def ensure_models(
                 on_event(f"[model] {spec.local_name}: valid")
             results[spec.name] = status
             continue
-        if not allow_download or not provider_values:
+        if not allow_download:
             raise HeadlessError(
                 f"model {spec.local_name} is {status}; automatic download "
                 "is disabled"
             )
+        if not provider_values:
+            raise HeadlessError(no_source_message())
         results[spec.name] = download_model(
             models_dir,
             spec,
