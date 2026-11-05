@@ -124,6 +124,11 @@ class Models():
         # engine 就优先 TRT）。由 Settings tab 的 Backend 开关驱动，
         # 在下次懒加载时生效。
         self._backend_pref: dict = {}
+        # CUDA EP 的 VRAM arena 扩展策略。默认 kSameAsRequested；改成
+        # kNextPowerOfTwo 只是减少重复 cudaMalloc、让"显存占用"数字变大，
+        # 不是提速手段（见 docs/gpu-utilization-plan.md 6.2）。必须在任何
+        # session 构建前设置，运行时切换对已加载的 session 无效。
+        self._arena_strategy: str = 'kSameAsRequested'
         self.syncvec = torch.empty((1,1), dtype=torch.float32, device='cuda:0')
 
         # model session mode——控制主管线用到的每一个 ORT-TRT-EP session
@@ -272,6 +277,20 @@ class Models():
         if mode not in ("Shared", "Per-Thread"):
             raise ValueError(f"unknown model session mode: {mode}")
         self._model_session_mode = mode
+
+    def set_arena_strategy(self, strategy: str) -> None:
+        """设置 CUDA EP 的 arena 扩展策略，必须在任何 session 加载前调用。
+
+        只接受 ORT 认识的两个值，未知值直接报错而不是静默传给 ORT——
+        拼错的策略名会被 ORT 当成默认行为，排查起来很费劲。这是阶段 3
+        的 6.2：收益小，默认仍是 kSameAsRequested。
+        """
+        valid = ('kSameAsRequested', 'kNextPowerOfTwo')
+        if strategy not in valid:
+            raise ValueError(
+                f"unknown arena strategy {strategy!r}; expected one of {valid}"
+            )
+        self._arena_strategy = strategy
 
     def get_backend_preference(self, attr_name):
         """返回 'trt' / 'onnx' / None（auto）。"""
@@ -928,7 +947,7 @@ class Models():
                 重新 benchmark，每个 session 都要卡一次）。
         """
         opts = {
-            'arena_extend_strategy': 'kSameAsRequested',
+            'arena_extend_strategy': self._arena_strategy,
             'cudnn_conv_algo_search': cudnn_algo,
         }
         try:
@@ -1415,7 +1434,7 @@ class Models():
 
     def run_GFPGAN(self, image, output):
         if not self.GFPGAN_model:
-            cuda_options = {"arena_extend_strategy": "kSameAsRequested", 'cudnn_conv_algo_search': 'DEFAULT'}
+            cuda_options = {"arena_extend_strategy": self._arena_strategy, 'cudnn_conv_algo_search': 'DEFAULT'}
             sess_options = onnxruntime.SessionOptions()
             sess_options.log_severity_level = 3
             sess_options.enable_cpu_mem_arena = False

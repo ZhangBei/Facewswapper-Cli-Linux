@@ -60,6 +60,31 @@ def _format_elapsed(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}.{tenth}"
 
 
+def _format_avg_fps(frames: int | float | None, seconds: float) -> str:
+    """把平均处理速度格式化成可直接拼在 elapsed 后面的片段。
+
+    帧数来自视频编码循环的实际计数，不是容器声明的 ``stream.frames``——
+    后者可能为 0 或只是估算值。缺帧数、零帧、非正耗时都返回空串，避免
+    除零或把一次不完整运行误报成 0.0 fps。
+    """
+    if frames is None or frames <= 0 or seconds <= 0:
+        return ""
+    return f" (avg {frames / seconds:.1f} fps)"
+
+
+def _format_profile(times: dict[str, float]) -> str:
+    """把分段耗时格式化成 ``profile: decode=Xs swap=Ys encode=Zs``。
+
+    三段顺序固定，缺的段补 0.00s。并行路径下三段会互相重叠，之和不等于
+    总用时，所以这里不做任何归一化，只呈现各段自身的累计耗时。
+    """
+    parts = [
+        f"{key}={float(times.get(key, 0.0)):.2f}s"
+        for key in ("decode", "swap", "encode")
+    ]
+    return "profile: " + " ".join(parts)
+
+
 # CLI 接受的图片扩展名，source 脸和 target 图片都算。放在这里（而不是
 # faceswapper.headless）是为了让 argument parser 和 --help 在没有装
 # OpenCV / torch 的机器上也能用。
@@ -184,6 +209,7 @@ def _build_options(args: argparse.Namespace, headless=None) -> "SwapOptions":
         merge_mode=args.merge or "Mean",
         overrides=overrides,
         backend=args.backend,
+        arena_strategy=args.arena_strategy,
     )
     return options
 
@@ -342,6 +368,12 @@ def _cmd_video(args: argparse.Namespace) -> int:
         keep_audio=not args.no_audio,
         every_nth=args.every_nth,
         workers=args.workers,
+        profile=args.profile,
+        encode_thread=args.encode_thread,
+        defer_d2h=args.defer_d2h,
+        force_recognize=args.force_recognize,
+        encoder=args.encoder,
+        arena_strategy=args.arena_strategy,
     )
 
     def progress(index: int, total: int) -> None:
@@ -353,12 +385,17 @@ def _cmd_video(args: argparse.Namespace) -> int:
 
     with headless.VideoSwapper(options) as swapper:
         report = swapper.swap(sources, args.target, args.output, on_progress=progress)
+    # 把实际处理帧数交回 main()，让它和 elapsed 用同一个时间基准算 avg fps。
+    # 不改动 report["frames"]（容器元数据），done 行的输出因此保持不变。
+    args._processed_frames = int(report.get("processed_frames", 0))
     print()
     print(
         f"done: {report['frames']} frame(s) at {report['fps']:.3f} fps, "
         f"{report['width']}x{report['height']}, "
         f"audio={'yes' if report['audio'] else 'no'} -> {report['output']}"
     )
+    if args.profile and report.get("profile"):
+        print(_format_profile(report["profile"]))
     return 0
 
 
@@ -478,6 +515,11 @@ def build_parser() -> argparse.ArgumentParser:
                             "faceparser_resnet34.onnx）")
         p.add_argument("--backend", choices=["cuda", "trt"], default="cuda",
                        help="推理后端（默认 cuda，不用 TensorRT）")
+        p.add_argument("--arena-strategy", choices=["same", "pow2"],
+                       default="same",
+                       help="CUDA EP 的 VRAM arena 扩展策略：same（默认，按需"
+                            "分配）或 pow2（减少重复 cudaMalloc，只是让显存"
+                            "数字变大，不是提速手段）")
 
     swap = sub.add_parser("swap", help="换一张或多张图片里的脸")
     add_common(swap)
@@ -518,6 +560,11 @@ def build_parser() -> argparse.ArgumentParser:
                        choices=["ultrafast", "veryfast", "fast", "medium",
                                 "slow", "veryslow"],
                        help="x264 速度/质量预设（默认 medium）")
+    video.add_argument("--encoder", choices=["libx264", "nvenc"],
+                       default="libx264",
+                       help="视频编码器：libx264（默认）或 h264_nvenc。"
+                            "nvenc 会先探测可用性，不可用直接报错；CRF/preset "
+                            "会映射成 CQ/p1-p7，语义不等价")
     video.add_argument("--no-audio", action="store_true",
                        help="不拷贝源音频轨")
     video.add_argument("--every-nth", type=int, default=1,
@@ -527,6 +574,20 @@ def build_parser() -> argparse.ArgumentParser:
                        help="并行处理帧的 worker 数（默认 1 = 串行；>1 时每个 "
                             "worker 各持一份模型 session，GPU 与显存占用随之"
                             "上升，建议 2-8）")
+    video.add_argument("--profile", action="store_true",
+                       help="打印 decode / swap / encode 三段的累计耗时；"
+                            "并行时三段会重叠，之和不等于总用时")
+    video.add_argument("--encode-thread", action="store_true",
+                       help="把编码移到独立线程，与换脸推理解耦（默认关闭；"
+                            "编码失败会中断命令，输出顺序不变）")
+    video.add_argument("--defer-d2h", action="store_true",
+                       help="把逐帧 GPU→CPU 拷贝从 worker 线程推迟到帧的"
+                            "消费侧（仅 --workers > 1 时生效；不删除任何"
+                            "CUDA 同步，默认关闭）")
+    video.add_argument("--force-recognize", action="store_true",
+                       help="保留每帧逐脸 ArcFace 推理的旧路径。默认会跳过"
+                            "没有读取方的 embedding 计算（仅未指定 "
+                            "--target-face 时生效，像素输出不变）")
     video.set_defaults(func=_cmd_video)
 
     inspect = sub.add_parser("inspect", help="列出图片里检测到的脸")
@@ -602,9 +663,12 @@ def main(argv: list[str] | None = None) -> int:
         traceback.print_exc()
         return 1
     # 只有真正跑完换脸的命令才报总用时；失败和中途退出不打印，避免把
-    # 半个任务的时间误报成一次完整运行。
+    # 半个任务的时间误报成一次完整运行。avg fps 只有 video 有帧数可算，
+    # swap 没有，因此保持原来的单行 elapsed。
     if args.command in ("swap", "video"):
-        print(f"elapsed: {_format_elapsed(time.monotonic() - started)}")
+        seconds = time.monotonic() - started
+        frames = getattr(args, "_processed_frames", None)
+        print(f"elapsed: {_format_elapsed(seconds)}{_format_avg_fps(frames, seconds)}")
     return result
 
 

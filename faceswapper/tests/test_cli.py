@@ -17,6 +17,8 @@ from faceswapper.cli import (
     VIDEO_EXTENSIONS,
     _collect_sources,
     _collect_targets,
+    _format_avg_fps,
+    _format_profile,
     _parameter_overrides,
     build_parser,
 )
@@ -142,16 +144,39 @@ def test_video_workers_flag() -> None:
     print("  ok  --workers defaults to 1 and accepts a parallel value")
 
 
-def test_parallel_path_preserves_order() -> None:
-    """并行路径必须按解码顺序消费 future，并启用 Per-Thread session。"""
+def test_parallel_path_wiring() -> None:
+    """并行帧调度必须委托给可独立测试的 frame_order 模块。
+
+    保序行为本身由 tests/test_frame_order.py 用假 swap_fn 做行为测试；
+    这里只用 AST 检查接线，防止 headless 里又留下一份旧实现。
+    """
+    import ast
+
     src = (Path(__file__).resolve().parents[1] / "headless.py").read_text(
         encoding="utf-8")
-    body = src[src.index("def _parallel_swap_frames"):src.index("def _swap_frame")]
-    if "popleft()" not in body or "f.result()" not in body:
-        fail("parallel frame path must drain futures in decode order")
-    if 'set_model_session_mode("Per-Thread")' not in src:
+    tree = ast.parse(src)
+    imported = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "faceswapper.frame_order"
+        and any(alias.name == "ordered_swap_frames" for alias in node.names)
+        for node in ast.walk(tree)
+    )
+    called = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ordered_swap_frames"
+        for node in ast.walk(tree)
+    )
+    if not (imported and called):
+        fail("headless must delegate to frame_order.ordered_swap_frames")
+    if "_parallel_swap_frames" in src:
+        fail("legacy in-headless scheduler is still referenced")
+    if not any(
+        isinstance(node, ast.Constant) and node.value == "Per-Thread"
+        for node in ast.walk(tree)
+    ):
         fail("workers > 1 must switch to Per-Thread sessions")
-    print("  ok  parallel frames keep decode order with Per-Thread sessions")
+    print("  ok  parallel path delegates to frame_order with Per-Thread sessions")
 
 
 def test_format_elapsed() -> None:
@@ -170,6 +195,394 @@ def test_format_elapsed() -> None:
         if got != expected:
             fail(f"_format_elapsed({seconds}) = {got!r}, expected {expected!r}")
     print("  ok  elapsed time is formatted as HH:MM:SS.s")
+
+
+def test_format_avg_fps() -> None:
+    """avg fps 用实际帧数 / 耗时，除零与缺帧数一律不输出。"""
+    cases = [
+        (4731, 154.6, " (avg 30.6 fps)"),
+        (100, 10.0, " (avg 10.0 fps)"),
+        (0, 10.0, ""),          # 没处理任何帧
+        (None, 10.0, ""),       # swap 子命令没有帧数
+        (100, 0.0, ""),         # 零耗时
+        (100, -1.0, ""),        # 时钟异常
+        (-5, 10.0, ""),         # 帧数异常
+    ]
+    for frames, seconds, expected in cases:
+        got = _format_avg_fps(frames, seconds)
+        if got != expected:
+            fail(
+                f"_format_avg_fps({frames}, {seconds}) = {got!r}, "
+                f"expected {expected!r}"
+            )
+    print("  ok  avg fps handles zero frames / zero seconds / rounding")
+
+
+def test_format_profile() -> None:
+    """分段耗时按固定顺序输出，缺的段补 0.00s。"""
+    got = _format_profile({"encode": 3.0, "decode": 1.234, "swap": 2.0})
+    expected = "profile: decode=1.23s swap=2.00s encode=3.00s"
+    if got != expected:
+        fail(f"unexpected profile line: {got!r}, expected {expected!r}")
+    got = _format_profile({})
+    expected = "profile: decode=0.00s swap=0.00s encode=0.00s"
+    if got != expected:
+        fail(f"missing segments must be zeroed: {got!r}")
+    print("  ok  profile line keeps segment order and defaults")
+
+
+def test_video_profile_flag() -> None:
+    """--profile 默认关闭，且只挂在 video 子命令上。"""
+    parser = build_parser()
+    plain = parser.parse_args([
+        "video", "--source", "face.jpg",
+        "--target", "in.mp4", "--output", "out.mp4",
+    ])
+    assert plain.profile is False, plain.profile
+    profiled = parser.parse_args([
+        "video", "--source", "face.jpg",
+        "--target", "in.mp4", "--output", "out.mp4",
+        "--profile",
+    ])
+    assert profiled.profile is True, profiled.profile
+    print("  ok  --profile defaults off and is accepted by video")
+
+
+def test_stage3_flags() -> None:
+    """阶段 3 两个开关默认关闭，且 --arena-strategy 属于公共参数。"""
+    parser = build_parser()
+    base = ["video", "--source", "face.jpg", "--target", "in.mp4",
+            "--output", "out.mp4"]
+    plain = parser.parse_args(base)
+    assert plain.defer_d2h is False, plain.defer_d2h
+    assert plain.arena_strategy == "same", plain.arena_strategy
+
+    tuned = parser.parse_args(base + [
+        "--defer-d2h", "--arena-strategy", "pow2", "--workers", "4",
+    ])
+    assert tuned.defer_d2h is True, tuned.defer_d2h
+    assert tuned.arena_strategy == "pow2", tuned.arena_strategy
+    assert tuned.workers == 4, tuned.workers
+
+    # add_common 参数：图片换脸也能选显存策略。
+    image = parser.parse_args([
+        "swap", "--source", "a.jpg", "--target", "b.jpg",
+        "--output", "o.png", "--arena-strategy", "pow2",
+    ])
+    assert image.arena_strategy == "pow2", image.arena_strategy
+    print("  ok  --defer-d2h / --arena-strategy default off and parse correctly")
+
+
+def test_video_encoder_flag() -> None:
+    """--encoder 默认 libx264，nvenc 需显式选择。"""
+    parser = build_parser()
+    base = ["video", "--source", "face.jpg", "--target", "in.mp4",
+            "--output", "out.mp4"]
+    assert parser.parse_args(base).encoder == "libx264"
+    assert parser.parse_args(base + ["--encoder", "nvenc"]).encoder == "nvenc"
+    print("  ok  --encoder defaults to libx264 and accepts nvenc")
+
+
+def test_force_recognize_flag() -> None:
+    """--force-recognize 默认关闭，是逐脸识别路径的回滚开关。"""
+    parser = build_parser()
+    base = ["video", "--source", "face.jpg", "--target", "in.mp4",
+            "--output", "out.mp4"]
+    assert parser.parse_args(base).force_recognize is False
+    assert parser.parse_args(
+        base + ["--force-recognize"]
+    ).force_recognize is True
+    print("  ok  --force-recognize defaults off and restores the old path")
+
+
+def test_recognize_wiring() -> None:
+    """跳过判定必须委托给可测试的 recognize.py，且 face_emb 有 None 兜底。"""
+    import ast
+
+    src = (Path(__file__).resolve().parents[1] / "VideoManager.py").read_text(
+        encoding="utf-8")
+    tree = ast.parse(src)
+    imported = any(
+        isinstance(node, ast.ImportFrom)
+        and node.module == "faceswapper.recognize"
+        and any(alias.name == "should_skip_recognize" for alias in node.names)
+        for node in ast.walk(tree)
+    )
+    called = any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "should_skip_recognize"
+        for node in ast.walk(tree)
+    )
+    if not (imported and called):
+        fail("VideoManager must delegate the skip decision to recognize.py")
+    has_none_default = any(
+        isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "face_emb"
+                for t in node.targets)
+        and isinstance(node.value, ast.Constant)
+        and node.value.value is None
+        for node in ast.walk(tree)
+    )
+    if not has_none_default:
+        fail("skipped faces must still carry a face_emb placeholder")
+    called_attrs = {
+        node.func.attr for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    if "run_recognize" not in called_attrs:
+        fail("the recognize path was removed entirely instead of gated")
+    print("  ok  recognize policy is delegated, gated and keeps the old path")
+
+
+def test_sync_red_lines_preserved() -> None:
+    """阶段 3 的红线：不能删 syncvec drain、wait_stream 或 stream 绑定。
+
+    用 AST 而不是普通子串匹配，避免注释里的字样把检查骗过去。
+    """
+    import ast
+
+    root = Path(__file__).resolve().parents[1]
+
+    def parse(name):
+        return ast.parse((root / name).read_text(encoding="utf-8"))
+
+    def called_attrs(tree):
+        return {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        }
+
+    models = parse("Models.py")
+    syncvec_drains = sum(
+        1 for node in ast.walk(models)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "cpu"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "syncvec"
+    )
+    if syncvec_drains < 1:
+        fail("Models.syncvec.cpu() drain was removed (red line)")
+    if "user_compute_stream" not in {
+        node.value for node in ast.walk(models)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }:
+        fail("user_compute_stream binding was removed (red line)")
+    if "set_arena_strategy" not in called_attrs(parse("headless.py")):
+        fail("arena strategy is not wired into the swapper base")
+    if not any(
+        isinstance(node, ast.Attribute) and node.attr == "_arena_strategy"
+        for node in ast.walk(models)
+    ):
+        fail("_cuda_ep_provider_options still hardcodes the arena strategy")
+
+    vm = parse("VideoManager.py")
+    if "wait_stream" not in called_attrs(vm):
+        fail("default_stream.wait_stream() was removed (red line)")
+    print("  ok  CUDA sync drains / stream binding / arena wiring are intact")
+
+
+def test_video_encode_thread_flag() -> None:
+    """--encode-thread 默认关闭，只挂在 video 子命令上。"""
+    parser = build_parser()
+    plain = parser.parse_args([
+        "video", "--source", "face.jpg",
+        "--target", "in.mp4", "--output", "out.mp4",
+    ])
+    assert plain.encode_thread is False, plain.encode_thread
+    threaded = parser.parse_args([
+        "video", "--source", "face.jpg",
+        "--target", "in.mp4", "--output", "out.mp4",
+        "--encode-thread",
+    ])
+    assert threaded.encode_thread is True, threaded.encode_thread
+    # 与其它 video 开关可以叠加，不互相覆盖。
+    both = parser.parse_args([
+        "video", "--source", "face.jpg",
+        "--target", "in.mp4", "--output", "out.mp4",
+        "--encode-thread", "--workers", "4", "--profile",
+    ])
+    assert both.workers == 4 and both.profile is True, both
+    print("  ok  --encode-thread defaults off and composes with other flags")
+
+
+def test_main_reports_avg_fps() -> None:
+    """main() 只在 video 成功结束后把 avg fps 拼到 elapsed 行上。"""
+    import argparse
+    import contextlib
+    import io
+    from unittest import mock
+
+    import faceswapper.cli as cli
+
+    def run(command: str, func) -> tuple[int, str]:
+        parser = mock.Mock()
+        parser.parse_args.return_value = argparse.Namespace(
+            command=command, func=func,
+        )
+        buf = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.object(cli, "build_parser", return_value=parser), \
+                contextlib.redirect_stdout(buf), \
+                contextlib.redirect_stderr(err):
+            rc = cli.main([])
+        return rc, buf.getvalue()
+
+    def fake_video(args) -> int:
+        args._processed_frames = 100
+        return 0
+
+    rc, out = run("video", fake_video)
+    if rc != 0 or "elapsed:" not in out or "(avg " not in out:
+        fail(f"video should report avg fps, got rc={rc} out={out!r}")
+
+    rc, out = run("swap", lambda args: 0)
+    if rc != 0 or "elapsed:" not in out or "avg " in out:
+        fail(f"swap must not report avg fps, got rc={rc} out={out!r}")
+
+    def failed_video(args) -> int:
+        raise HeadlessError("boom")
+
+    rc, out = run("video", failed_video)
+    if rc != 2 or "elapsed:" in out:
+        fail(f"a failed run must not report elapsed, got rc={rc} out={out!r}")
+    print("  ok  elapsed line carries avg fps for video only, never on failure")
+
+
+def test_all_new_video_flags_compose() -> None:
+    """所有新开关同时给出时不能互相覆盖，也不能被 argparse 判成歧义。"""
+    parser = build_parser()
+    args = parser.parse_args([
+        "--models", "./models",
+        "video", "--source", "face.jpg", "--target", "in.mp4",
+        "--output", "out.mp4",
+        "--workers", "4", "--profile", "--encode-thread", "--defer-d2h",
+        "--force-recognize", "--encoder", "nvenc",
+        "--arena-strategy", "pow2", "--crf", "23", "--preset", "fast",
+        "--every-nth", "2", "--no-audio", "--backend", "cuda",
+    ])
+    expected = {
+        "workers": 4, "profile": True, "encode_thread": True,
+        "defer_d2h": True, "force_recognize": True, "encoder": "nvenc",
+        "arena_strategy": "pow2", "crf": 23, "preset": "fast",
+        "every_nth": 2, "no_audio": True, "backend": "cuda",
+    }
+    for key, value in expected.items():
+        got = getattr(args, key)
+        if got != value:
+            fail(f"{key} = {got!r}, expected {value!r}")
+    print("  ok  all new video switches parse together without clobbering")
+
+
+def test_switch_defaults_match_baseline() -> None:
+    """不传新开关时，除 recognize 跳过外所有默认值都回到基线。
+
+    唯一默认生效的变化是 ``--force-recognize=False`` —— 它让没有读取方的
+    逐脸 ArcFace 推理被跳过（像素输出不变，但 ORT 调用次数变了）。这里把
+    事实钉住，避免有人误以为所有新功能都默认关闭。
+    """
+    parser = build_parser()
+    args = parser.parse_args([
+        "video", "--source", "face.jpg", "--target", "in.mp4",
+        "--output", "out.mp4",
+    ])
+    defaults = {
+        "workers": 1, "profile": False, "encode_thread": False,
+        "defer_d2h": False, "force_recognize": False,
+        "encoder": "libx264", "arena_strategy": "same",
+        "crf": 18, "preset": "medium", "every_nth": 1,
+        "no_audio": False, "backend": "cuda",
+    }
+    for key, value in defaults.items():
+        got = getattr(args, key)
+        if got != value:
+            fail(f"default {key} = {got!r}, expected baseline {value!r}")
+    print("  ok  switch defaults match baseline (recognize skip is the one change)")
+
+
+def test_docs_stay_in_sync() -> None:
+    """README 必须提到每个 video flag；本地 CLAUDE.md 要列全测试模块。
+
+    这是收尾防漂移检查：新增开关却忘了写文档，比代码本身出错更难发现。
+    CLAUDE.md 被 .gitignore 忽略、克隆环境里可能不存在，所以只在存在时查。
+    """
+    root = Path(__file__).resolve().parents[2]
+    parser = build_parser()
+    sub = parser._subparsers._group_actions[0]
+    video = sub.choices["video"]
+    readme = (root / "README.md").read_text(encoding="utf-8")
+    for action in video._actions:
+        for opt in action.option_strings:
+            if opt in ("-h", "--help"):
+                continue
+            if opt not in readme:
+                fail(f"{opt} is missing from README.md")
+
+    claude_path = root / "CLAUDE.md"
+    if claude_path.exists():
+        claude = claude_path.read_text(encoding="utf-8")
+        for path in sorted(Path(__file__).resolve().parent.glob("test_*.py")):
+            dotted = f"faceswapper.tests.{path.stem}"
+            if dotted not in claude:
+                fail(f"{dotted} is missing from CLAUDE.md")
+    print("  ok  README covers every video flag and the test list is complete")
+
+
+def test_headless_module_syntax() -> None:
+    """headless.py 需要 GPU 栈才能 import，但改动后语法必须仍可解析。
+
+    这里只做 ast.parse，不触发任何第三方依赖，用来兜住 _encode_video 这类
+    本地无法实际执行的核心循环改动。
+    """
+    import ast
+
+    src = (Path(__file__).resolve().parents[1] / "headless.py").read_text(
+        encoding="utf-8")
+    try:
+        tree = ast.parse(src)
+    except SyntaxError as exc:
+        fail(f"headless.py has a syntax error: {exc}")
+    names = {
+        node.name for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for required in (
+        "_encode_video", "_encode_via_thread", "_swap_frame",
+        "_finalize_frame",
+    ):
+        if required not in names:
+            fail(f"headless.py is missing {required}()")
+
+    # CLI 会把这些 flag 传进 dataclass；字段缺失要到运行时才 TypeError，
+    # 这里用 AST 提前兜住。
+    classes = {
+        node.name: node for node in tree.body
+        if isinstance(node, ast.ClassDef)
+    }
+    expected_fields = {
+        "SwapOptions": ("arena_strategy",),
+        "VideoOptions": (
+            "profile", "encode_thread", "defer_d2h", "force_recognize",
+            "encoder", "workers",
+        ),
+    }
+    for cls_name, required in expected_fields.items():
+        cls = classes.get(cls_name)
+        if cls is None:
+            fail(f"headless.py is missing {cls_name}")
+        fields = {
+            node.target.id
+            for node in cls.body
+            if isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+        }
+        for field in required:
+            if field not in fields:
+                fail(f"{cls_name} is missing field {field!r}")
+    print("  ok  headless.py parses and keeps the frame-pipeline wiring")
 
 
 def test_model_command_flags() -> None:
@@ -334,8 +747,22 @@ def main() -> int:
     test_collect_expands_folders()
     test_video_parser_flags()
     test_video_workers_flag()
-    test_parallel_path_preserves_order()
+    test_parallel_path_wiring()
     test_format_elapsed()
+    test_format_avg_fps()
+    test_format_profile()
+    test_video_profile_flag()
+    test_video_encode_thread_flag()
+    test_stage3_flags()
+    test_force_recognize_flag()
+    test_video_encoder_flag()
+    test_recognize_wiring()
+    test_sync_red_lines_preserved()
+    test_main_reports_avg_fps()
+    test_headless_module_syntax()
+    test_all_new_video_flags_compose()
+    test_switch_defaults_match_baseline()
+    test_docs_stay_in_sync()
     test_model_command_flags()
     test_video_extensions_cover_common_containers()
     test_feature_flags_map_to_parameters()

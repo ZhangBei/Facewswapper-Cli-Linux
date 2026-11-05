@@ -721,8 +721,8 @@ python -m faceswapper.cli --models ./models video \
 | 方案 | 效果 | 状态 |
 |---|---|---|
 | `--workers N` 多 worker 并行帧 | GPU 利用率和显存随 N 上升 | **已实现，默认关闭** |
-| 编码移到独立线程，与推理重叠 | 进一步解除 CPU 编码阻塞 | 未实现，可与上者叠加 |
-| 跨帧 batch 推理 / NVENC 硬件编码 | 上限最高 | 未实现，可能影响 PTS 与画质 |
+| 编码移到独立线程，与推理重叠 | 进一步解除 CPU 编码阻塞 | **已实现（`--encode-thread`），默认关闭** |
+| 跨帧 batch 推理 | 上限最高 | 未实现，可能影响 PTS 与画质 |
 
 `--workers > 1` 会启用 Per-Thread session，此时不要打开 `OrientAutoSwitch`
 （自动朝向）：它维护跨帧共享状态，多线程下会竞态。默认参数是关闭的，
@@ -731,22 +731,136 @@ python -m faceswapper.cli --models ./models video \
 先用 `nvidia-smi dmon -s u -d 1` 看利用率是否周期性归零：归零说明还卡在
 CPU 编码或同步上，此时叠加 `--preset ultrafast` 收益更明显。
 
+#### 编码独立线程 `--encode-thread`
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target input.mp4 --output output.mp4 \
+    --workers 4 --encode-thread --profile
+```
+
+主线程按解码顺序把帧投进有界队列（`maxsize=2*workers`），编码线程按 FIFO
+取用并负责创建、使用和关闭全部 PyAV 对象；因此 PTS、VFR 时序、音画对齐
+和逐帧输出顺序与串行路径一致，进度回调也仍按序触发。编码线程出错会写回
+异常并置停止标志，主线程立即中断，不会静默产出半个视频。
+
+可与 `--workers` 叠加，但**默认关闭，不传该参数即走原来的主线程编码路径**，
+不需要回滚代码。配合 `--profile` 看 `encode=` 占总用时的比例再决定是否值得
+开启：`--workers > 1` 的 2N 有序窗口已经让编码与推理部分重叠，PyAV 的
+libx264 编码是否在 C 层释放 GIL 也尚未验证，因此收益不确定，甚至可能为负。
+离线测试覆盖了队列保序、flush、异常传播与背压；**真机性能尚未验证**。
+
+#### 阶段 3：延迟 D2H 与显存策略
+
+两个默认关闭的开关，**都不删除任何 CUDA 同步**：
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target input.mp4 --output output.mp4 \
+    --workers 4 --defer-d2h --arena-strategy pow2
+```
+
+- `--defer-d2h`：把逐帧 `.cpu().numpy()` 从 worker 线程挪到帧的消费侧，
+  worker 不再被 D2H 阻塞。仅 `--workers > 1` 生效，串行路径自动忽略。
+  `VideoManager.swap_video` 里的 `default_stream().wait_stream(worker_stream)`
+  仍保证拷贝读到已写完的缓冲，`Models` 里的 `syncvec.cpu()` 与
+  `user_compute_stream` 保持原样。
+- `--arena-strategy pow2`：CUDA EP 的 `arena_extend_strategy` 从
+  `kSameAsRequested` 换成 `kNextPowerOfTwo`。它只减少重复 `cudaMalloc`、
+  让 VRAM 占用数字变大，**不是提速手段**（所有命令均可用）。
+
+与实施方案的差别：D2H 推迟到**帧的消费侧（主线程）**而非编码线程，顺序继续
+靠已有的 `wait_stream`，没有新增 CUDA event、也没有把 stream 对象跨线程传递，
+因此 `encoder.py` 仍是 stdlib-only。代价是收益可能低于预期：D2H 仍在主线程
+串行，跨 worker 的默认 stream 隐式屏障也还在。开启 `--defer-d2h` 时，D2H
+耗时不计入 `--profile` 的三段。方案原本要求先用 nsys 确认 host stall，本次
+只交付代码、未做该验证；不传这两个开关即回到原行为。
+
+#### 阶段 4：跳过无用的逐脸识别
+
+单帧多脸 batch（方案 7.1）的代码已按「先编写、不启用」落地：由
+`EXPERIMENTAL_FACE_BATCH=False` 闸门挡住，`_swap_video_inner` 不调用它，
+默认输出与基线逐字一致。之所以不能直接启用：paste-back 虽只作用于该脸
+bbox，但 `run_swapper_batched` 的 N 是 polyphase phase 数而非脸数、
+`pipeline_size` 逐脸不同、`swap_core` 是 438 行单体函数，且输入 warp 会从
+已被前一张脸写回的 `img` 采样——预批量准备会改变重叠人脸的像素。因此
+`face_batch.py` 强制要求 bbox 两两不重叠、只用 `inswapper-128`、关闭多 pass
+开关，任一不满足就回退逐脸路径。五条完整依据与解冻步骤见
+[docs/gpu-utilization-plan.md 7.1](docs/gpu-utilization-plan.md)。
+
+改实现了一条逻辑等价、改动更小的优化：headless video 未指定 `--target-face`
+时，所有检测到的人脸都换成同一个 `--source` 身份，逐帧 `run_recognize` 算出的
+embedding **没有任何读取方**。现在默认跳过这些调用，每帧少 N 次 ArcFace 推理
+（N = 检测到的脸数），像素输出完全不变。
+
+```bash
+# 退回旧路径，便于 A/B 或排查
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target input.mp4 --output output.mp4 --force-recognize
+```
+
+指定 `--target-face` 时会自动照常计算 embedding（要按相似度筛人）；图片换脸走
+`found_faces` 匹配路径，同样不受影响。判定在 `recognize.py`，离线行为测试覆盖
+四种组合。真机收益未测。
+
+#### 阶段 5：NVENC 编码开关
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target input.mp4 --output output.mp4 --encoder nvenc
+```
+
+默认 `--encoder libx264`，行为与之前逐字一致。选择 `nvenc` 时会先探测当前
+PyAV/FFmpeg 是否提供 `h264_nvenc`；不可用直接报错并给出修复提示，**不会静默
+回退**。`--encode-thread` 与默认编码路径共用同一个编码器选择结果。
+
+参数**不是等价替换**：x264 的 `--crf` 映射成 NVENC 的 `cq`（配合 `rc=vbr`），
+`--preset` 的六档映射成 `p1..p7`。CRF 与 CQ 的率控行为不同，`p1..p7` 也不是
+x264 档位的一一对应；较旧的 FFmpeg 可能不认 `p1..p7`，遇到未知 preset 请回退
+`--encoder libx264`。NVENC 是独立硬件单元，**不提高 CUDA SM 利用率**，只解除
+CPU 编码瓶颈；PyAV 目前仍吃 CPU `rgb24` frame，那次 D2H 并没有省掉。
+
+GPU 常驻解码（torchcodec）仍未实现。真机可用性、`p1..p7` 是否被当前 FFmpeg
+接受、画质与体积对比均未验证。
+
 完整的分阶段实施方案（现状瓶颈、详细实现步骤、验收清单、风险与回滚）见
 [docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md)。
 
 #### 完成后的总用时
 
 换脸命令成功结束后会打印整条命令的总用时（从参数校验、模型准备、源特征
-提取到编码与音频 mux），格式为 `HH:MM:SS.s`：
+提取到编码与音频 mux），格式为 `HH:MM:SS.s`。视频命令还会附带平均处理速度：
 
 ```text
 frame 4731/4731 (100.0%)
 done: 4731 frame(s) at 24.000 fps, 720x1280, audio=yes -> output.mp4
-elapsed: 00:02:34.6
+elapsed: 00:02:34.6 (avg 30.6 fps)
 ```
 
-图片换脸 `swap` 同样会在末尾打印这一行；失败或 `Ctrl+C` 中断时不打印，
-避免把半个任务的时间误报成一次完整运行。
+`avg fps` 用的是编码循环实际消费的帧数，不是容器声明的 `stream.frames`
+（后者可能为 0，或只是按 duration 估算的值），因此不受元数据缺失影响。
+图片换脸 `swap` 没有帧数概念，只打印 `elapsed:`；失败或 `Ctrl+C` 中断时
+不打印，避免把半个任务的时间误报成一次完整运行。
+
+#### 分段计时 `--profile`
+
+`video` 加 `--profile` 会在结束时额外打印三段累计耗时：
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target input.mp4 --output output.mp4 --profile
+```
+
+```text
+done: 4731 frame(s) at 24.000 fps, 720x1280, audio=yes -> output.mp4
+profile: decode=12.40s swap=131.20s encode=18.30s
+elapsed: 00:02:34.6 (avg 30.6 fps)
+```
+
+`decode` 是取帧、`to_ndarray` 与 PTS 计算，`swap` 是逐帧换脸，`encode` 是
+编码与 mux。`--workers > 1` 时三段在不同线程上重叠，之和会大于总用时——
+它用来判断瓶颈落在哪一段，不要相加。默认关闭；关闭时计时逻辑只多一次
+布尔判断，不改变推理与编码行为。
 
 ### 3.4 参数总览
 
@@ -783,6 +897,7 @@ python -m faceswapper.cli \
 | `--swapper-model` | `inswapper-128`/`inswapper-256`/`inswapper-512`/`hyperswap-256` | `inswapper-128` |
 | `--color-match` | 启用 LAB 色彩匹配 | 关闭 |
 | `--backend` | `cuda`（纯 CUDA EP，不尝试 TensorRT）或 `trt`（需 TensorRT 10 运行时） | `cuda` |
+| `--arena-strategy` | `same`（按需分配）或 `pow2`（减少重复 `cudaMalloc`，只是让 VRAM 数字变大，不是提速手段） | `same` |
 
 > **`--detect-input-size` 不要随便调小。** 它只影响检测器输入分辨率，
 > 不影响换脸质量——调小是纯速度交易：`480` ≈ 1.8× 快，`416` ≈ 2.4×，
@@ -828,9 +943,14 @@ python -m faceswapper.cli --models ./models swap \
 | `--output` | 输出视频文件 | 必填 |
 | `--crf` | H.264 质量，越低越好 | `18` |
 | `--preset` | x264 档位 | `medium` |
+| `--encoder` | `libx264`（默认）或 `nvenc`（需探测 `h264_nvenc` 可用） | `libx264` |
 | `--no-audio` | 不复制源音频轨 | 关闭 |
 | `--every-nth` | 只处理第 N 帧，其余透传 | `1` |
 | `--workers` | 并行处理帧的 worker 数，`>1` 时各 worker 独占一份模型 session | `1` |
+| `--profile` | 打印 decode / swap / encode 分段累计耗时 | 关闭 |
+| `--encode-thread` | 把编码移到独立线程，与换脸推理解耦 | 关闭 |
+| `--defer-d2h` | 把逐帧 GPU→CPU 拷贝从 worker 推迟到帧的消费侧（仅 `--workers > 1` 生效） | 关闭 |
+| `--force-recognize` | 保留每帧逐脸 ArcFace 推理的旧路径（回滚 / A/B 用） | 关闭 |
 
 查看全部已知参数及默认值：
 

@@ -8,6 +8,8 @@ from math import floor, ceil
 
 from faceswapper.parameters import default_values
 from faceswapper._nvtx import nvtx_range
+from faceswapper.face_batch import FaceCandidate, batch_eligibility
+from faceswapper.recognize import should_skip_recognize
 
 
 import onnxruntime
@@ -21,6 +23,12 @@ torch.set_grad_enabled(False)
 onnxruntime.set_default_logger_severity(1)
 
 device = 'cuda'
+
+# 阶段 4 的 7.1 单帧多脸 batch 的闸门。代码已编写，但**默认不启用**：
+# _swap_video_inner 不调用 swap_core_batched，闸门关闭时该方法直接拒绝执行。
+# 解冻前必须在 GPU 环境用多人脸视频做与逐脸路径的 PSNR 比对，确认像素一致。
+# 完整阻断条件见 docs/gpu-utilization-plan.md 7.1。
+EXPERIMENTAL_FACE_BATCH = False
 
 
 def _rgb_chw_to_lab(rgb: torch.Tensor) -> torch.Tensor:
@@ -128,6 +136,10 @@ class VideoManager():
         # 检测脸才会被换。None 表示"换掉每一张检测到的脸"。
         self.target_face_embeddings: list[np.ndarray] | None = None
         self.target_face_threshold: float = 55.0
+        # True = 显式保留每帧逐脸 run_recognize 的旧路径（--force-recognize）。
+        # 默认 False：headless video 且未指定 --target-face 时，那些 embedding
+        # 没有任何读取方，跳过可省掉每帧 N 次 ArcFace 推理。
+        self.force_recognize: bool = False
 
         # 自动朝向状态（OrientAutoSwitch）。`detected_orient_angle` 是 4 向
         # 探测缓存下来的胜出旋转（None = 下一帧重新探测）。
@@ -402,10 +414,23 @@ class VideoManager():
                         self.orient_fine_angle = 0.9 * self.orient_fine_angle + 0.1 * tilt
                 except (IndexError, TypeError, ValueError):
                     pass
-        # 给画面里所有检测到的脸算 embedding
+        # 给画面里所有检测到的脸算 embedding。
+        # headless video 且未指定 --target-face 时，下面的分支只把同一个
+        # force_source_embedding 贴到所有检测到的脸上，face_emb 没有任何
+        # 读取方——跳过每帧 N 次 run_recognize 的 ORT 调用，像素输出不变。
+        # 图片 / GUI 的 found_faces 匹配路径、以及 --target-face 的相似度
+        # 筛选都要真的读 embedding，照常计算。判定抽到 recognize.py 以便
+        # 脱离 GPU 栈做行为测试。
+        skip_recognize = should_skip_recognize(
+            force_source=self.force_source_embedding,
+            targets=self.target_face_embeddings,
+            opt_out=self.force_recognize,
+        )
         ret = []
         for face_kps in kpss:
-            face_emb, _ = self.models.run_recognize(img, face_kps)
+            face_emb = None
+            if not skip_recognize:
+                face_emb, _ = self.models.run_recognize(img, face_kps)
             ret.append([face_kps, face_emb])
         
         if ret and self.force_source_embedding is not None:
@@ -496,7 +521,10 @@ class VideoManager():
 
 
     # @profile
-    def swap_core(self, img, kps, s_e, parameters, precomputed_latent=None, slot=None): # img = RGB
+    def swap_core(self, img, kps, s_e, parameters, precomputed_latent=None,
+                  slot=None, batch_slot=None):  # img = RGB
+        """换一张脸。``batch_slot`` 是阶段 4 的 7.1 实验钩子，默认 None——
+        现有逐脸路径只多一次 bool 判断，行为逐字不变。"""
         # "inswapper-512" 选中 inswapper_512 模型：单次前向吃下完整 512x512
         # 脸部裁剪，不做 polyphase 分解。
         # "inswapper-256" 用专门的单次 pass inswapper_256_phase1；
@@ -653,6 +681,28 @@ class VideoManager():
             poly_pass = self._hyperswap_pass
         else:
             poly_pass = self._polyphase_pass_v1
+
+        # ===== 实验性钩子：阶段 4 的 7.1 单帧多脸 batch ==================
+        # 只有 swap_core_batched 会传 batch_slot；闸门未打开时无人调用。
+        # prepare 阶段在写回 img 之前把对齐裁剪填进 batch buffer 就返回；
+        # finish 阶段把 poly_pass 换成只读批输出的闭包，让下面 *255/clamp
+        # 与 735 行之后的全部 postprocess 原样复用，不复制第二套实现。
+        if batch_slot is not None:
+            index = batch_slot["index"]
+            if batch_slot["mode"] == "prepare":
+                # (H, W, 3) 0-1 -> (3, H, W)；此时 img 尚未被任何脸写回。
+                batch_slot["input"][index].copy_(
+                    swap_face_input.permute(2, 0, 1)
+                )
+                batch_slot["bbox"] = self._face_bbox(
+                    img.shape, tform, pipeline_size,
+                )
+                batch_slot["pipeline_size"] = pipeline_size
+                return None
+            # finish：itex 必须为 1、HF 2-pass 必须关闭，两者由
+            # face_batch.batch_eligibility 保证。
+            def poly_pass(_inp, _latent, _dim, _size, _params):
+                return batch_slot["output"][index].permute(1, 2, 0).clone()
 
         for k in range(itex):
             with nvtx_range(f"sc_polypass[k={k}]"):
@@ -925,6 +975,103 @@ class VideoManager():
             img[0:3, top:bottom, left:right] = swap  
 
         return img
+
+    # ===== 阶段 4 的 7.1：单帧多脸 batch（实验性，未启用） ===============
+
+    @staticmethod
+    def _face_bbox(img_shape, tform, pipeline_size):
+        """算 paste_back 会写回的矩形 ``(left, top, right, bottom)``。
+
+        与 ``swap_core`` 的 paste_back 段是同一套算法。实验性 batch 的
+        prepare 阶段必须在写回之前就知道 bbox，用来判定人脸是否重叠。
+        **改动 paste_back 的 bbox 计算时必须同步这里。**
+        """
+        IM512 = tform.inverse.params[0:2, :]
+        corners = np.array([
+            [0, 0], [0, pipeline_size - 1],
+            [pipeline_size - 1, 0], [pipeline_size - 1, pipeline_size - 1],
+        ])
+        x = (IM512[0][0] * corners[:, 0]
+             + IM512[0][1] * corners[:, 1] + IM512[0][2])
+        y = (IM512[1][0] * corners[:, 0]
+             + IM512[1][1] * corners[:, 1] + IM512[1][2])
+        left = max(0, floor(np.min(x)))
+        top = max(0, floor(np.min(y)))
+        right = min(img_shape[2], ceil(np.max(x)))
+        bottom = min(img_shape[1], ceil(np.max(y)))
+        return left, top, right, bottom
+
+    def swap_core_batched(self, img, faces, s_e, parameters):
+        """把一帧里的 N 张脸合成一次 swapper 前向，返回 ``(img, status)``。
+
+        **当前不启用**：``EXPERIMENTAL_FACE_BATCH=False``，且
+        ``_swap_video_inner`` 不会调用本方法。解冻前必须在 GPU 环境用多人脸
+        视频做与逐脸路径的 PSNR 比对；五条阻断条件见
+        ``docs/gpu-utilization-plan.md`` 7.1。
+
+        思路：第一遍 ``prepare`` 只填 batch 输入、收集 bbox，完全不写回 img；
+        中间一次 ``run_swapper_batched``；第二遍 ``finish`` 按原顺序把各脸的
+        输出喂回 ``swap_core`` 的 postprocess。这样 mask / restorer /
+        paste_back 全部复用原有 190 行，不必复制第二套实现。
+
+        bbox 两两不重叠是硬条件：finish 阶段重算 ``pipeline_input_face`` 时
+        读到的 img 已被前面的脸写回，重叠时与逐脸路径不再等价。
+        """
+        if not EXPERIMENTAL_FACE_BATCH:
+            raise RuntimeError(
+                "single-frame multi-face batch is experimental and disabled; "
+                "see docs/gpu-utilization-plan.md section 7.1"
+            )
+
+        n = len(faces)
+        swapper_type = str(parameters['SwapperTypeTextSel'])
+        latent_scale = float(parameters.get('LikenessSlider', 100)) / 100.0
+        extrap_amount = float(parameters.get('EmbExtrapSlider', 0)) / 100.0
+        latent = self._get_latent_for(
+            s_e, scale=latent_scale, extrap_amount=extrap_amount,
+            latent_mode='emap',
+        )
+
+        # 128 inswapper 的固定输入形状。判据会拒绝 pipeline_size != 128 的脸，
+        # 所以这里的 copy_ 形状一定吻合。
+        batch_in = torch.empty(
+            (n, 3, 128, 128), dtype=torch.float32, device='cuda',
+        )
+        batch_out = torch.empty_like(batch_in)
+        slots = []
+        for index, kps in enumerate(faces):
+            slot = {
+                "mode": "prepare", "index": index,
+                "input": batch_in, "output": batch_out,
+            }
+            self.swap_core(
+                img, kps, s_e, parameters,
+                precomputed_latent=latent, batch_slot=slot,
+            )
+            slots.append(slot)
+
+        ok, reason = batch_eligibility(
+            [FaceCandidate(s["bbox"], s["pipeline_size"]) for s in slots],
+            swapper_type=swapper_type,
+            parameters=parameters,
+        )
+        if not ok:
+            # prepare 阶段没有写回过 img，这里可以干净地退回逐脸路径。
+            for kps in faces:
+                img = self.swap_core(img, kps, s_e, parameters)
+            return img, f"fallback: {reason}"
+
+        # source 在所有脸之间共享，run_swapper_batched 只绑定 latent 的第 0 行。
+        self.models.run_swapper_batched(batch_in, latent, batch_out)
+
+        for index, kps in enumerate(faces):
+            slot = slots[index]
+            slot["mode"] = "finish"
+            img = self.swap_core(
+                img, kps, s_e, parameters,
+                precomputed_latent=latent, batch_slot=slot,
+            )
+        return img, "batched"
 
     # ------------------------------------------------------------------
     # Polyphase passes

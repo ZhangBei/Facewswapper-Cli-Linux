@@ -17,8 +17,8 @@ import os
 import shutil
 import subprocess
 import tempfile
-from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Any, Callable
@@ -28,7 +28,9 @@ import numpy as np
 import torch
 
 from faceswapper.EmbeddingMerge import combine
+from faceswapper.encoder_probe import EncoderPlan, resolve_encoder
 from faceswapper.errors import HeadlessError
+from faceswapper.frame_order import ordered_swap_frames
 from faceswapper.Models import Models
 from faceswapper.VideoManager import VideoManager
 
@@ -58,6 +60,9 @@ class SwapOptions:
     # Linux engine 缓存无法从 Windows 安装直接移植过来，所以除非明确要求，
     # CLI 保持用 CUDA EP。
     backend: str = "cuda"
+    # CUDA EP 的 VRAM arena 扩展策略：same（默认，kSameAsRequested）或 pow2
+    # （kNextPowerOfTwo）。后者只减少重复 cudaMalloc，不是提速手段。
+    arena_strategy: str = "same"
 
 
 def _read_image(path: str) -> np.ndarray:
@@ -98,6 +103,13 @@ class _SwapperBase:
         self.options = options
         self.models = Models()
         self.models.set_models_folder(options.models_folder)
+        # 阶段 3 的 6.2：必须在任何 session 懒加载之前设置，否则已构建的
+        # session 仍用旧策略。默认 same，只有显式 pow2 才切换。
+        self.models.set_arena_strategy(
+            "kNextPowerOfTwo"
+            if getattr(options, "arena_strategy", "same") == "pow2"
+            else "kSameAsRequested"
+        )
         if options.backend == "cuda":
             # 这里的 "onnx" 指的是 faceswapper.Models 里那条纯 CUDA
             # ExecutionProvider 路径，不是 CPU provider。这个命名继承自
@@ -110,6 +122,9 @@ class _SwapperBase:
             # 才能让它们各自占用 GPU（代价是每 worker 多一份显存）。
             self.models.set_model_session_mode("Per-Thread")
         self.vm = VideoManager(self.models)
+        self.vm.force_recognize = bool(
+            getattr(options, "force_recognize", False)
+        )
         self._apply_parameters()
 
     # -- 生命周期 ------------------------------------------------------------
@@ -329,6 +344,35 @@ class VideoOptions(SwapOptions):
     # 并行处理帧的 worker 数。1 = 原来的单线程串行路径；>1 时每个 worker
     # 各持有一份 ORT session 和一条 CUDA stream，GPU 与显存占用随之上升。
     workers: int = 1
+    # 打开分段计时，结束时输出 decode / swap / encode 的累计耗时。
+    # 关闭时计时代码只多一次 bool 判断，不改变任何推理与编码行为。
+    profile: bool = False
+    # 把编码搬进独立线程，让 CPU 编码与 GPU 推理解耦。默认关闭；关闭时
+    # _encode_video 走原来的主线程串行编码路径，输出与基线逐字一致。
+    encode_thread: bool = False
+    # 把 D2H（.cpu().numpy()）从 worker 线程推迟到帧的消费侧。只在
+    # workers > 1 时有意义：串行路径没有可解放的 worker。默认关闭。
+    # 不删除 swap_video 里的 wait_stream / Models 里的 syncvec 同步。
+    defer_d2h: bool = False
+    # True = 保留每帧逐脸 run_recognize 的旧路径，便于 A/B 与回滚。
+    # 默认 False：无用的 ArcFace 推理会被跳过（像素输出不变）。
+    force_recognize: bool = False
+    # 视频编码器：libx264（默认）或 nvenc（需探测 h264_nvenc 可用）。
+    encoder: str = "libx264"
+
+
+@dataclass
+class _EncodeResult:
+    """``_encode_video`` 的结果。
+
+    ``first_pts`` 供音频 mux 恢复视频流的起始偏移；``frames`` 是编码循环
+    实际消费的帧数（容器声明的 stream.frames 可能为 0 或只是估算值，不能
+    用来算吞吐）；``profile`` 未开启计时时为 None。
+    """
+
+    first_pts: int
+    frames: int
+    profile: dict[str, float] | None = None
 
 
 def _find_ffmpeg() -> str:
@@ -415,15 +459,15 @@ class VideoSwapper(_SwapperBase):
 
             with tempfile.TemporaryDirectory(prefix="faceswapper-video-") as tmp:
                 silent = os.path.join(tmp, "silent.mp4")
-                first_pts = self._encode_video(
+                encoded = self._encode_video(
                     av, container, stream, silent, width, height, fps,
                     total, on_progress,
                 )
                 # 源视频流的时间偏移，单位为秒。重建出的视频从 0 开始，
                 # 所以要把它挪回原视频相对音频所在的位置。
                 video_offset = (
-                    float(first_pts * stream.time_base)
-                    if first_pts and stream.time_base else 0.0
+                    float(encoded.first_pts * stream.time_base)
+                    if encoded.first_pts and stream.time_base else 0.0
                 )
                 audio_offset = self._stream_start_seconds(audio_stream)
                 self._mux_audio(
@@ -432,14 +476,20 @@ class VideoSwapper(_SwapperBase):
                     audio_offset=audio_offset,
                 )
 
-            return {
+            report = {
                 "output": output_path,
+                # 容器声明或按 duration 估算的帧数：done 行沿用原语义，不改。
                 "frames": total,
+                # 编码循环实际消费的帧数：容器不声明帧数时仍准确，供 avg fps 用。
+                "processed_frames": encoded.frames,
                 "fps": fps,
                 "width": width,
                 "height": height,
                 "audio": has_audio,
             }
+            if encoded.profile is not None:
+                report["profile"] = encoded.profile
+            return report
         finally:
             container.close()
             self.vm.force_source_embedding = None
@@ -489,13 +539,46 @@ class VideoSwapper(_SwapperBase):
         fps: float,
         total: int,
         on_progress: Callable[[int, int], None] | None,
-    ) -> int:
+    ) -> _EncodeResult:
         """解码每一帧、换脸，并按原始 PTS 编码。
 
         与按固定 `-r` 把原始帧灌给 ffmpeg 不同，这里保留每一帧的呈现
         时间戳。因此可变帧率源能保持自己的原始时序，拷贝过来的音频轨也与
         视频保持对齐。
+
+        ``--profile`` 打开时累加 decode / swap / encode 三段耗时。串行路径
+        下三段近似串行、之和接近总用时；workers > 1 时它们在不同线程上
+        重叠，之和会大于总用时，只能用来判断瓶颈落在哪一段，不要相加。
         """
+        profile = bool(getattr(self.options, "profile", False))
+        times: dict[str, float] = {"decode": 0.0, "swap": 0.0, "encode": 0.0}
+        times_lock = threading.Lock()
+        processed = 0
+        workers = min(8, max(1, int(getattr(self.options, "workers", 1))))
+        parallel = workers > 1
+        # 阶段 3 的 6.1：只有并行路径才有可解放的 worker；串行时推迟 D2H
+        # 没有意义，自动退回原行为。同步本身一个都不删。
+        defer_d2h = bool(getattr(self.options, "defer_d2h", False)) and parallel
+
+        def add_time(key: str, seconds: float) -> None:
+            # swap 由 ThreadPoolExecutor 的多个 worker 并发记账，累加必须
+            # 串行化；另两段只在主线程调用，共用这把锁的开销可忽略。
+            if not profile:
+                return
+            with times_lock:
+                times[key] += seconds
+
+        def timed_swap(rgb):
+            # 串行路径在 decoded() 里调用，并行路径由 ordered_swap_frames
+            # 调用；包一层让两条路径共用同一个计时入口，后者签名不用改。
+            if not profile:
+                return self._swap_frame(rgb, defer=defer_d2h)
+            t0 = time.monotonic()
+            try:
+                return self._swap_frame(rgb, defer=defer_d2h)
+            finally:
+                add_time("swap", time.monotonic() - t0)
+
         in_tb = in_stream.time_base
         if in_tb is None:
             in_tb = Fraction(1, 1000)
@@ -508,28 +591,20 @@ class VideoSwapper(_SwapperBase):
         # 改掉分辨率。
         pix_fmt = "yuv420p" if width % 2 == 0 and height % 2 == 0 else "yuv444p"
 
-        output = av.open(
-            silent_path, mode="w", format="mp4",
-            options={"movflags": "+faststart"},
+        # 阶段 5 的编码侧：解析 --encoder。libx264 分支不会触碰 av.codec，
+        # 只有显式 nvenc 才通过惰性 lambda 去探测 h264_nvenc；探测失败会
+        # 抛 HeadlessError，不静默回退成 libx264。
+        plan = resolve_encoder(
+            getattr(self.options, "encoder", "libx264"),
+            lambda name, mode: av.codec.Codec(name, mode),
+            crf=self.options.crf,
+            preset=self.options.preset,
         )
-        try:
-            # PyAV >= 14 要求 `rate` 是 Fraction，不能是 float。
-            out_stream = output.add_stream(
-                "libx264", rate=Fraction(fps).limit_denominator(1000000)
-            )
-            out_stream.width = width
-            out_stream.height = height
-            out_stream.pix_fmt = pix_fmt
-            out_stream.options = {
-                "crf": str(int(self.options.crf)),
-                "preset": str(self.options.preset),
-            }
-            # 保留源 time base，这样 PTS 值可以直接照抄，不累积舍入
-            # 误差。
-            out_stream.time_base = in_tb
-            out_tb = out_stream.time_base or in_tb
-            pts_scale = float(in_tb / out_tb)
 
+        # output 由实际使用的那条编码路径创建：默认路径在主线程创建，
+        # --encode-thread 路径在编码线程里创建（PyAV 对象不跨线程）。
+        output = None
+        try:
             # 给极少数不带 PTS 的帧准备的兜底步长。
             fallback_step = max(
                 1, int(round((1.0 / max(fps, 1e-6)) / float(in_tb)))
@@ -539,21 +614,29 @@ class VideoSwapper(_SwapperBase):
             first_source_pts: int | None = None
             next_pts: int | None = None
             step = max(1, int(self.options.every_nth))
-            workers = min(8, max(1, int(getattr(self.options, "workers", 1))))
-            parallel = workers > 1
+            encode_thread = bool(
+                getattr(self.options, "encode_thread", False)
+            )
 
             def decoded():
                 """按解码顺序产出 (index, rgb, pts)。
 
                 PTS 算法与串行路径完全一致；串行时换脸也在这里做，并行时
-                交给 _parallel_swap_frames 提前提交给 worker 线程池。
+                交给 ordered_swap_frames 提前提交给 worker 线程池。
                 """
                 nonlocal first_pts, first_source_pts, next_pts
                 index = 0
                 for frame in container.decode(in_stream):
+                    t0 = time.monotonic() if profile else 0.0
                     rgb = frame.to_ndarray(format="rgb24")
                     if not parallel and index % step == 0:
-                        rgb = self._swap_frame(rgb)
+                        # 串行换脸归 swap 段：先结清解码耗时，换完再重新起表，
+                        # 后面的 PTS 计算仍记回 decode，两段不会重复计数。
+                        if profile:
+                            add_time("decode", time.monotonic() - t0)
+                        rgb = timed_swap(rgb)
+                        if profile:
+                            t0 = time.monotonic()
                     if frame.pts is not None:
                         source_pts = int(frame.pts)
                         if first_source_pts is None:
@@ -572,16 +655,70 @@ class VideoSwapper(_SwapperBase):
                         pts = 0
                         first_source_pts = 0
                         next_pts = fallback_step
+                    if profile:
+                        add_time("decode", time.monotonic() - t0)
                     yield index, rgb, pts
                     index += 1
 
             frames = decoded()
             if parallel:
-                frames = self._parallel_swap_frames(
-                    frames, workers, step, self._swap_frame,
+                # 调度器刻意放在 stdlib-only 的 frame_order.py，保序行为
+                # 由 tests/test_frame_order.py 用假 swap_fn 做行为测试。
+                frames = ordered_swap_frames(
+                    frames, workers, step, timed_swap,
                 )
 
+            if defer_d2h:
+                # 阶段 3 的 6.1：把 D2H 从 worker 线程挪到帧的消费侧，
+                # worker 不再被 .cpu().numpy() 阻塞，可立刻接下一帧。
+                #
+                # 顺序仍由 VideoManager.swap_video 里的
+                # default_stream().wait_stream(worker_stream) 保证：消费侧的
+                # .cpu() 跑在默认 stream 上，一定读到已写完的缓冲。
+                # Models 里的 syncvec.cpu() 与 user_compute_stream 一个都没动，
+                # 这是文档 6.1 的红线。
+                #
+                # 这段 D2H 耗时不计入 --profile 的三段（既非解码、非 swap、
+                # 也非编码），开启后三段之和会更小于总用时。
+                frames = (
+                    (index, self._finalize_frame(rgb), pts)
+                    for index, rgb, pts in frames
+                )
+
+            if encode_thread:
+                # 编码线程自己创建/关闭 PyAV 对象；主线程只按序投递帧。
+                # decoded() 与 PTS 算法共用上面这一份，不复制第二套。
+                processed = self._encode_via_thread(
+                    av, frames, silent_path, width, height, fps, in_tb,
+                    pix_fmt, total, on_progress, workers,
+                    add_time if profile else None, plan,
+                )
+                return _EncodeResult(
+                    first_pts=first_pts if first_pts is not None else 0,
+                    frames=processed,
+                    profile=dict(times) if profile else None,
+                )
+
+            output = av.open(
+                silent_path, mode="w", format="mp4",
+                options={"movflags": "+faststart"},
+            )
+            # PyAV >= 14 要求 `rate` 是 Fraction，不能是 float。
+            out_stream = output.add_stream(
+                plan.codec, rate=Fraction(fps).limit_denominator(1000000)
+            )
+            out_stream.width = width
+            out_stream.height = height
+            out_stream.pix_fmt = pix_fmt
+            out_stream.options = dict(plan.stream_options)
+            # 保留源 time base，这样 PTS 值可以直接照抄，不累积舍入
+            # 误差。
+            out_stream.time_base = in_tb
+            out_tb = out_stream.time_base or in_tb
+            pts_scale = float(in_tb / out_tb)
+
             for index, rgb, pts in frames:
+                t0 = time.monotonic() if profile else 0.0
                 new_frame = av.VideoFrame.from_ndarray(
                     np.ascontiguousarray(rgb), format="rgb24",
                 )
@@ -589,7 +726,10 @@ class VideoSwapper(_SwapperBase):
                 new_frame.time_base = out_tb
                 for packet in out_stream.encode(new_frame):
                     output.mux(packet)
+                if profile:
+                    add_time("encode", time.monotonic() - t0)
 
+                processed += 1
                 index += 1
                 if on_progress is not None and (
                     index % 10 == 0 or index == total
@@ -599,37 +739,127 @@ class VideoSwapper(_SwapperBase):
             for packet in out_stream.encode(None):
                 output.mux(packet)
         finally:
-            output.close()
-        return first_pts if first_pts is not None else 0
+            # --encode-thread 路径没有创建 output，PyAV 的关闭由编码线程负责。
+            if output is not None:
+                output.close()
+        return _EncodeResult(
+            first_pts=first_pts if first_pts is not None else 0,
+            frames=processed,
+            profile=dict(times) if profile else None,
+        )
 
-    @staticmethod
-    def _parallel_swap_frames(frames, workers, step, swap_fn):
-        """把换脸预提交给 worker 线程池，仍严格按解码顺序 yield。
+    def _encode_via_thread(
+        self,
+        av,
+        frames,
+        silent_path: str,
+        width: int,
+        height: int,
+        fps: float,
+        in_tb: Fraction,
+        pix_fmt: str,
+        total: int,
+        on_progress: Callable[[int, int], None] | None,
+        workers: int,
+        add_time: Callable[[str, float], None] | None,
+        plan: EncoderPlan,
+    ) -> int:
+        """把编码放到独立线程；返回实际编码的帧数。
 
-        窗口最多 2*workers 帧：主线程编码队首时，后续帧已并行在 GPU 上
-        推进，CPU 编解码与 GPU 推理得以重叠。每个 worker 各持有一份 ORT
-        session / CUDA stream，所以显存占用也随 workers 上升。
+        主线程按解码顺序把 ``(display_index, rgb, pts)`` 投进有界队列，编码
+        线程按 FIFO 取用，因此 PTS / VFR 时序与串行路径一致。队列
+        ``maxsize=2*workers`` 提供背压，主机内存不会随视频长度膨胀。
+
+        异常路径不投 sentinel，而是设 ``stop_event`` 让编码线程在 get 超时
+        后自行退出；非 daemon 线程一定 join，保证 output.close() 发生在
+        音频 mux 之前。
         """
-        pending = deque()
-        limit = workers * 2
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for index, rgb, pts in frames:
-                future = (
-                    pool.submit(swap_fn, rgb) if index % step == 0 else None
-                )
-                pending.append((index, rgb, pts, future))
-                if len(pending) >= limit:
-                    i, original, p, f = pending.popleft()
-                    yield i, (f.result() if f is not None else original), p
-            while pending:
-                i, original, p, f = pending.popleft()
-                yield i, (f.result() if f is not None else original), p
+        import queue
 
-    def _swap_frame(self, rgb: np.ndarray) -> np.ndarray:
+        from faceswapper.encoder import (
+            EncoderFailure,
+            encoder_worker,
+            submit_frames,
+        )
+
+        items: queue.Queue = queue.Queue(maxsize=max(2, 2 * workers))
+        stop_event = threading.Event()
+        errors: list[BaseException] = []
+        encoded = [0]
+
+        def on_encoded() -> None:
+            encoded[0] += 1
+
+        thread = threading.Thread(
+            target=encoder_worker,
+            kwargs={
+                "av": av,
+                "silent_path": silent_path,
+                "width": width,
+                "height": height,
+                "fps": fps,
+                "in_tb": in_tb,
+                "pix_fmt": pix_fmt,
+                "crf": self.options.crf,
+                "preset": self.options.preset,
+                "items": items,
+                "stop_event": stop_event,
+                "errors": errors,
+                "on_progress": on_progress,
+                "total": total,
+                "on_encoded": on_encoded,
+                "add_time": add_time,
+                "codec": plan.codec,
+                "stream_options": dict(plan.stream_options),
+            },
+            name="faceswapper-encoder",
+            daemon=False,
+        )
+        thread.start()
+        finished = False
+        try:
+            for index, rgb, pts in frames:
+                # PyAV 要求 contiguous。放在主线程做，编码线程因此不依赖
+                # numpy，也便于用假 av 桩做离线测试。
+                submit_frames(
+                    items, (index + 1, np.ascontiguousarray(rgb), pts),
+                    stop_event, errors,
+                )
+            submit_frames(items, None, stop_event, errors)
+            finished = True
+        finally:
+            if not finished:
+                stop_event.set()
+            thread.join(timeout=30.0)
+            if thread.is_alive():
+                errors.append(RuntimeError("encoder thread did not stop"))
+
+        if errors:
+            raise EncoderFailure(errors[0])
+        return encoded[0]
+
+    def _swap_frame(self, rgb: np.ndarray, *, defer: bool = False):
+        """跑一次逐帧换脸。
+
+        ``defer=True`` 时把 CUDA tensor 原样交回调用方，由 ``_finalize_frame``
+        在消费侧取回 CPU。默认 False，行为与改造前逐字一致。
+        """
         result = self.vm.swap_video(rgb, 0)
-        if isinstance(result, torch.Tensor):
-            result = result.detach().cpu().numpy()
-        return np.ascontiguousarray(result.astype(np.uint8))
+        if defer:
+            return result
+        return self._finalize_frame(result)
+
+    def _finalize_frame(self, rgb) -> np.ndarray:
+        """把换脸结果取回 CPU，做成 PyAV 能直接吃的 contiguous uint8 数组。
+
+        对 CUDA tensor 走 ``detach().cpu().numpy()`` 再转 uint8，与原
+        ``_swap_frame`` 一致；对已经是 numpy 的帧（例如 ``--every-nth`` 跳过
+        换脸的帧）只保证 contiguous，不额外 astype，避免改变像素。
+        """
+        if isinstance(rgb, torch.Tensor):
+            rgb = rgb.detach().cpu().numpy()
+            return np.ascontiguousarray(rgb.astype(np.uint8))
+        return np.ascontiguousarray(rgb)
 
     @staticmethod
     def _mux_audio(
