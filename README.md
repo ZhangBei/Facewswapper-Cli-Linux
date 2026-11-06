@@ -483,6 +483,10 @@ python -m faceswapper.cli --models ./models video \
 Hugging Face 官方仓库获取（来源见 [2.3](#23-模型下载)）。下面按场景给出
 带参数的版本。
 
+> 视频想提速，只需加 `--workers 2`（实测约 1.5×）。其余实验开关在真机上
+> 均无收益，数据、原因与不要叠加的清单见 3.3 节的
+> 「提速办法（2026-11-06 真机实测）」。
+
 ### 3.2 图片换脸
 
 #### 只替换最大的一张脸
@@ -721,9 +725,89 @@ python -m faceswapper.cli --models ./models video \
     --every-nth 20
 ```
 
+#### 提速办法（2026-11-06 真机实测）
+
+**结论先行**：唯一被真机验证有效的提速手段是 `--workers 2`。在 Tesla T4 /
+720p / 25 fps 的 30 秒 / 750 帧样本上约 **1.5×**；其余可选开关全部持平或
+负收益，NVENC、GPU 常驻解码、batch 推理在当前环境不可用。
+
+推荐命令 —— 只加这一个开关，不要叠加下面列出的实验开关：
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg \
+    --target input.mp4 \
+    --output output.mp4 \
+    --workers 2 \
+    --preset ultrafast --crf 23
+```
+
+**实测数据**（`tools/bench_gpu.py --run --workers 1,2,4`，30 秒正式基线，
+报告在 `bench-out/baseline-30s/bench_report.json`）：
+
+| workers | elapsed | avg fps | 加速比 | 对 w1 逐帧 PSNR |
+|---:|---:|---:|---:|---|
+| 1 | 226.9s | 3.3 | 1.00 | — |
+| 2 | 151.0s | 5.0 | **1.50** | `inf` |
+| 4 | 139.1s | 5.4 | **1.63** | `inf` |
+
+`inf` 表示逐像素完全一致，并发没有改变输出。w2 → w4 只多 0.4 fps，
+收益已递减，**不建议加到 4 以上**。
+
+##### 提速原因
+
+`nsys profile -t cuda,nvtx` 的轨迹显示，耗时集中在逐脸 swapper 推理与
+同步等待，而不是主机侧数据搬运：
+
+| 观测 | 数值 | 含义 |
+|---|---|---|
+| `cudaStreamSynchronize` | 13.41s / 2618 次，占 CUDA API 时间 **75.6%** | 主机在等 GPU 完成 |
+| `ort_run_swapper`（NVTX） | 11.77s / 225 次（每帧 3 张脸 × 75 帧） | 逐脸 ORT Run 是主体 |
+| `syncvec_drain` | 0.323s | 原先以为的主瓶颈，实测可忽略 |
+| H2D + D2H memcpy | 0.243s | 相对 36.1s 总用时不足 1% |
+| `cudaMalloc` + `cudaFree` | 0.074s | 分配器开销可忽略 |
+
+`--workers N` 让 N 个 worker 各持一份 ORT session 和一条 CUDA stream，
+把「主机等某一次 ORT Run」的时间与另一帧的推理重叠起来；解码与编码仍在
+主线程，输出严格按解码顺序（`frame_order.py` 的 `2N` 有序窗口），因此
+PTS、VFR 时序、音画对齐与逐帧像素都不变。
+
+反过来，编码、D2H、memcpy、显存分配这些环节的收益上限本来就不到 1%，
+针对它们的开关在 A/B 里全部测不出收益：
+
+| 开关 | 10 秒 / 250 帧 A/B（基线 60.9s / 4.1 fps） | 逐帧 PSNR |
+|---|---|---|
+| `--encode-thread` | 64.8s / 3.9 fps（**负收益**） | `inf` |
+| `--defer-d2h --arena-strategy pow2` | 63.0s / 4.0 fps | `inf` |
+| `--reuse-detect-buffers` | 62.6s / 4.0 fps | `inf` |
+| `--zero-copy-frames` | 63.3s / 3.9 fps | `inf` |
+| 阶段 6 + 7 组合 | 62.8s / 4.0 fps | `inf` |
+
+##### 不要这样提速
+
+- 不要叠加上面那批实验开关：全部无收益，`--encode-thread` 还会变慢。
+- 不要把显存占用当提速指标：VRAM 随 worker 数上升只是各持一份 session
+  的副产物；`--arena-strategy pow2` 只让数字变大，不提速。本机同机还有
+  4 个外部 GPU 进程，`nvidia-smi` 读数无法归因于本工具。
+- `--every-nth` 是抽样验证、不是加速；降分辨率、`--preset ultrafast`、
+  关掉可选功能是减少总耗时，不改变换脸计算量。
+- NVENC（`--encoder nvenc`）在本容器权限不足会明确报错；GPU 常驻解码
+  （`--decoder gpu`）因 torchcodec 与 torch ABI 不匹配不可用；单帧多脸
+  batch 虽有数值等价的动态 batch 模型可用，但输出 PSNR 仅 45.69 dB，
+  闸门保持关闭。
+
+完整的分阶段数据、nsys 轨迹与验收顺序见
+[docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md)。
+
 #### 为什么 GPU / 显存占用很低
 
-这是当前流水线结构决定的，不是参数没调满：
+> **2026-11-06 真机实测修正**：下面这段是改造前的结构分析。`nsys` 后来
+> 显示主机主要是在**等 GPU**（`cudaStreamSynchronize` 占 CUDA API 时间
+> 75.6%），并非 GPU 空闲；且本机同机有 4 个外部 GPU 进程，`nvidia-smi`
+> 读数无法归因于本工具。因此「GPU / 显存占用很低」这一旧判断在这台机器上
+> 未得到证实。实测有效的提速办法与原因见上一节。
+
+改造前（`workers=1`）的流水线结构：
 
 - 解码（PyAV，CPU）、GPU 推理、libx264 编码都在**同一个线程逐帧串行**
   （`headless.py` 的 `_encode_video`），任意时刻只有一帧在推进；
@@ -739,32 +823,32 @@ python -m faceswapper.cli --models ./models video \
 只影响人脸筛选：未指定时逐脸识别 embedding 默认已跳过（见阶段 4，像素不变，
 省每帧 N 次 ArcFace 推理）；指定时要按相似度筛人，embedding 照常计算。
 
-要真正提高 GPU 利用率和显存占用，需要增加并发。下面第二档已落地为
-`--workers N`（默认 `1`，走原来的串行路径）：
+真正有效的是增加并发，即 `--workers N`（默认 `1`，走串行路径）：
 
 ```bash
 python -m faceswapper.cli --models ./models video \
     --source face.jpg --target input.mp4 --output output.mp4 \
-    --workers 4
+    --workers 2
 ```
 
 `N` 个 worker 各持一份 ORT session 和一条 CUDA stream，解码/编码留在主线程，
 换脸推理在线程池里并行；输出仍严格按解码顺序，PTS、VFR 时序和音画对齐与
-串行路径一致。显存约为 `N × 3 份模型 session`，建议从 2 开始逐步加，用
-`nvidia-smi` 观察利用率和显存，别一次开到 8。
+串行路径一致。显存约为 `N × 3 份模型 session`。**实测 w2 → w4 只多
+0.4 fps，取 2 即可**；本机 `nvidia-smi` 读数受同机其它进程污染，不能用来
+判断本工具的利用率。
 
-| 方案 | 效果 | 状态 |
+| 方案 | 真机效果 | 状态 |
 |---|---|---|
-| `--workers N` 多 worker 并行帧 | GPU 利用率和显存随 N 上升 | **已实现，默认关闭** |
-| 编码移到独立线程，与推理重叠 | 进一步解除 CPU 编码阻塞 | **已实现（`--encode-thread`），默认关闭** |
-| 跨帧 batch 推理 | 上限最高 | 未实现，可能影响 PTS 与画质 |
+| `--workers N` 多 worker 并行帧 | **约 1.5×（w2）**，唯一有效 | 见「提速办法」 |
+| 编码移到独立线程 | **负收益** | 保持默认关闭 |
+| 跨帧 batch 推理 | 上限最高 | 代码已编写、闸门关闭；像素等价未通过 |
 
 `--workers > 1` 会启用 Per-Thread session，此时不要打开 `OrientAutoSwitch`
 （自动朝向）：它维护跨帧共享状态，多线程下会竞态。默认参数是关闭的，
 正常使用不受影响。
 
-先用 `nvidia-smi dmon -s u -d 1` 看利用率是否周期性归零：归零说明还卡在
-CPU 编码或同步上，此时叠加 `--preset ultrafast` 收益更明显。
+观察利用率请用 `nvidia-smi dmon -s um -d 1`（`-s u,m` 是非法写法）；
+但要得到可归因的数字，需先隔离同机其它 GPU 进程。
 
 #### 编码独立线程 `--encode-thread`
 
@@ -780,10 +864,12 @@ python -m faceswapper.cli --models ./models video \
 异常并置停止标志，主线程立即中断，不会静默产出半个视频。
 
 可与 `--workers` 叠加，但**默认关闭，不传该参数即走原来的主线程编码路径**，
-不需要回滚代码。配合 `--profile` 看 `encode=` 占总用时的比例再决定是否值得
-开启：`--workers > 1` 的 2N 有序窗口已经让编码与推理部分重叠，PyAV 的
-libx264 编码是否在 C 层释放 GIL 也尚未验证，因此收益不确定，甚至可能为负。
-离线测试覆盖了队列保序、flush、异常传播与背压；**真机性能尚未验证**。
+不需要回滚代码。`--workers > 1` 的 2N 有序窗口已经让编码与推理部分重叠；
+`--profile` 里 `encode` 仅占总用时约 5–8%，可争取的空间本来就很有限。
+PyAV 的 libx264 编码是否在 C 层释放 GIL 未单独验证，但实测的负收益与
+「不释放 GIL 反而卡住主线程」这一推测一致。
+离线测试覆盖了队列保序、flush、异常传播与背压。**真机 A/B 已测为负收益**
+（64.8s / 3.9 fps，基线 60.9s / 4.1 fps；PSNR=`inf`），不建议开启。
 
 #### 阶段 3：延迟 D2H 与显存策略
 
@@ -808,8 +894,10 @@ python -m faceswapper.cli --models ./models video \
 靠已有的 `wait_stream`，没有新增 CUDA event、也没有把 stream 对象跨线程传递，
 因此 `encoder.py` 仍是 stdlib-only。代价是收益可能低于预期：D2H 仍在主线程
 串行，跨 worker 的默认 stream 隐式屏障也还在。开启 `--defer-d2h` 时，D2H
-耗时不计入 `--profile` 的三段。方案原本要求先用 nsys 确认 host stall，本次
-只交付代码、未做该验证；不传这两个开关即回到原行为。
+耗时不计入 `--profile` 的三段。后续 `nsys` 已确认 host stall 主体是
+`cudaStreamSynchronize`（占 CUDA API 时间 75.6%），而 D2H memcpy 仅
+0.062s；真机 A/B 也显示该开关无收益（63.0s / 4.0 fps，PSNR=`inf`）。
+不传这两个开关即回到原行为。
 
 #### 阶段 4：跳过无用的逐脸识别
 
@@ -826,8 +914,10 @@ bbox，但 `run_swapper_batched` 的 N 是 polyphase phase 数而非脸数、
 会让 N>1 的 batch 被 ONNX 以 `Got: 3 Expected: 1` 拒绝，异常回退后触发
 `CUDA failure 700` 崩溃。现已给判定补上必填的 `batch_backend_available`
 并修正 session 探测顺序，复测确认误开闸门会干净回退（PSNR=`inf`、无
-CUDA 错误）。但**两个实验闸门仍必须保持 `False`**：模型本身不支持动态
-batch，要解冻须先换 swapper 模型。六条完整依据、受控实验与解冻步骤见
+CUDA 错误）。动态 batch 模型也已通过本地图改写构造并验证数值等价
+（逐脸路径 PSNR=`inf`），但用它开闸后 batch 对逐脸只有 **PSNR 45.69 dB**。
+因此**两个实验闸门仍必须保持 `False`**：剩余阻断是 7.1 prepare/finish
+的像素等价性，不是模型能力。六条完整依据、受控实验与解冻步骤见
 [docs/gpu-utilization-plan.md 7.1](docs/gpu-utilization-plan.md)。
 
 改实现了一条逻辑等价、改动更小的优化：headless video 未指定 `--target-face`
@@ -843,7 +933,8 @@ python -m faceswapper.cli --models ./models video \
 
 指定 `--target-face` 时会自动照常计算 embedding（要按相似度筛人）；图片换脸走
 `found_faces` 匹配路径，同样不受影响。判定在 `recognize.py`，离线行为测试覆盖
-四种组合。真机收益未测。
+四种组合。`nsys` 已确认逐脸调用被跳过（`:run_recognize` 全程仅 1 次，
+即源特征提取），但收益数字未单独做 A/B。
 
 跨帧 batch（方案 7.2）的**判定、有序分组、前向/回填编排与闸门**均已写进
 代码，但 `EXPERIMENTAL_CROSS_FRAME_BATCH=False` 且主流水线完全没有调用它。
@@ -886,8 +977,12 @@ torchcodec 各版本的 frame 字段与 PTS 单位不统一，适配层刻意**�
 静默产出坏帧或错时序。首帧绝对 PTS 由 GPU 路径自己记录，音频 mux 的偏移照常
 恢复。判定与字段提取在 `decoder.py`，有离线行为测试。
 
-真机未验证：torchcodec 的实际 frame 布局、PTS 单位、VFR 与音画同步都需要在
-GPU 环境核对。不传该开关即回到原 PyAV 路径。
+真机已核对（本环境不可用）：装上 `torchcodec 0.17.0` 后 import 即报
+`libtorchcodec_image.so: undefined symbol: torch_from_blob`，当前
+`torch 2.10.0+cu128` 与 torchcodec ABI 不匹配；`--decoder gpu` 会明确
+报 `GPU decode unavailable` 并提示用默认路径，不会静默回退。验证后已
+卸载该可选包。因此 frame 布局、PTS 单位、VFR 与音画同步仍未能核对。
+不传该开关即回到原 PyAV 路径。
 
 #### 阶段 6：复用 detector 输出缓冲（每帧少 9 次显存分配）
 
@@ -914,8 +1009,9 @@ python -m faceswapper.cli --models ./models video \
 `torch.empty` 的路径（AST 测试钉住这条 fallback）。`--backend trt` 下判定逻辑
 会自动关闭复用：TRT-EP 的 `io_binding` 输出行为未经真机核对，不猜。
 
-**真机未验证**：ORT 是否每帧完整覆写这 9 个缓冲、复用后逐帧 PSNR、以及省下
-分配后的实际 `avg fps` 收益。按方案第 10 节的 A/B 顺序测；不传该开关即回滚。
+**真机已验证**：10 秒 / 250 帧 `workers=2` 下逐帧 PSNR=`inf`（说明 ORT
+每帧完整覆写复用缓冲）、帧数与音画正常；但吞吐无可测量收益（62.6s /
+4.0 fps vs 基线 60.9s / 4.1 fps）。默认保持关闭，不传开关即回滚。
 
 #### 阶段 7：帧路径零拷贝归一化（少一次整帧 memcpy）
 
@@ -951,9 +1047,10 @@ import numpy，因此闸门关闭、命中、dtype 不符、布局不连续、�
 与 `_frame_to_uint8` 两条 fallback）。开启后也不改像素——dtype 或布局不满足时
 仍照旧复制，只是不再对已经合格的帧做无用功。
 
-**真机未验证**：逐帧 PSNR 是否完全一致、PyAV / torchcodec / NVENC 各路径实际
-给出的 dtype 与布局、以及省下 memcpy 后的 `avg fps` 收益。按方案第 10 节的
-A/B 顺序测；不传该开关即回滚。
+**真机已验证**：10 秒 / 250 帧 `workers=2` 下逐帧 PSNR=`inf`（dtype /
+layout 判定与实际内存一致）、帧数与音画正常；但吞吐无可测量收益（63.3s /
+3.9 fps vs 基线 60.9s / 4.1 fps）。`nsys` 显示 H2D + D2H memcpy 合计仅
+0.243s / 36s，收益上限 <1%。默认保持关闭，不传开关即回滚。
 
 #### GPU 基线验收脚本
 
@@ -980,9 +1077,12 @@ python tools/bench_gpu.py --source face.jpg --target in.mp4 --run \
 （加速比 `1.0 / 1.50 / 1.63`）。**真机结论**：除 `--workers 2` 外，
 编码独立线程、延迟 D2H、detector 缓冲复用、帧零拷贝均无可测量收益，
 NVENC 在本环境不可用，不建议开启这些开关；`nsys` 已把瓶颈定位到逐脸
-ORT Run 与 `cudaStreamSynchronize`。完整数字、结论与剩余待办见
+ORT Run 与 `cudaStreamSynchronize`。后续又验证了 P0（动态 batch 模型可
+本地构造且数值等价，但 7.1 batch 路径 PSNR 仅 45.69 dB）与 P2
+（`torchcodec 0.17` 与 `torch 2.10` ABI 不匹配，GPU 解码不可用）。
+完整数字、结论与剩余待办见
 [docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md) 的
-「第二轮真机数据」一节。
+「第二 / 第三轮真机数据」两节。
 
 完整的分阶段实施方案（现状瓶颈、详细实现步骤、验收清单、风险与回滚）见
 [docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md)。

@@ -1,6 +1,6 @@
 # 提升 GPU 与 VRAM 利用率的实施方案
 
-日期：2026-11-05（最近核对：2026-11-06 五次核对，含 nsys / A/B / 30s 正式基线 / 7.1 受控实验 / P1 安全修复）
+日期：2026-11-05（最近核对：2026-11-06 六次核对，含 nsys / A/B / 30s 基线 / P0 动态 batch 模型 / P2 torchcodec / P1 修复）
 
 ## 状态
 
@@ -17,19 +17,20 @@
   `cudaStreamSynchronize` 占 CUDA API 时间 75.6%，而 `syncvec_drain` 仅
   0.323s、D2H memcpy 仅 0.062s —— **原 B2 把 `syncvec.cpu()` 当作主要
   瓶颈的判断不成立**，见「第二轮真机数据」。
-- 阶段 4：7.1 **受控解冻实验已做**（进程内临时开闸、不改文件），结论是
-  **当前模型不可解冻**——`inswapper_128.fp16.onnx` 为 `static-batch=1`，
-  N=3 的 batch 被 ONNX 拒绝（`Got: 3 Expected: 1`），异常回退后触发
-  `CUDA failure 700` 崩溃；闸门关闭的对照实验正常完成。该安全缺陷
-  **已修并复测**（补动态 batch 判据 + 修正 session 探测顺序，误开闸门
-  现在干净回退、PSNR=`inf`）。两个闸门仍为 `False`，7.1 / 7.2 均被
-  模型能力阻断，不再是「待解冻」。4.2 跳过逐脸
-  recognize 已由 nsys 间接证实（`:run_recognize` 全程仅 1 次），仍是唯一
-  默认生效的行为变化。详见「第二轮真机数据」的 7.1 受控实验。
+- 阶段 4：7.1 的受控解冻实验、P1 安全修复、P0 动态 batch 模型**三轮
+  验证均已完成**。原 `static-batch=1` 导致的 `CUDA failure 700` 已修
+  （补判据 + 修正 session 探测顺序，误开闸门干净回退、PSNR=`inf`）；
+  P0 用本地图改写构造出数值等价的动态 batch 模型（逐脸 PSNR=`inf`），
+  证明模型能力可解。但用它开闸后 batch 对逐脸 **PSNR 仅 45.69 dB**，
+  最终阻断是 prepare/finish 的**像素等价性**。两个闸门仍为 `False`。
+  4.2 跳过逐脸 recognize 已由 nsys 间接证实（`:run_recognize` 全程仅
+  1 次），仍是唯一默认生效的行为变化。详见「第二 / 第三轮真机数据」。
 - 阶段 5：5a NVENC 代码已落地，真机**明确报错不可用**——
   `avcodec_open2("h264_nvenc")` 抛 `PermissionError`（容器 NVENC 权限 /
   驱动 API 受限），符合「不静默回退」设计，默认 `libx264` 不受影响。
-  5b GPU 常驻解码仍**未验证**：`torchcodec` 未安装。
+  5b GPU 常驻解码**已核对为不可用**：`torchcodec 0.17.0` 与
+  `torch 2.10.0+cu128` ABI 不匹配（`undefined symbol: torch_from_blob`），
+  `--decoder gpu` 明确报错不静默回退，验证后已卸载恢复环境。
 - 阶段 6 `--reuse-detect-buffers` 与阶段 7 `--zero-copy-frames`：均已做
   真机 A/B（含组合），PSNR 全部 `inf`（逐像素一致），但**无可测量吞吐收益**
   （3.9–4.0 fps vs 基线 4.1）。nsys 给出收益上限：`cudaMalloc` + `cudaFree`
@@ -39,8 +40,9 @@
   0 / 1 / 2 / 3 / 4.2 / 5a / 6 / 7 已实测，4.1 / 4.3 被 `static-batch=1`
   模型阻断，5b 缺可选依赖且收益上限 <1%。最重要的结论是：**除
   `--workers 2` 的约 1.5× 外，其余优化在真机上均无收益或不可行**；
-  唯一对症的「减少 ORT 调用次数」需要换支持动态 batch 的 swapper 模型，
-  而不是继续改当前代码。
+  唯一对症的「减少 ORT 调用次数」已用本地图改写构造出数值等价的动态
+  batch 模型验证过，但 7.1 的 prepare/finish 仍导致 PSNR 45.69 dB 的
+  像素差异——**剩余卡点是像素等价性，不是模型能力**。
 - 环境：Tesla T4 / 15 GiB / 驱动 580，运行时栈已由
   `tools/install.py default` 补齐，`check_env.py` 9 项全 ok；但同机持续有
   4 个外部 GPU 进程占约 5.6 GiB，**GPU 利用率 / VRAM 曲线无法隔离采集**，
@@ -48,7 +50,7 @@
 - 离线测试 `python -m faceswapper.tests --strict` 18/18 PASS；四个闸门
   均为 `False`；`compileall` 与 `git diff --check` 通过。
 
-### 完成情况核对（2026-11-06 五次核对）
+### 完成情况核对（2026-11-06 六次核对）
 
 对照代码库与两轮真机结果逐项复查：**代码层 11 个阶段 / 子项全部收口**；
 真机侧 11 项**均已给出结论**（含 7.1 受控解冻实验）。其中 0 / 1 / 2 /
@@ -63,11 +65,11 @@ batch 的 swapper 模型，见「第二轮真机数据」。
 | 1 `--workers N` | 已完成 | PASS | `workers=1`（串行） | **基本完成**（30s 矩阵、PSNR=inf；GPU 曲线本环境不可归因） |
 | 2 `--encode-thread` | 已完成 | PASS | 关闭 | **已完成**：负收益，PSNR=inf |
 | 3 `--defer-d2h` / `--arena-strategy` | 已完成（保守版） | PASS | 均关闭 | **已完成**：持平，PSNR=inf，nsys 已定位 |
-| 4.1 单帧多脸 batch | 已编写、闸门关闭 | PASS + AST 闸门（新增 2 项） | `EXPERIMENTAL_FACE_BATCH=False` | **模型阻断，不可解冻**；但安全缺陷已修并复测：误开闸门干净回退、PSNR=`inf` |
+| 4.1 单帧多脸 batch | 已编写、闸门关闭 | PASS + AST 闸门（新增 2 项） | `EXPERIMENTAL_FACE_BATCH=False` | **受像素等价阻断**：动态 batch 模型已构造并验证，但 batch 对逐脸 PSNR 仅 45.69 dB；不可解冻 |
 | 4.2 跳过逐脸 recognize | 已完成 | PASS | **默认生效**，`--force-recognize` 回滚 | **间接验证**（nsys `:run_recognize` 仅 1 次；收益数字未单测） |
-| 4.3 跨帧 batch | 已编写、未挂载主路径 | PASS + AST 未挂载 | `EXPERIMENTAL_CROSS_FRAME_BATCH=False` | **受模型阻断**（同样依赖动态 batch），放最后 |
+| 4.3 跨帧 batch | 已编写、未挂载主路径 | PASS + AST 未挂载 | `EXPERIMENTAL_CROSS_FRAME_BATCH=False` | **受像素等价阻断**（同依赖 prepare/finish 编排），放最后 |
 | 5a NVENC 编码 | 已完成 | PASS | 关闭（默认 `libx264`） | **已完成**：真机不可用，明确报错 |
-| 5b GPU 常驻解码 | 已完成 | PASS | 关闭（默认 `pyav`） | **未做**（`torchcodec` 未安装） |
+| 5b GPU 常驻解码 | 已完成 | PASS | 关闭（默认 `pyav`） | **已完成**：torchcodec 0.17 与 torch 2.10 ABI 不兼容，本环境不可用 |
 | 6 detector 输出缓冲复用 | 已完成 | PASS | 关闭，`trt` 自动关 | **已完成**：PSNR=inf，无收益 |
 | 7 帧路径零拷贝 | 已完成 | PASS | 关闭 | **已完成**：PSNR=inf，无收益 |
 
@@ -91,48 +93,59 @@ requirements 文件的行为测试；`test_target_match` 早期因缺 numpy 的�
 
 1. **唯一默认改变行为的项是 4.2**。其余新开关全部默认关闭或闸门为 False，
    不传开关即回到基线路径；这也是本文所有回滚说明的前提。
-2. **7.1 / 7.2 不只是「冻结」，而是被模型能力阻断**：受控实验证明当前
-   `inswapper_128.fp16.onnx` 为 `static-batch=1`，当时 N=3 的 batch 被
-   ONNX 拒绝、回退后触发 `CUDA failure 700`。该安全缺陷已修（动态 batch
-   判据 + session 探测顺序），复测确认误开闸门会干净回退且 PSNR=`inf`；
-   但两个闸门仍必须保持 `False`，要解冻只能先换支持动态 batch 的
-   swapper 模型。
+2. **7.1 / 7.2 的最终阻断是像素等价，不是模型能力**：原模型
+   `static-batch=1` 曾导致 `CUDA failure 700`，该安全缺陷已修；P0 又用
+   本地图改写构造出数值等价的动态 batch 模型（逐脸路径 PSNR=`inf`），
+   证明模型能力可解。但同模型下 batch 对逐脸 **PSNR 仅 45.69 dB**，
+   说明 prepare 全部从原始 `img` warp、finish 按序写回与逐脸路径不等价。
+   **两个闸门必须保持 `False`**，解冻前需先重构这段输入依赖。
 3. **性能改造基本证伪，别再堆开关**：nsys 定位到
    `cudaStreamSynchronize`（CUDA API 时间 75.6%）与逐脸 `ort_run_swapper`
    （225 次 / 11.77s）才是瓶颈，而 `syncvec_drain` / memcpy / 显存分配
    合计不足总用时 1%。阶段 2 / 3 / 6 / 7 的 A/B 全部持平或负收益，
-   5a 环境不支持。唯一对症的「减少 ORT 调用次数」（每帧 3 张脸 →
-   1 次 Run）在当前模型下无法实施，需先解决模型能力这一前置条件。
+   5a / 5b 环境均不可用。唯一对症的「减少 ORT 调用次数」（每帧 3 张脸
+   → 1 次 Run）在动态模型上已跑通（75 次 batch 调用），但像素不等价，
+   需先重构 7.1 的 prepare/finish 输入依赖才能用。
 4. **GPU / VRAM 曲线在本环境不可完成**：同机 4 个外部 GPU 进程持续占用
    约 5.6 GiB 且 PID 随会话变化，无法隔离。不要再列为「待执行」，
    应记为环境限制；「GPU 利用率低」这一旧判断也始终未得到证实。
 
-### 下一步动作（2026-11-06 五次核对，P1 安全修复已完成）
+### 下一步动作（2026-11-06 六次核对，P0 / P1 / P2 全部收口）
 
-P0 / P1 / P2 中可执行的项**已全部完成**（30 秒正式基线、nsys、阶段 2 / 3 /
-6 / 7 的 A/B、5a 探测、7.1 受控开闸实验、P1 安全修复与复测）。阶段 2 / 3 /
-6 / 7 已由真机证伪，不再投入。剩余按价值排序：
+P0 / P1 / P2 **已全部执行并给出结论**。阶段 2 / 3 / 6 / 7 已由真机证伪，
+不再投入；GPU 曲线受同机负载污染，属环境限制。
 
-| 优先级 | 动作 | 预期产出 | 状态 |
-|---|---|---|---|
-| P0 | 评估并换用支持动态 batch 的 swapper 模型（当前 `inswapper_128.fp16.onnx` 锁死 batch=1） | 解锁 7.1 / 4.3 的唯一前提 | 未做，需外部模型 |
-| ~~P1~~ | ~~修 CUDA 700 回退 + 补动态 batch 判据~~ | 误开闸门时干净回退 | **已完成**（见下） |
-| P2 | 5b：安装 `torchcodec>=0.4` 核对 frame 布局 / PTS 单位 | 可用性结论；H2D 收益上限 <1% | 低价值 |
-| — | 4.3 跨帧 batch 解冻 | 上限更高，需重构帧流水线 | 放最后，同受模型阻断 |
-| — | 隔离同机 GPU 进程后重采利用率 / VRAM 曲线 | 可归因的 GPU 数字 | **本环境不可完成** |
+| 优先级 | 动作 | 结论 |
+|---|---|---|
+| P0 | 评估并换用支持动态 batch 的 swapper 模型 | **评估完成**：本地图改写可得到数值等价的动态 batch 模型，但**仍不足以解锁 7.1**（batch 路径 PSNR 45.69 dB）。不正式接入 CLI，见下 |
+| ~~P1~~ | ~~修 CUDA 700 回退 + 补动态 batch 判据~~ | **已完成**：误开闸门干净回退、PSNR=`inf` |
+| P2 | 5b：安装 `torchcodec>=0.4` 核对 frame 布局 / PTS | **已完成**：与 torch 2.10.0 ABI 不兼容，本环境不可用；CLI 明确报错不静默回退 |
+| — | 4.3 跨帧 batch 解冻 | 放最后，同受模型与像素等价双重阻断 |
+| — | 隔离同机 GPU 进程后重采利用率 / VRAM 曲线 | **本环境不可完成** |
 
-**P1 已完成**：`batch_eligibility()` 增加必填的 `batch_backend_available`
-（与 7.2 同名同义、不设默认值），`Models.swapper_supports_dynamic_batch()`
-显式触发 session 懒加载后返回模型能力；`run_swapper_batched` 把
-`_get_swapper_session()` 提前到静态 batch 检查之前作为第二道防线。
-新增 2 项离线行为测试（含接线 AST 检查），全量 18/18 PASS。真机复测
-临时开闸跑 3 秒 / 75 帧片段：`done: 75 frame(s)`、无 CUDA 错误、输出与
-闸门关闭的逐脸基线 **PSNR=`inf`**，即误开闸门现在会**干净回退**。
+**P0 结论（新增）**：不必等外部模型。把 `inswapper_128.fp16.onnx` 的
+`graph.input[0]` / `graph.output[0]` 以及 `graph.value_info` 里 297 处 4D
+张量的第 0 维从常量 `1` 改成符号 `N`，ORT 即接受 `N=3`，输出
+`(3,3,128,128)` 且与逐次推理 `max abs diff = 0.0`；同一逐脸路径下动态
+模型对原模型 **PSNR=`inf`**（改写安全）。但用它开闸跑 7.1 时，batch 对
+逐脸的 **PSNR 仅 45.69 dB** —— 说明文档第 4 条阻断条件比预估更硬：
+即使 `batch_eligibility()` 要求 bbox 不重叠，prepare 全部从原始 `img`
+warp、finish 按序写回仍会改变像素。**换模型不是 7.1 的充分条件**，
+因此该模型只作为评估产物保留在
+`models/inswapper_128.fp16.dynbatch.onnx`（`models/` 已 gitignore），
+**不接入生产路径**。完整数据见「第三轮真机数据」。
 
-**当前卡点**不是缺代码或 GPU，而是模型能力：`inswapper_128.fp16.onnx`
-把 batch 维锁死为 1，任何 batch 路线都走不通。
-其次是 GPU 读数被外部负载污染。继续调 `workers`、编码线程、D2H、
-分配器、memcpy 都不会有收益。
+**P2 结论（新增）**：`pip install torchcodec>=0.4` 得到 0.17.0，但
+`import torchcodec` 抛
+`libtorchcodec_image.so: undefined symbol: torch_from_blob`；
+`nm -D libtorch_cpu.so` 确认 torch 2.10.0+cu128 **不含该符号**，属
+torch / torchcodec 的 ABI 不匹配（换更低版本只会更旧）。`--decoder gpu`
+按设计明确报 `GPU decode unavailable` 并建议 `--decoder pyav`，
+没有静默回退。验证后已卸载 torchcodec 恢复环境。
+
+**当前卡点**已从「模型能力」转为**像素等价性**：动态 batch 可解决，
+但 7.1 的多脸 prepare/finish 与逐脸路径不等价；其次是 GPU 读数被外部
+负载污染。继续调 `workers`、编码线程、D2H、分配器、memcpy 都不会有收益。
 
 ### 首批真机数据（2026-11-06）
 
@@ -299,18 +312,75 @@ or newer`（本机驱动 580，更可能是容器内 NVENC 设备权限 / 驱动
 `done: 75 frame(s)`、无 CUDA 错误、对闸门关闭的逐脸基线
 **PSNR=`inf`**——误开闸门现在会在判定阶段干净回退，不再进入 N>1 的
 `io_binding`。闸门仍保持 `False`（这是模型能力限制，不是代码缺陷）。
-要继续这个方向，唯一前提是换成支持动态 batch 的 swapper 模型。
+**第三轮修正**：动态 batch 模型已可本地构造且数值等价，但这只解决了
+模型能力；batch 路径仍有像素差异（PSNR 45.69 dB），见「第三轮真机数据」。
 
-#### 本轮仍未完成
+#### 本轮仍未完成（第三轮后已收窄）
 
-- 4.1 / 4.3 解冻：**不是待执行，而是被模型阻断**。受控实验证明
-  `inswapper_128.fp16.onnx` 为 `static-batch=1`；当时的 CUDA 700 崩溃
-  已通过 P1 安全修复消除（误开闸门现在干净回退），但两个闸门仍为
-  `False`。要真正解冻仍需先换支持动态 batch 的 swapper 模型。
-- 5b：`torchcodec` 未安装。nsys 显示 H2D memcpy 仅 0.181s / 36s，
-  GPU 常驻解码的收益上限 <1%，性价比低。
+- 4.1 / 4.3 解冻：**阻断点是像素等价，不再是模型能力**。动态 batch
+  模型与 CUDA 700 都已解决，但 7.1 的 prepare/finish 与逐脸路径不等价；
+  两个闸门仍为 `False`，需重构输入依赖后才能谈解冻。
+- 5b：**已核对为环境不可用**（torchcodec 0.17 与 torch 2.10 ABI 不匹配），
+  且 nsys 显示 H2D memcpy 仅 0.181s / 36s，收益上限 <1%，不值得降级 torch。
 - GPU / VRAM 曲线：同机 4 个外部进程持续占约 5.6 GiB，**无法隔离，
   属环境限制而非待执行项**。
+
+### 第三轮真机数据（2026-11-06：P0 动态 batch 模型与 P2 torchcodec）
+
+#### P0：动态 batch 模型的构造与验证
+
+原模型 `graph.input[0]` 是 `target [1,3,128,128]`，输出 `[1,3,128,128]`；
+算子统计为 `Cast 78 / Mul 36 / Add 31 / Constant 24 / Unsqueeze 24 /
+Slice 24 / ReduceMean 24 / Conv 20 / Pad 14 / …`，**没有 `Reshape` /
+`Expand` / `Tile`**，具备改写条件。评估脚本
+`bench-out/eval_dynbatch.py` 依次试三种强度：
+
+| 方案 | 改写范围 | ORT `N=3` | 结果 |
+|---|---|---|---|
+| A | 只改 input / output 第 0 维为 `N` | 失败 | `Shape mismatch attempting to re-use buffer. {1,1024,1,1} != {3,1024,1,1}` |
+| B | A + 把 `graph.value_info` 里 **297 处** 4D 张量第 0 维 `1→N` | `(3,3,128,128)` | **PASS**，`max abs diff = 0.0` |
+| C | B 之后再做 shape inference | `(3,3,128,128)` | PASS，但多一条 output shape warning |
+
+采用方案 B，产物 `models/inswapper_128.fp16.dynbatch.onnx`（265 MB）。
+`bench-out/eval_71_dynbatch.py` 用进程内 patch（`Models._mp` 指向新文件、
+临时开闸、计数 `run_swapper_batched`）跑 3 秒 / 75 帧片段：
+
+| 配置 | 模型 | 闸门 | `run_swapper_batched` 次数 | elapsed | swap 段 |
+|---|---|---|---:|---:|---:|
+| 逐脸基线 | 原静态 | 关 | — | 32.0s / 2.3 fps | 27.53s |
+| 逐脸对照 | 动态 | 关 | 225（75×3，n=1） | 18.4s / 4.1 fps | 15.04s |
+| 7.1 batch | 动态 | 开 | **75**（每帧一次 N=3） | 17.0s / 4.4 fps | 13.43s |
+
+> 耗时受同机 4 个外部 GPU 任务干扰，**不作为性能结论**；静态与动态
+> 逐脸相差近 2× 主要来自负载波动与会话差异，需要隔离后重测才有意义。
+
+**像素等价性**（关键）：
+
+| 对比 | PSNR |
+|---|---|
+| 同一逐脸路径：动态模型 vs 原静态模型 | **`inf`**（改写数值安全） |
+| 同一动态模型：7.1 batch vs 逐脸 | **45.69 dB**（`y 44.19 / u 52.71 / v 53.85`） |
+
+即**换模型解决了 `static-batch=1`，却没有解决 7.1 的像素等价性**。
+`batch_eligibility()` 已要求 bbox 两两不重叠，但 prepare 阶段所有脸都从
+原始 `img` warp、finish 按序写回，与逐脸路径「后一张脸读到前一张已写回
+像素」仍不等价。这把 7.1 第 4 条阻断条件从「重叠时不等价」强化为
+「当前实现下普遍不等价」。因此动态模型**不接入生产路径**，闸门保持
+`False`；若将来要解冻，需要先重构 prepare/finish 的输入依赖。
+
+#### P2：torchcodec 可用性
+
+| 步骤 | 结果 |
+|---|---|
+| `pip install 'torchcodec>=0.4'` | 装上 `torchcodec 0.17.0`（10 MB） |
+| `import torchcodec` | `OSError: libtorchcodec_image.so: undefined symbol: torch_from_blob` |
+| `nm -D torch/lib/libtorch_cpu.so \| grep torch_from_blob` | **0 处命中**，torch 2.10.0+cu128 不提供该符号 |
+| `--decoder gpu` | CLI 明确报 `GPU decode unavailable: torchcodec import failed`，建议 `--decoder pyav`，**没有静默回退** |
+
+结论是 **torch / torchcodec ABI 不匹配**，不是版本选错（更低版本只会更旧），
+也补不上 8.1 要求的 frame 布局 / PTS 单位核对。验证后已卸载 torchcodec
+恢复环境，`--decoder pyav` 默认路径不受影响。结合 nsys 的 H2D memcpy
+仅 0.181s / 36s，5b 的收益上限 <1%，不值得为此降级 torch。
 
 适用范围：headless CLI 的 `video` / `swap` 路径。文中代码位置以函数名定位，
 括号里的行号来自 2026-11-05 的代码快照；阶段 6 / 7 及后续改动后请勿依赖
@@ -654,11 +724,13 @@ nsys 实测 `cudaMalloc` + `cudaFree` 合计仅 0.074s，A/B 也确认无收益�
    第二道防线。详见「第二轮真机数据」的 7.1 受控实验与复测。
 
 这六条决定了 7.1 **不能直接挂进主路径**：硬接会产出「看起来省了 ORT
-调用、但多人脸/重叠人脸像素不对」的结果，在当前模型下更会直接触发
-CUDA 非法内存访问。按「代码先编写进入、不启用」的要求，实现已落地
-但闸门必须保持 `False`；解冻的前置条件已变成**换支持动态 batch 的
-swapper 模型**，而不只是建 PSNR 基线。详见「第二轮真机数据」的
-7.1 受控实验。
+调用、但像素不对」的结果，当时还会触发 CUDA 非法内存访问。按「代码先
+编写进入、不启用」的要求，实现已落地但闸门必须保持 `False`。
+**第三轮的最终结论**：动态 batch 模型可本地构造且数值等价（逐脸
+PSNR=`inf`），CUDA 700 也已修；但用该模型开闸后 batch 对逐脸仍只有
+**PSNR 45.69 dB**。所以解冻的前置条件不是换模型，而是**重构
+prepare 全部从原始 `img` warp、finish 按序写回的输入依赖**，先让
+逐帧像素等价。详见「第二 / 第三轮真机数据」。
 
 #### 已编写、未挂载的实现
 
@@ -688,13 +760,14 @@ swapper 模型**，而不只是建 PSNR 基线。详见「第二轮真机数据�
   「闸门为 False、**每一个** `swap_core_batched` 调用都在闸门分支内、
   `batch_slot` 默认 None」这三条。
 
-#### 解冻步骤（受控实验已证当前模型不可解冻，以下步骤须先换模型）
+#### 解冻步骤（受控实验已证像素不等价，以下步骤须先重构输入依赖）
 
 > **执行前必读**：11-06 已在 `static-batch=1` 模型上按第 2 步临时开闸
 > 做过受控实验，当时结果是 ONNX 维度拒绝 + `CUDA failure 700` 崩溃。
-> 该安全缺陷已修（复测确认误开闸门干净回退、PSNR=`inf`），但
-> **换支持动态 batch 的 swapper 模型之前不要重跑这套步骤**，闸门保持
-> `False`。
+> 该安全缺陷已修（复测确认误开闸门干净回退、PSNR=`inf`），动态 batch
+> 模型也已在 P0 中构造并验证；但第三轮证明 batch 路径 PSNR 仅
+> 45.69 dB。**在重构 prepare/finish 的输入依赖、拿到逐帧 PSNR=`inf`
+> 之前不要重跑这套步骤**，闸门保持 `False`。
 
 1. 准备多人脸视频样本，分别覆盖 bbox 不重叠与重叠两种情况，记录
    `workers=1` 逐脸路径的输出作为 PSNR 基线。
@@ -740,9 +813,10 @@ swapper 模型**，而不只是建 PSNR 基线。详见「第二轮真机数据�
 - **硬条件**：`workers >= 2`、`every_nth == 1`、仅 `inswapper-128`、
   关闭 `StrengthSwitch` / `HighFidelitySwitch`、动态 batch 可用、每帧人脸数
   恒为 1、`pipeline_size` 恒为 128、`index` 连续、**PTS 严格递增**。
-  **11-06 补充**：其中「动态 batch 可用」在当前
-  `inswapper_128.fp16.onnx`（`static-batch=1`）上恒不满足，因此 7.2 与
-  7.1 一样被模型能力阻断，见「第二轮真机数据」的 7.1 受控实验。
+  **11-06 补充**：原 `inswapper_128.fp16.onnx`（`static-batch=1`）上这条
+  恒不满足；P0 已用本地图改写构造出数值等价的动态 batch 模型，能力问题
+  可解。但 7.1 的受控复测显示 batch 路径 PSNR 仅 45.69 dB，因此 7.2 与
+  7.1 一样**最终受像素等价阻断**，见「第三轮真机数据」。
   最后两条是 VFR 时序的守门条件：batch 只能切，不能排序。
 - `group_frames()` 只做有序切片，保留不足一组的尾部；分组不允许排序。
 - `tests/test_cross_frame_batch.py`：7 项行为测试，覆盖上述全部条件、闸门、
@@ -770,7 +844,7 @@ swapper 模型**，而不只是建 PSNR 基线。详见「第二轮真机数据�
 
 **仍未验证**：GPU 侧前向与回填本身、逐帧 PSNR、VFR/音画时序、以及省下
 ORT 调用后的实际收益——这些必须在 GPU 环境做（环境现已具备，缺的是执行）。
-解冻步骤（截至 2026-11-06 三次核对全部未执行）：
+解冻步骤（截至 2026-11-06 六次核对仍未执行，且同样受像素等价阻断）：
 
 1. 有 GPU 环境后，用多人脸 + 单人险混合片段建立 `workers=1` 的逐帧 PSNR 基线。
 2. 在 `frame_order.ordered_swap_frames` 的消费侧，按 `resolve_cross_frame_batch`
@@ -808,10 +882,14 @@ ORT 调用后的实际收益——这些必须在 GPU 环境做（环境现已�
 - CLI `video --decoder pyav|gpu`，默认 `pyav`；`_encode_video` 按
   `DecoderPlan` 选择帧源，`decoded()` 的 PyAV 路径一行未改。
 
-**真机未验证**：`torchcodec` **未安装**（`importlib.util.find_spec` 返回
-`None`），因此 frame 布局与 PTS 单位、VFR 时序、音画同步、省掉上传后的
-收益一项都没能核对。GPU 硬件已具备，缺的是这个可选依赖；装上后再按
-8.1 的适配层约定核对，不传开关即回原路径。
+**真机已核对（本环境不可用）**：11-06 装上 `torchcodec 0.17.0` 后
+`import` 即抛 `libtorchcodec_image.so: undefined symbol: torch_from_blob`，
+`nm -D libtorch_cpu.so` 确认 `torch 2.10.0+cu128` 不含该符号，属
+torch / torchcodec **ABI 不匹配**。`--decoder gpu` 按本节设计明确报
+`GPU decode unavailable` 并建议 `--decoder pyav`，**没有静默回退**；
+验证后已卸载恢复环境。因此 frame 布局、PTS 单位、VFR 时序仍未能核对，
+且 nsys 显示 H2D memcpy 仅 0.181s / 36s（收益上限 <1%），不值得为此
+降级 torch。详见「第三轮真机数据」的 P2 小节。
 
 ### 8.2 NVENC 编码开关（已实现，默认关闭）
 
@@ -859,12 +937,13 @@ FFmpeg 附带日志称驱动需 570+（本机 580，故更可能是 NVENC 设备
 
 ## 10. 优先级与执行顺序
 
-> **完成度说明（2026-11-06 五次核对，含 7.1 受控实验与 P1 修复）**：下表直接标出
-> 各阶段的**实测收益与真机状态**。11 项均已给出结论：8 项有实测数据，
-> 4.1 / 4.3 被 `static-batch=1` 模型阻断，5b 缺可选依赖。代码与离线
+> **完成度说明（2026-11-06 六次核对，含 P0 / P1 / P2 收口）**：下表直接
+> 标出各阶段的**实测收益与真机状态**。11 项均已给出结论：9 项有实测
+> 数据或明确的不可用结论，4.1 / 4.3 剩像素等价这一项阻断。代码与离线
 > 测试的逐项状态见开头「完成情况核对」表。nsys 把瓶颈锁定在逐脸 ORT
-> Run 与 stream 同步，但唯一对症的 batch 路线被模型能力卡住，
-> **后续优先级已改为「先解决模型能力」，不再按并发或主机侧开销排**。
+> Run 与 stream 同步；P0 已证明动态 batch 模型可本地构造，但 7.1 的
+> prepare/finish 仍导致 PSNR 45.69 dB，**后续优先级改为「先解决像素
+> 等价」，不再按并发、主机侧开销或模型能力排**。
 
 | 顺序 | 阶段 | 实测收益 | 工作量 | 风险 | 真机状态 |
 |---|---|---|---|---|---|
@@ -872,25 +951,27 @@ FFmpeg 附带日志称驱动需 570+（本机 580，故更可能是 NVENC 设备
 | 1 | `--workers N` | **1.50–1.63×**（30s 基线） | 已完成 | 中（GIL 已命中） | **基本完成** |
 | 2 | 编码独立线程 | **负收益**（4.1 → 3.9 fps） | 已完成 | 中 | **已验证，不启用** |
 | 3 | 延迟 D2H / arena 策略 | **无收益**（4.1 → 4.0 fps） | 已完成 | 低 | **已验证，不启用** |
-| 4.1 | 单帧多脸 batch | 受控开闸曾触发 CUDA 700；已修为干净回退 | 代码已编写、闸门关闭 | 高（模型限制） | **模型阻断**；误开已安全（PSNR=`inf`） |
+| 4.1 | 单帧多脸 batch | 动态模型下 75 次 batch 调用；PSNR 45.69 dB | 代码已编写、闸门关闭 | 高（像素不等价） | **像素阻断**；误开已安全 |
 | 4.2 | 跳过无用的逐脸 recognize | 中（每帧省 N 次 ORT） | 已完成 | 极低 | **间接验证**（nsys） |
-| 4.3 | 跨帧 batch | — | 代码已编写、未挂载 | 高 | **模型阻断**（放最后） |
+| 4.3 | 跨帧 batch | — | 代码已编写、未挂载 | 高 | **像素阻断**（放最后） |
 | 5a | NVENC 编码开关 | 环境不支持 | 已完成 | 中 | **已验证不可用** |
-| 5b | GPU 常驻解码 | 未测 | 已完成 | 中 | **未做**（缺 `torchcodec`） |
+| 5b | GPU 常驻解码 | torchcodec / torch ABI 不匹配 | 已完成 | 中 | **已验证不可用** |
 | 6 | detector 输出缓冲复用 | **无收益**（4.1 → 4.0 fps） | 已完成 | 低 | **已验证，PSNR=inf** |
 | 7 | 帧路径零拷贝归一化 | **无收益**（4.1 → 3.9 fps） | 已完成 | 低 | **已验证，PSNR=inf** |
 
-建议的**后续顺序**（三次核对 + 7.1 受控实验后重排）：阶段 2 / 3 / 6 / 7
-已由 A/B 证伪、5a 环境不可用，**不再投入**；`--workers` 也已到收益递减区。
-唯一剩余的前置条件是**换用支持动态 batch 的 swapper 模型**，之后才谈得上
-`7.1 解冻 → 4.3 跨帧 batch`；5b 装 torchcodec 收益上限 <1%，排最后。
+建议的**后续顺序**（六次核对后重排）：阶段 2 / 3 / 6 / 7 已由 A/B 证伪，
+5a / 5b 已核对为环境不可用，**不再投入**；`--workers` 也到收益递减区。
+唯一剩余的前置条件是**重构 7.1 的 prepare/finish 输入依赖，让 batch
+输出与逐脸逐帧 PSNR=`inf`**，之后才谈得上 `7.1 解冻 → 4.3 跨帧 batch`。
+动态 batch 模型已作为评估产物备好（`models/inswapper_128.fp16.dynbatch.onnx`），
+不必再找外部模型。
 
 理由是 nsys 把瓶颈锁定在逐脸 `ort_run_swapper`（225 次 / 11.77s）与
 `cudaStreamSynchronize`（占 CUDA API 时间 75.6%），只有减少 ORT 调用
 次数才对症；而编码、D2H、显存分配、主机侧 memcpy 合计不足总用时 1%。
-但当前 `inswapper_128.fp16.onnx` 的 batch 维锁死为 1，受控开闸实验
-已证明会触发 `CUDA failure 700`，所以 7.1 的五步解冻流程在换模型之前
-**不得执行**。GPU / VRAM 曲线因同机外部负载无法隔离，不再列为待办。
+P1 修好了 CUDA 700、P0 解决了 `static-batch=1`，但第三轮实测 batch 对
+逐脸仍只有 PSNR 45.69 dB，所以 7.1 的五步解冻流程在拿到逐帧 PSNR=`inf`
+之前**不得执行**。GPU / VRAM 曲线因同机外部负载无法隔离，不再列为待办。
 
 ---
 
@@ -915,7 +996,7 @@ FFmpeg 附带日志称驱动需 570+（本机 580，故更可能是 NVENC 设备
 
 ## 12. 不改代码、现在就能做的措施
 
-> **11-06 五次核对**：以下仍是最有效的现成配置。但真机 A/B 已确认
+> **11-06 六次核对**：以下仍是最有效的现成配置。但真机 A/B 已确认
 > **除 `--workers 2` 外，阶段 2 / 3 / 6 / 7 的开关都没有收益**，不要再
 > 叠加 `--encode-thread` / `--defer-d2h` / `--reuse-detect-buffers` /
 > `--zero-copy-frames`；NVENC 在本环境还不可用。
@@ -994,7 +1075,7 @@ ffprobe -v error -select_streams v:0 -show_entries stream=profile,bit_rate \
 | CLI 参数 | `cli.py::build_parser`：阶段 0–3（`--workers` / `--profile` / `--encode-thread` / `--defer-d2h` / `--arena-strategy` / `--force-recognize`）、阶段 5（`--encoder` / `--decoder`）、阶段 6–7（`--reuse-detect-buffers` / `--zero-copy-frames`），以及 `--preset` / `--crf` / `--every-nth` / `--backend` |
 | 完成计时 / avg fps | `cli.py::main`、`_format_elapsed`、`_format_avg_fps` |
 | 分段计时 | `headless.py::_encode_video`、`cli.py::_format_profile` |
-| 离线测试（18 个模块，2026-11-06 五次核对 `--strict` 18/18 PASS） | `tests/test_cli.py`、`test_timing.py`、`test_wiring.py`、`test_hyperswap.py`、`test_model_store.py`、`test_install.py`（已改为环境无关断言）、`test_target_match.py`、`test_encoder.py`、`test_encoder_probe.py`、`test_decoder.py`、`test_frame_order.py`、`test_recognize.py`、`test_face_batch.py`（已补动态 batch 判据与接线 AST 测试）、`test_cross_frame_batch.py`、`test_bench_plan.py`（已补 PSNR / dmon 测试）、`test_detect_buffers.py`、`test_frame_upload.py`、`test_suite_runner.py` |
+| 离线测试（18 个模块，2026-11-06 六次核对 `--strict` 18/18 PASS） | `tests/test_cli.py`、`test_timing.py`、`test_wiring.py`、`test_hyperswap.py`、`test_model_store.py`、`test_install.py`（已改为环境无关断言）、`test_target_match.py`、`test_encoder.py`、`test_encoder_probe.py`、`test_decoder.py`、`test_frame_order.py`、`test_recognize.py`、`test_face_batch.py`（已补动态 batch 判据与接线 AST 测试）、`test_cross_frame_batch.py`、`test_bench_plan.py`（已补 PSNR / dmon 测试）、`test_detect_buffers.py`、`test_frame_upload.py`、`test_suite_runner.py` |
 | 命名与 GUI 遗留 | `docs/adr/0001-keep-gui-era-parameter-naming.md`、`CONTEXT.md` |
 
 ---
