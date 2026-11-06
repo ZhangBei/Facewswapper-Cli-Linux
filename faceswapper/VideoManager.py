@@ -14,6 +14,7 @@ from faceswapper.cross_frame_batch import (
     run_cross_frame_batch,
 )
 from faceswapper.face_batch import FaceCandidate, batch_eligibility
+from faceswapper.frame_upload import normalize_plan
 from faceswapper.recognize import should_skip_recognize
 
 
@@ -145,6 +146,10 @@ class VideoManager():
         # 默认 False：headless video 且未指定 --target-face 时，那些 embedding
         # 没有任何读取方，跳过可省掉每帧 N 次 ArcFace 推理。
         self.force_recognize: bool = False
+        # 阶段 7：帧已是 uint8 C contiguous 时跳过 ``astype('uint8')`` 的整帧
+        # 复制，直接把原数组交给 torch.from_numpy。默认 False，关掉时
+        # _swap_video_inner 的表达式逐字不变。
+        self.zero_copy_frames: bool = False
 
         # 自动朝向状态（OrientAutoSwitch）。`detected_orient_angle` 是 4 向
         # 探测缓存下来的胜出旋转（None = 下一帧重新探测）。
@@ -350,7 +355,25 @@ class VideoManager():
             if img.dtype != torch.uint8:
                 img = img.to(torch.uint8)
         else:
-            img = torch.from_numpy(target_image.astype('uint8')).to('cuda') #HxWxc
+            # 阶段 7：闸门关闭时逐字保留原来的 astype；开启后仅当帧已是
+            # uint8 C contiguous 时复用原数组，省掉一整帧 memcpy。PyAV 每帧
+            # to_ndarray 都产出新数组，跳过复制只会让 torch.from_numpy 借用
+            # 它，同步 .to('cuda') 完成前不会有别人改写这块内存。
+            if self.zero_copy_frames:
+                plan = normalize_plan(
+                    target_image.dtype.name,
+                    bool(target_image.flags.c_contiguous),
+                    target_image.shape[0],
+                    target_image.shape[1],
+                    zero_copy=True,
+                )
+                frame = (
+                    target_image if not plan.needs_copy
+                    else np.ascontiguousarray(target_image, dtype=np.uint8)
+                )
+            else:
+                frame = target_image.astype('uint8')
+            img = torch.from_numpy(frame).to('cuda') #HxWxc
         img = img.permute(2,0,1)#cxHxW
         
         # 画面小于 512 时放大

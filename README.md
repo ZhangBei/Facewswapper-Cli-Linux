@@ -701,8 +701,9 @@ python -m faceswapper.cli --models ./models video \
 所以单纯调大显存池不会提速，`saved_parameters.json` 里的 `ThreadsSlider`
 是没有读取方的遗留参数，改它无效。前面「低显存 / 最快配置」里列的
 `--preset ultrafast`、降分辨率、关掉可选功能等仍然有效，但它们是减少总
-耗时，不会让 GPU 吃满。`--every-nth` 是抽样验证、不是加速；`--target-face`
-只影响人脸筛选，每帧的识别 embedding 仍会计算，去掉它提速有限。
+耗时，不会让 GPU 吃满。`--every-nth` 是抽样验证、不是加速。`--target-face`
+只影响人脸筛选：未指定时逐脸识别 embedding 默认已跳过（见阶段 4，像素不变，
+省每帧 N 次 ArcFace 推理）；指定时要按相似度筛人，embedding 照常计算。
 
 要真正提高 GPU 利用率和显存占用，需要增加并发。下面第二档已落地为
 `--workers N`（默认 `1`，走原来的串行路径）：
@@ -876,6 +877,44 @@ python -m faceswapper.cli --models ./models video \
 **真机未验证**：ORT 是否每帧完整覆写这 9 个缓冲、复用后逐帧 PSNR、以及省下
 分配后的实际 `avg fps` 收益。按方案第 10 节的 A/B 顺序测；不传该开关即回滚。
 
+#### 阶段 7：帧路径零拷贝归一化（少一次整帧 memcpy）
+
+帧路径上有多处 `frame.astype("uint8")`：numpy 的 `astype` 默认 `copy=True`，
+哪怕输入已经是 `uint8` 且 C contiguous，也会**无条件**复制一整帧。PyAV 的
+`to_ndarray(format="rgb24")`（H2D 侧）与 `_finalize_frame` 的 D2H 结果恰好常
+常已经满足这两个条件。1080p RGB 单侧约 6.2 MB，H2D + D2H 两侧合计约
+12.4 MB/帧，60 秒 30fps 就是约 22 GB 纯内存带宽——不碰 GPU 计算，也不改一个
+像素。
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target input.mp4 --output output.mp4 \
+    --zero-copy-frames
+```
+
+判定抽在 stdlib-only 的 `frame_upload.py`：`normalize_plan()` 只吃 `dtype` /
+`c_contiguous` / `height` / `width` / 闸门，返回 `FramePlan`（是否要复制、省下
+的字节数、原因）。生产代码读取 `rgb.dtype.name` 与
+`rgb.flags.c_contiguous` 后按 plan 决定直接复用原数组，或用
+`np.ascontiguousarray(..., dtype=np.uint8)` 一次完成转换 + 整理。模块本身不
+import numpy，因此闸门关闭、命中、dtype 不符、布局不连续、字节预算都能离线
+做真行为测试。
+
+共接了 5 个调用点：`VideoManager._swap_video_inner` 的 CPU numpy H2D 分支，
+以及 `headless.py` 的 `source_embedding()`、`_detect_face_slots()`、
+`ImageSwapper.swap()`、`_finalize_frame()`。跳过复制时返回的是与输入共享内存
+的数组，调用方只把它交给同步的 `torch.from_numpy(...).to("cuda")` /
+`VideoFrame.from_ndarray`，不会原地写它；PyAV 每帧 `to_ndarray` 都产出新数组，
+不存在跨帧复用。
+
+默认**关闭**：闸门关闭时所有 `astype` 表达式逐字保留（AST 测试钉住 H2D 分支
+与 `_frame_to_uint8` 两条 fallback）。开启后也不改像素——dtype 或布局不满足时
+仍照旧复制，只是不再对已经合格的帧做无用功。
+
+**真机未验证**：逐帧 PSNR 是否完全一致、PyAV / torchcodec / NVENC 各路径实际
+给出的 dtype 与布局、以及省下 memcpy 后的 `avg fps` 收益。按方案第 10 节的
+A/B 顺序测；不传该开关即回滚。
+
 #### GPU 基线验收脚本
 
 方案 3.4 的 `workers=1/2/4` 矩阵已封装成 `tools/bench_gpu.py`，**默认
@@ -970,6 +1009,7 @@ python -m faceswapper.cli \
 | `--backend` | `cuda`（纯 CUDA EP，不尝试 TensorRT）或 `trt`（需 TensorRT 10 运行时） | `cuda` |
 | `--arena-strategy` | `same`（按需分配）或 `pow2`（减少重复 `cudaMalloc`，只是让 VRAM 数字变大，不是提速手段） | `same` |
 | `--reuse-detect-buffers` | 复用 detector 的 9 个 `io_binding` 输出缓冲，省掉每帧 9 次显存分配；`--backend trt` 下自动关闭 | 关闭 |
+| `--zero-copy-frames` | 帧已是 `uint8` C contiguous 时跳过 `astype` 的整帧复制（H2D 与 D2H 两侧），不改变像素 | 关闭 |
 
 > **`--detect-input-size` 不要随便调小。** 它只影响检测器输入分辨率，
 > 不影响换脸质量——调小是纯速度交易：`480` ≈ 1.8× 快，`416` ≈ 2.4×，

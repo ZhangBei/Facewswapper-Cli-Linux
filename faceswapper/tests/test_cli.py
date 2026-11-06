@@ -364,6 +364,154 @@ def test_detect_buffer_reuse_wiring() -> None:
     print("  ok  reuse is gated off by default and keeps the per-frame fallback")
 
 
+def test_zero_copy_frames_flag() -> None:
+    """阶段 7 开关默认关闭，且属于 add_common（swap 也能用）。"""
+    parser = build_parser()
+    base = ["video", "--source", "face.jpg", "--target", "in.mp4",
+            "--output", "out.mp4"]
+    plain = parser.parse_args(base)
+    if plain.zero_copy_frames is not False:
+        fail(f"zero-copy flag defaults to {plain.zero_copy_frames!r}")
+    tuned = parser.parse_args(base + ["--zero-copy-frames"])
+    if tuned.zero_copy_frames is not True:
+        fail("--zero-copy-frames was not accepted by video")
+    image = parser.parse_args([
+        "swap", "--source", "a.jpg", "--target", "b.jpg",
+        "--output", "o.png", "--zero-copy-frames",
+    ])
+    if image.zero_copy_frames is not True:
+        fail("--zero-copy-frames should be a common flag")
+    print("  ok  --zero-copy-frames defaults off and parses for video/swap")
+
+
+def test_zero_copy_frames_wiring() -> None:
+    """钉住阶段 7 的闸门与旧路径：关掉时帧归一化表达式逐字不变。
+
+    H2D（VideoManager）与 D2H / 图片（headless）两侧都要检查：只要哪一侧
+    把 astype 直接删了，默认路径的行为就不再是基线，回滚也就没有意义。
+    """
+    import ast
+
+    root = Path(__file__).resolve().parents[1]
+
+    def parse(name):
+        return ast.parse((root / name).read_text(encoding="utf-8"))
+
+    def module(nodes):
+        return ast.Module(body=list(nodes), type_ignores=[])
+
+    def defaults(tree, field):
+        values = []
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.AnnAssign)
+                    and isinstance(node.value, ast.Constant)):
+                continue
+            target = node.target
+            name = (
+                target.id if isinstance(target, ast.Name)
+                else target.attr if isinstance(target, ast.Attribute)
+                else None
+            )
+            if name == field:
+                values.append(node.value.value)
+        return values
+
+    def imports(tree, name):
+        return any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "faceswapper.frame_upload"
+            and any(alias.name == name for alias in node.names)
+            for node in ast.walk(tree)
+        )
+
+    def is_astype_uint8(node):
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "astype"
+            and any(
+                isinstance(arg, ast.Constant) and arg.value == "uint8"
+                for arg in node.args
+            )
+        )
+
+    headless = parse("headless.py")
+    vm = parse("VideoManager.py")
+
+    if defaults(headless, "zero_copy_frames") != [False]:
+        fail("SwapOptions.zero_copy_frames must default to False")
+    if defaults(vm, "zero_copy_frames") != [False]:
+        fail("VideoManager.zero_copy_frames must default to False")
+    if not (imports(headless, "normalize_plan")
+            and imports(vm, "normalize_plan")):
+        fail("both frame paths must delegate to frame_upload.normalize_plan")
+
+    helper = next(
+        (n for n in ast.walk(headless)
+         if isinstance(n, ast.FunctionDef) and n.name == "_frame_to_uint8"),
+        None,
+    )
+    if helper is None:
+        fail("_frame_to_uint8 helper is missing")
+    gates = [
+        n for n in ast.walk(helper)
+        if isinstance(n, ast.If)
+        and isinstance(n.test, ast.UnaryOp)
+        and isinstance(n.test.op, ast.Not)
+        and isinstance(n.test.operand, ast.Name)
+        and n.test.operand.id == "zero_copy"
+    ]
+    if len(gates) != 1:
+        fail(f"expected one closed-gate branch, found {len(gates)}")
+    returns = [n.value for n in gates[0].body if isinstance(n, ast.Return)]
+    if len(returns) != 1 or not is_astype_uint8(returns[0]):
+        fail("closed gate must keep rgb.astype('uint8') verbatim")
+
+    fn = next(
+        (n for n in ast.walk(vm)
+         if isinstance(n, ast.FunctionDef) and n.name == "_swap_video_inner"),
+        None,
+    )
+    if fn is None:
+        fail("_swap_video_inner not found")
+    branches = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.If) and "zero_copy_frames" in ast.dump(n.test)
+    ]
+    if len(branches) != 1:
+        fail(f"expected one zero-copy H2D branch, found {len(branches)}")
+    branch = branches[0]
+    body_calls = {
+        n.func.id for n in ast.walk(module(branch.body))
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+    }
+    if "normalize_plan" not in body_calls:
+        fail("zero-copy H2D branch does not consult normalize_plan")
+    if not branch.orelse:
+        fail("the original astype H2D fallback is missing")
+    fallback_values = [
+        n.value for n in ast.walk(module(branch.orelse))
+        if isinstance(n, ast.Assign)
+    ]
+    if not any(is_astype_uint8(value) for value in fallback_values):
+        fail("H2D fallback must keep target_image.astype('uint8') verbatim")
+
+    wired = any(
+        isinstance(node, ast.Assign)
+        and any(
+            isinstance(t, ast.Attribute)
+            and t.attr == "zero_copy_frames"
+            and isinstance(t.value, ast.Attribute)
+            and t.value.attr == "vm"
+            for t in node.targets
+        )
+        for node in ast.walk(headless)
+    )
+    if not wired:
+        fail("SwapOptions.zero_copy_frames is not wired into VideoManager")
+    print("  ok  zero-copy is gated off and keeps both astype fallbacks")
+
+
 def test_video_encoder_flag() -> None:
     """--encoder 默认 libx264，nvenc 需显式选择。"""
     parser = build_parser()
@@ -553,6 +701,7 @@ def test_all_new_video_flags_compose() -> None:
         "--workers", "4", "--profile", "--encode-thread", "--defer-d2h",
         "--force-recognize", "--encoder", "nvenc", "--decoder", "gpu",
         "--arena-strategy", "pow2", "--reuse-detect-buffers",
+        "--zero-copy-frames",
         "--crf", "23", "--preset", "fast",
         "--every-nth", "2", "--no-audio", "--backend", "cuda",
     ])
@@ -560,8 +709,8 @@ def test_all_new_video_flags_compose() -> None:
         "workers": 4, "profile": True, "encode_thread": True,
         "defer_d2h": True, "force_recognize": True, "encoder": "nvenc",
         "decoder": "gpu", "arena_strategy": "pow2", "crf": 23, "preset": "fast",
-        "every_nth": 2, "no_audio": True, "backend": "cuda",
-        "reuse_detect_buffers": True,
+        "every_nth": 2,         "no_audio": True, "backend": "cuda",
+        "reuse_detect_buffers": True, "zero_copy_frames": True,
     }
     for key, value in expected.items():
         got = getattr(args, key)
@@ -587,6 +736,7 @@ def test_switch_defaults_match_baseline() -> None:
         "defer_d2h": False, "force_recognize": False,
         "encoder": "libx264", "decoder": "pyav",
         "arena_strategy": "same", "reuse_detect_buffers": False,
+        "zero_copy_frames": False,
         "crf": 18, "preset": "medium", "every_nth": 1,
         "no_audio": False, "backend": "cuda",
     }
@@ -657,7 +807,9 @@ def test_headless_module_syntax() -> None:
         if isinstance(node, ast.ClassDef)
     }
     expected_fields = {
-        "SwapOptions": ("arena_strategy", "reuse_detect_buffers"),
+        "SwapOptions": (
+            "arena_strategy", "reuse_detect_buffers", "zero_copy_frames",
+        ),
         "VideoOptions": (
             "profile", "encode_thread", "defer_d2h", "force_recognize",
             "encoder", "decoder", "workers",
@@ -850,6 +1002,8 @@ def main() -> int:
     test_stage3_flags()
     test_reuse_detect_buffers_flag()
     test_detect_buffer_reuse_wiring()
+    test_zero_copy_frames_flag()
+    test_zero_copy_frames_wiring()
     test_force_recognize_flag()
     test_video_encoder_flag()
     test_recognize_wiring()

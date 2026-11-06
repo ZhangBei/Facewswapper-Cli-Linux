@@ -1,6 +1,6 @@
 # 提升 GPU 与 VRAM 利用率的实施方案
 
-日期：2026-11-05
+日期：2026-11-05（最近核对：2026-11-06）
 
 ## 状态
 
@@ -15,7 +15,8 @@
 - 阶段 4 的 7.1 代码已编写，接入点受闸门保护、默认短路
   （`EXPERIMENTAL_FACE_BATCH=False`）；需 GPU 环境做多人脸 PSNR 比对后才能
   解冻，见 7.1 的五条阻断条件与解冻步骤。另实现了一条等价且更安全的优化：
-  跳过没有读取方的逐脸 `run_recognize`，`--force-recognize` 可回滚。
+  跳过没有读取方的逐脸 `run_recognize`，`--force-recognize` 可回滚；这是全部
+  改造中**唯一默认生效**的行为变化（不改变像素）。
 - 阶段 5 的编码侧（`--encoder libx264|nvenc`）与解码侧
   （`--decoder pyav|gpu`）代码均已落地，两个默认值都不变；两者都需要真机
   核对第三方 API/参数。阶段 4 的 7.2 判定 / 分组 / 前向与回填编排均已落地，
@@ -23,12 +24,55 @@
 - 阶段 6 的 `--reuse-detect-buffers` 已落地（默认关闭、`trt` 后端自动关闭），
   shape 计算 / 闸门 / per-worker 缓存均有离线行为测试，默认帧路径逐字保留；
   ORT 是否每帧完整覆写复用缓冲、逐帧 PSNR 与实际收益仍需真机核对，见第 14 节。
+- 阶段 7 的 `--zero-copy-frames` 已落地（默认关闭），frame dtype / layout 判定
+  与字节预算抽到 stdlib-only 的 `frame_upload.py`，H2D 与 D2H 两侧的 `astype`
+  fallback 由 AST 测试钉住；逐帧 PSNR、各解码路径实际 dtype / layout 与真实
+  memcpy 带宽收益仍需真机核对，见第 15 节。
 - 当前环境没有 GPU 栈，以上均为代码层实现，**未做任何真机性能验证**；
   3.4 的基线矩阵仍是后续所有阶段的前置条件。
 
-适用范围：headless CLI 的 `video` / `swap` 路径。文中代码位置以 2026-11-05
-的代码快照为准，后续改动后请以函数名而非行号定位。术语沿用
-[CONTEXT.md](../CONTEXT.md) 的约定：中文行文，领域术语保留英文原词。
+### 完成情况核对（2026-11-06）
+
+对照代码库逐项复查的结果：**代码层 11 个阶段 / 子项全部收口，真机验证 0 项
+完成**。因此本文出现的「待验证步骤」「解冻步骤」「真机验收清单」截至目前
+都还是未执行项，不是已完成项。
+
+| 阶段 | 代码 | 离线测试 | 默认行为 | 真机验证 |
+|---|---|---|---|---|
+| 0 基线 / `avg fps` / `--profile` | 已完成 | PASS | 默认生效 | **未做**（3.4 矩阵待 `--run`） |
+| 1 `--workers N` | 已完成 | PASS | `workers=1`（串行） | **未做** |
+| 2 `--encode-thread` | 已完成 | PASS | 关闭 | **未做** |
+| 3 `--defer-d2h` / `--arena-strategy` | 已完成（保守版） | PASS | 均关闭 | **未做**（含 nsys） |
+| 4.1 单帧多脸 batch | 已编写、未挂载主路径 | PASS + AST 闸门 | `EXPERIMENTAL_FACE_BATCH=False` | **未做**（解冻前置） |
+| 4.2 跳过逐脸 recognize | 已完成 | PASS | **默认生效**，`--force-recognize` 回滚 | **未做** |
+| 4.3 跨帧 batch | 已编写、未挂载主路径 | PASS + AST 未挂载 | `EXPERIMENTAL_CROSS_FRAME_BATCH=False` | **未做** |
+| 5a NVENC 编码 | 已完成 | PASS | 关闭（默认 `libx264`） | **未做** |
+| 5b GPU 常驻解码 | 已完成 | PASS | 关闭（默认 `pyav`） | **未做** |
+| 6 detector 输出缓冲复用 | 已完成 | PASS | 关闭，`trt` 自动关 | **未做**（第 14 节清单） |
+| 7 帧路径零拷贝 | 已完成 | PASS | 关闭 | **未做**（第 15 节清单） |
+
+核对依据：`faceswapper/tests/` 下 17 个离线模块，16 个 PASS；
+`test_target_match` 因本机未装 numpy 报 `ModuleNotFoundError`（环境缺失，
+非代码缺陷）；四个实验 / 优化闸门均为 `False`；`compileall` 与
+`git diff --check` 通过。
+
+三点需要特别留意：
+
+1. **唯一默认改变行为的项是 4.2**。其余新开关全部默认关闭或闸门为 False，
+   不传开关即回到基线路径；这也是本文所有回滚说明的前提。
+2. **7.1 / 7.2 是「代码已编写但冻结」**，不是「已实现可用」。判定、编排、
+   推理骨架齐备且离线测试通过，但主流水线没有挂载、没有 CLI flag，启用前
+   必须先做逐帧 PSNR。
+3. **真机侧仍是整张白纸**：`elapsed` / `avg fps` / GPU 与 VRAM 曲线、
+   `ffprobe` 帧数与 PTS / VFR / 音画同步、与 `workers=1` 的逐帧 PSNR、
+   nsys host stall、NVENC 与 torchcodec 的第三方 API 行为、以及 7.1 / 7.2
+   解冻后的收益数字，一项都还没有采集。前置动作只有一条：
+   `python tools/bench_gpu.py ... --run`。
+
+适用范围：headless CLI 的 `video` / `swap` 路径。文中代码位置以函数名定位，
+括号里的行号来自 2026-11-05 的代码快照；阶段 6 / 7 及后续改动后请勿依赖
+行号。术语沿用 [CONTEXT.md](../CONTEXT.md) 的约定：中文行文，领域术语保留
+英文原词。
 
 ---
 
@@ -58,7 +102,7 @@
 | B1 | 解码（PyAV，CPU）、GPU 推理、libx264 编码全在**同一个线程逐帧串行** | `headless.py::_encode_video` |
 | B2 | `Shared` 模式下每次 ORT 调用前做一次阻塞式 `syncvec.cpu()`；每帧结束还有 `result.detach().cpu().numpy()` | `Models.py::_should_drain_syncvec`、`headless.py::_swap_frame` |
 | B3 | ORT session 单份 `Shared`；CUDA EP 用 `arena_extend_strategy=kSameAsRequested` 按需分配 VRAM | `Models.py::__init__`、`Models.py::_cuda_ep_provider_options` |
-| B4 | 换脸按脸逐个 ORT Run，没有跨帧 batch；`run_swapper_batched` 只在 polyphase 内部使用 | `VideoManager.py::_swap_video_inner`、`Models.py::run_swapper_batched` |
+| B4 | 换脸按脸逐个 ORT Run，没有跨帧 batch；生产路径上 `run_swapper_batched` 只在 polyphase 内部使用（阶段 4 的冻结骨架另有 3 处调用，闸门关闭、不进帧路径） | `VideoManager.py::_swap_video_inner`、`Models.py::run_swapper_batched` |
 | B5 | `ThreadsSlider` 是零读取方的遗留参数；`_model_session_mode` 原本没有 setter | `parameters.py`、`Models.py` |
 | B6 | 可选 GPU 解码依赖被注释掉，但 `VideoManager.py::_swap_video_inner` 已接受 CUDA tensor 输入 | `requirements.txt`、`VideoManager.py` |
 | B7 | 逐脸 `run_recognize` 的结果在 headless 且无 `--target-face` 时完全没有读取方 | `VideoManager.py::_swap_video_inner`（已由 7.1 的替代优化跳过，`--force-recognize` 可回滚） |
@@ -139,6 +183,10 @@ python tools/bench_gpu.py --source face.jpg --target in.mp4 --run \
 
 **通过标准**：拿到可复现的数字，且 `workers=1` 的输出与改造前完全一致（回归基线）。
 
+> **核对状态（2026-11-06）**：脚本与 `bench_plan.py` 已落地、离线测试 PASS，
+> 但 `--run` 从未在 GPU 环境执行，上面的「通过标准」尚未达成。本矩阵仍是
+> 后续所有阶段的前置条件，不能因为代码齐了就跳过。
+
 ---
 
 ## 4. 阶段 1：`--workers N`（已实现，待真机验证）
@@ -163,7 +211,7 @@ python tools/bench_gpu.py --source face.jpg --target in.mp4 --run \
 future 完成才交给编码**，因此 PTS、VFR 时序、音画对齐与串行路径一致。`--every-nth`
 跳过的帧不提交、原样透传。
 
-### 4.2 待验证步骤
+### 4.2 待验证步骤（截至 2026-11-06 全部未执行）
 
 1. 用 3.4 的矩阵跑 `workers=1/2/4`，记录 `elapsed`、GPU 利用率、VRAM。
 2. `ffprobe -count_frames` 比对帧数与时长，检查音画偏移是否与 `workers=1` 一致。
@@ -346,7 +394,7 @@ stdlib-only，传入 torch stream 会破坏这条约束；而 `wait_stream` 本�
   「闸门为 False、**每一个** `swap_core_batched` 调用都在闸门分支内、
   `batch_slot` 默认 None」这三条。
 
-#### 解冻步骤（需要 GPU 环境）
+#### 解冻步骤（需要 GPU 环境，截至 2026-11-06 未执行）
 
 1. 准备多人脸视频样本，分别覆盖 bbox 不重叠与重叠两种情况，记录
    `workers=1` 逐脸路径的输出作为 PSNR 基线。
@@ -375,7 +423,7 @@ stdlib-only，传入 torch stream 会破坏这条约束；而 `wait_stream` 本�
 `tests/test_cli.py::test_recognize_wiring` 用 AST 守住接线与旧路径未删。
 **真机收益未测**；单人脸视频省 1 次识别，多人脸省 N 次。
 
-### 7.2 跨帧 batch —— 判定与闸门已落地，推理侧待真机
+### 7.2 跨帧 batch —— 判定 / 编排 / 推理骨架已落地，主流水线未挂载
 
 把 N 个 worker 的帧拼成一个 batch 一次 ORT Run，需要模型输入支持动态 batch
 （`_swapper_batch_unsupported` 已有探测），并重构整个帧流水线。会与 PTS 保序、
@@ -416,7 +464,8 @@ stdlib-only，传入 torch stream 会破坏这条约束；而 `wait_stream` 本�
   `frame_order.py` 都不调用它，也没有新 CLI flag。AST 测试守住这条。
 
 **仍未验证**：GPU 侧前向与回填本身、逐帧 PSNR、VFR/音画时序、以及省下
-ORT 调用后的实际收益——这些必须在 GPU 环境做。解冻步骤：
+ORT 调用后的实际收益——这些必须在 GPU 环境做。解冻步骤（截至 2026-11-06
+全部未执行）：
 
 1. 有 GPU 环境后，用多人脸 + 单人险混合片段建立 `workers=1` 的逐帧 PSNR 基线。
 2. 在 `frame_order.ordered_swap_frames` 的消费侧，按 `resolve_cross_frame_batch`
@@ -428,7 +477,7 @@ ORT 调用后的实际收益——这些必须在 GPU 环境做。解冻步骤�
 
 ---
 
-## 8. 阶段 5：GPU 解码 / NVENC 编码（编码侧已实现，GPU 解码待实施）
+## 8. 阶段 5：GPU 解码 / NVENC 编码（两侧代码均已实现，待真机验证）
 
 ### 8.1 GPU 常驻解码（代码已编写，实验性，默认关闭）
 
@@ -498,6 +547,10 @@ ORT 调用后的实际收益——这些必须在 GPU 环境做。解冻步骤�
 
 ## 10. 优先级与执行顺序
 
+> **完成度说明（2026-11-06 核对）**：下表「需真实 GPU 验证」列标的是
+> **必要性**，不是完成状态；该列 11 项截至目前**全部未做**。代码与离线测试的
+> 逐项状态见开头「完成情况核对」表。
+
 | 顺序 | 阶段 | 预期收益 | 工作量 | 风险 | 需真实 GPU 验证 |
 |---|---|---|---|---|---|
 | 0 | 基线 + `avg fps` + `--profile` | 无（但决定后续） | 代码已完成 | 极低 | 是（3.4 矩阵待跑） |
@@ -510,16 +563,21 @@ ORT 调用后的实际收益——这些必须在 GPU 环境做。解冻步骤�
 | 5a | NVENC 编码开关 | 中（只解 CPU 编码瓶颈） | 代码已完成 | 中（画质 / 驱动） | 是 |
 | 5b | GPU 常驻解码（torchcodec） | 未测 | 代码已完成、默认关闭 | 中（frame/PTS 单位） | 是 |
 | 6 | detector 输出缓冲复用 | 未测（省每帧 9 次分配） | 代码已完成、默认关闭 | 低（默认路径逐字保留） | 是 |
+| 7 | 帧路径零拷贝归一化 | 未测（1080p 省约 12.4 MB/帧 memcpy） | 代码已完成、默认关闭 | 低（两侧 `astype` fallback 逐字保留） | 是 |
 
 建议的**真机验证顺序**：`0 → 1 → 2 →（按 nsys 结果决定）3 → 阶段 4 的 7.1
 单帧多脸 batch → 5`。0–3 的代码已落地，但仍要按这个顺序逐个实测，不要
 因为代码齐了就跳过基线。跨帧 batch 放最后，除非前四步都测过仍不够。
 阶段 6 不改像素、回滚成本为零，可作为 3 之后的低风险 A/B 插队做；它只省
-分配器开销，不要当成吞吐瓶颈的主解法。
+分配器开销，不要当成吞吐瓶颈的主解法。阶段 7 同理，且只动主机侧 memcpy，
+可与阶段 6 合成一组 A/B；若 nsys 显示瓶颈不在 H2D / D2H，收益可能接近零。
 
 ---
 
 ## 11. 每阶段通用验收清单
+
+> **核对状态（2026-11-06）**：以下 5 条**均未在真机执行**。离线可覆盖的部分
+> （PTS / VFR 算术、flag 默认值、AST 接线）已有测试，但不能替代 GPU 实测。
 
 - `elapsed` / `avg fps` / `nvidia-smi` 利用率与 VRAM
 - `ffprobe` 帧数、时长、PTS 与音画同步
@@ -545,8 +603,10 @@ python -m faceswapper.cli --models ./models video \
 - 关闭 `--restorer` / `--occluder` / `--xseg` / `--face-parser` / `--color-match`
   可减少每帧的 ORT 调用。
 - `--detect-input-size` 保持 640；调小会漏检小脸。
-- `--every-nth` 是抽样验证，不是加速；`--target-face` 只影响人脸筛选，
-  每帧的识别 embedding 仍会计算。
+- `--every-nth` 是抽样验证，不是加速。`--target-face` 只影响人脸筛选：
+  **未指定时**逐脸识别 embedding 已由阶段 4.2 默认跳过（像素不变，省每帧
+  N 次 ArcFace 推理）；**指定时**要按相似度筛人，embedding 照常计算。
+  `--force-recognize` 可强制回到旧路径。
 - `--backend trt` 需先安装 TensorRT 10 运行时（提供 `libnvinfer.so.10`）。
 
 ### `--preset` 对文件体积的实测影响
@@ -594,11 +654,12 @@ ffprobe -v error -select_streams v:0 -show_entries stream=profile,bit_rate \
 | 后端偏好（cuda 不碰 TRT） | `Models.py::set_backend_preference_for_all`、`headless.py::_SwapperBase.__init__` |
 | 同步判断、CUDA EP 选项、session 选项 | `Models.py::_should_drain_syncvec`、`_cuda_ep_provider_options`、`_make_session_options` |
 | detector 输出缓冲 shape / 复用（阶段 6） | `detect_buffers.py::output_buffer_specs`、`resolve_reuse_buffers`、`OutputBufferCache`；`Models.py::set_reuse_detect_buffers`、`_get_retinaface_output_buffers`、`_detect_retinaface_inner` |
+| 帧零拷贝判定 / 字节预算（阶段 7） | `frame_upload.py::normalize_plan`、`frame_bytes`、`estimate_saved_bytes`；`headless.py::_frame_to_uint8`、`_finalize_frame`；`VideoManager.py::_swap_video_inner`；`tests/test_frame_upload.py` |
 | batch 推理 | `Models.py::run_swapper_batched`、`VideoManager.py::swap_core` |
-| CLI 参数 | `cli.py::build_parser`（`--workers`、`--preset`、`--crf`、`--every-nth`、`--backend`） |
+| CLI 参数 | `cli.py::build_parser`：阶段 0–3（`--workers` / `--profile` / `--encode-thread` / `--defer-d2h` / `--arena-strategy` / `--force-recognize`）、阶段 5（`--encoder` / `--decoder`）、阶段 6–7（`--reuse-detect-buffers` / `--zero-copy-frames`），以及 `--preset` / `--crf` / `--every-nth` / `--backend` |
 | 完成计时 / avg fps | `cli.py::main`、`_format_elapsed`、`_format_avg_fps` |
 | 分段计时 | `headless.py::_encode_video`、`cli.py::_format_profile` |
-| 离线测试 | `tests/test_cli.py`、`tests/test_timing.py`、`tests/test_hyperswap.py`、`tests/test_model_store.py` |
+| 离线测试（17 个模块，2026-11-06 核对） | `tests/test_cli.py`、`test_timing.py`、`test_wiring.py`、`test_hyperswap.py`、`test_model_store.py`、`test_install.py`、`test_target_match.py`（本机缺 numpy）、`test_encoder.py`、`test_encoder_probe.py`、`test_decoder.py`、`test_frame_order.py`、`test_recognize.py`、`test_face_batch.py`、`test_cross_frame_batch.py`、`test_bench_plan.py`、`test_detect_buffers.py`、`test_frame_upload.py` |
 | 命名与 GUI 遗留 | `docs/adr/0001-keep-gui-era-parameter-naming.md`、`CONTEXT.md` |
 
 ---
@@ -655,7 +716,7 @@ else 里仍有至少 3 次 `torch.empty`」。
 `delete_models()` 时它们仍常驻，属于既有行为，没有为阶段 6 新增特殊的清理
 语义。
 
-### 14.4 真机验收清单
+### 14.4 真机验收清单（截至 2026-11-06 未执行）
 
 1. `workers=1` 且不带开关，跑一段多人脸片段，存逐帧 PSNR 基线。
 2. 加 `--reuse-detect-buffers` 重跑，比对帧数、PTS、音画与逐帧 PSNR；
@@ -669,3 +730,80 @@ else 里仍有至少 3 次 `torch.empty`」。
 
 **回滚**：不传 `--reuse-detect-buffers` 即回到原路径；即使代码层改默认值，
 `resolve_reuse_buffers` 也只放行显式开启 + CUDA EP。
+
+---
+
+## 15. 阶段 7：帧路径零拷贝归一化
+
+> 与第 14 节同理，本节续在「相关代码索引」之后，不改动 2026-11-05 快照的
+> 章节号与交叉引用。实现日期 2026-11-06。
+
+### 15.1 依据
+
+帧路径上共有 5 处 `astype(uint8)`：`VideoManager._swap_video_inner` 的 CPU
+numpy H2D 分支，以及 `headless.py` 的 `source_embedding()`、
+`_detect_face_slots()`、`ImageSwapper.swap()`、`_finalize_frame()`。
+`numpy.astype` 默认 `copy=True`，**即使输入已是 uint8 C contiguous 也会整帧
+复制**。PyAV 的 `to_ndarray(format="rgb24")` 与 D2H 结果通常已经满足这两个
+条件，于是每帧白付一次全帧 memcpy。
+
+| 量 | 1080p RGB uint8 |
+|---|---|
+| 单帧字节 | `1920 × 1080 × 3 = 6,220,800 B`（约 5.9 MiB） |
+| H2D + D2H 两侧 | 约 12.4 MB/帧 |
+| 60 秒 × 30 fps | 约 22 GB 纯主机内存带宽 |
+
+这是主机侧带宽与 CPU 时间开销，与 GPU SM 利用率无关，VRAM 数字完全不变。
+因此**不要把它当成 GPU 利用率瓶颈的主解法**；只有 nsys 显示 H2D / D2H 确实
+排得上号时，才值得考虑改默认值。
+
+### 15.2 实现
+
+| 层 | 改动 |
+|---|---|
+| `frame_upload.py` | stdlib-only：`FramePlan`、`frame_bytes()`、`normalize_plan()`（闸门 + dtype + layout 判定）、`estimate_saved_bytes()`、`format_saved_bytes()`；不 import numpy |
+| `headless.py` | `_frame_to_uint8()` helper、`SwapOptions.zero_copy_frames`、4 处帧路径改调 helper；`_SwapperBase.__init__` 把闸门传给 `self.vm` |
+| `VideoManager.py` | `self.zero_copy_frames = False`；`_swap_video_inner` 的 CPU numpy H2D 分支按 plan 复用或转换 |
+| `cli.py` | `add_common` 新增 `--zero-copy-frames`（`swap` / `video` / `inspect` 共有），两处 Options 构造接线 |
+| `tests/` | `test_frame_upload.py` 6 项真行为测试；`test_cli.py` 加 flag / compose / defaults / AST 闸门与两侧 fallback 检查 |
+
+`normalize_plan()` 的四种结果：
+
+| 条件 | `needs_copy` | `bytes_saved` | `reason` |
+|---|---|---|---|
+| 闸门关闭 | True | 0 | `gate-closed` |
+| dtype 不是 uint8 | True | 0 | `dtype-...-needs-conversion` |
+| 非 C contiguous | True | 0 | `not-c-contiguous` |
+| uint8 + C contiguous | False | `frame_bytes(h, w)` | `already-uint8-contiguous` |
+
+只有最后一种省字节；其余仍走 `astype` 或
+`np.ascontiguousarray(..., dtype=np.uint8)`，数值等价。闸门关闭时的 `astype`
+表达式逐字保留，`test_zero_copy_frames_wiring` 用 AST 同时钉住 `SwapOptions` /
+`VideoManager` 两个默认值、H2D 与 helper 两条 fallback，以及
+`self.vm.zero_copy_frames` 接线。
+
+### 15.3 别名与生命周期
+
+跳过复制返回的是与输入共享内存的数组，安全性依赖三条：调用方不原地写、
+只交给同步的 `torch.from_numpy(...).to("cuda")` / `VideoFrame.from_ndarray`、
+PyAV 每帧 `to_ndarray` 都产出新数组（无跨帧复用）。`--workers > 1` 下每帧数组
+各自独立，没有跨 worker 共享；复用只发生在本帧内。`--decoder gpu` 的
+torchcodec 路径直接给 CUDA tensor，根本不走这段 CPU numpy H2D 分支，因此
+不受影响。
+
+### 15.4 真机验收清单（截至 2026-11-06 未执行）
+
+1. `workers=1` 且不带开关，跑一段 1080p 视频，存逐帧 PSNR 基线。
+2. 加 `--zero-copy-frames` 重跑，比对帧数、PTS、音画与逐帧 PSNR；**必须
+   逐像素一致**，否则说明某条路径的 dtype / layout 判定与实际内存不符。
+3. 分别在 `--decoder pyav` 与 `gpu`、`--encoder libx264` 与 `nvenc` 下重复，
+   确认没有哪一侧的帧其实是 float / 非 contiguous 而被误判为可复用。
+4. `swap` 图片路径同样跑一次（source / target / 输出写盘），确认
+   `ImageSwapper.swap()` 的写出结果一致。
+5. `--workers 2/4` 下重复第 2 步，确认没有跨帧别名。
+6. 用 `elapsed` / `avg fps` / nsys 的 H2D / D2H 段记录收益；若不可测量，
+   保持默认关闭，不必为了「用了新开关」而改默认值。
+
+**回滚**：不传 `--zero-copy-frames` 即回到原路径。与阶段 6 不同，这里没有
+ORT 输出覆写之类的第三方行为假设，两侧 `astype` fallback 由 AST 测试守住，
+回滚成本为零。

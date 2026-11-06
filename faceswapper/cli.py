@@ -211,6 +211,7 @@ def _build_options(args: argparse.Namespace, headless=None) -> "SwapOptions":
         backend=args.backend,
         arena_strategy=args.arena_strategy,
         reuse_detect_buffers=args.reuse_detect_buffers,
+        zero_copy_frames=args.zero_copy_frames,
     )
     return options
 
@@ -377,6 +378,7 @@ def _cmd_video(args: argparse.Namespace) -> int:
         decoder=args.decoder,
         arena_strategy=args.arena_strategy,
         reuse_detect_buffers=args.reuse_detect_buffers,
+        zero_copy_frames=args.zero_copy_frames,
     )
 
     def progress(index: int, total: int) -> None:
@@ -526,6 +528,9 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--reuse-detect-buffers", action="store_true",
                        help="复用 detector 的 9 个 io_binding 输出缓冲，省掉"
                             "每帧 9 次显存分配；默认关闭，TRT 后端下自动关闭")
+        p.add_argument("--zero-copy-frames", action="store_true",
+                       help="帧已是 uint8 C contiguous 时跳过 astype 的整帧"
+                            "复制（H2D 与 D2H 两侧），不改变像素；默认关闭")
 
     swap = sub.add_parser("swap", help="换一张或多张图片里的脸")
     add_common(swap)

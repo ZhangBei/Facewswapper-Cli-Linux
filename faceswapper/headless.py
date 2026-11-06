@@ -32,6 +32,7 @@ from faceswapper.decoder import DecoderPlan, frame_fields, resolve_decoder
 from faceswapper.encoder_probe import EncoderPlan, resolve_encoder
 from faceswapper.errors import HeadlessError
 from faceswapper.frame_order import ordered_swap_frames
+from faceswapper.frame_upload import normalize_plan
 from faceswapper.Models import Models
 from faceswapper.VideoManager import VideoManager
 
@@ -67,6 +68,9 @@ class SwapOptions:
     # 阶段 6：复用 retinaface 的 9 个 io_binding 输出缓冲，省掉每帧 9 次
     # torch.empty。默认关闭；TRT-EP 后端下会被判定逻辑自动关掉。
     reuse_detect_buffers: bool = False
+    # 阶段 7：帧已是 uint8 C contiguous 时跳过 astype 的整帧复制。默认关闭，
+    # 关掉时所有帧路径逐字保留原来的 astype 表达式。
+    zero_copy_frames: bool = False
 
 
 def _read_image(path: str) -> np.ndarray:
@@ -77,6 +81,32 @@ def _read_image(path: str) -> np.ndarray:
     if bgr is None:
         raise HeadlessError(f"could not decode image (unsupported format?): {path}")
     return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def _frame_to_uint8(rgb: np.ndarray, zero_copy: bool) -> np.ndarray:
+    """阶段 7：按 plan 把一帧归一化成 uint8，能不复制就不复制。
+
+    闸门关闭时逐字返回 ``rgb.astype("uint8")``——这是所有调用点改造前的
+    表达式。开启后只有「已是 uint8 且 C contiguous」的帧直接复用原数组；
+    dtype 或布局不满足时仍要转换，用 ``ascontiguousarray`` 一次完成，数值
+    与 astype 等价。
+
+    跳过复制会返回与输入共享内存的视图，调用方只把它交给同步的
+    ``torch.from_numpy(...).to("cuda")`` 或 ``VideoFrame.from_ndarray``，
+    不会原地写；PyAV 每帧 ``to_ndarray`` 都产出新数组，没有跨帧复用。
+    """
+    if not zero_copy:
+        return rgb.astype("uint8")
+    plan = normalize_plan(
+        rgb.dtype.name,
+        bool(rgb.flags.c_contiguous),
+        rgb.shape[0],
+        rgb.shape[1],
+        zero_copy=True,
+    )
+    if not plan.needs_copy:
+        return rgb
+    return np.ascontiguousarray(rgb, dtype=np.uint8)
 
 
 def _cosine_similarity_pct(a: np.ndarray, b: np.ndarray) -> float:
@@ -135,6 +165,10 @@ class _SwapperBase:
         self.vm.force_recognize = bool(
             getattr(options, "force_recognize", False)
         )
+        # 阶段 7：闸门默认关闭；开启后才在 VM 的 H2D 分支跳过整帧复制。
+        self.vm.zero_copy_frames = bool(
+            getattr(options, "zero_copy_frames", False)
+        )
         self._apply_parameters()
 
     # -- 生命周期 ------------------------------------------------------------
@@ -172,7 +206,9 @@ class _SwapperBase:
     def source_embedding(self, path: str) -> np.ndarray:
         """检测并识别 `path` 里的那一张脸。"""
         rgb = _read_image(path)
-        img_chw = torch.from_numpy(rgb.astype("uint8")).to("cuda").permute(2, 0, 1)
+        img_chw = torch.from_numpy(
+            _frame_to_uint8(rgb, self.options.zero_copy_frames)
+        ).to("cuda").permute(2, 0, 1)
         kpss = self.models.run_detect(
             img_chw,
             self.options.detect_type,
@@ -203,7 +239,9 @@ class _SwapperBase:
         重复的检测结果。
         """
         threshold = float(self.vm.parameters.get("ThresholdSlider", 55))
-        img_chw = torch.from_numpy(rgb.astype("uint8")).to("cuda").permute(2, 0, 1)
+        img_chw = torch.from_numpy(
+            _frame_to_uint8(rgb, self.options.zero_copy_frames)
+        ).to("cuda").permute(2, 0, 1)
         kpss = self.models.run_detect(
             img_chw,
             self.options.detect_type,
@@ -298,7 +336,9 @@ class ImageSwapper(_SwapperBase):
         result = self.vm.swap_video(rgb, 0)
         if isinstance(result, torch.Tensor):
             result = result.detach().cpu().numpy()
-        out = np.ascontiguousarray(result.astype(np.uint8))
+        out = np.ascontiguousarray(
+            _frame_to_uint8(result, self.options.zero_copy_frames)
+        )
 
         out_dir = os.path.dirname(os.path.abspath(output_path))
         if out_dir:
@@ -964,7 +1004,9 @@ class VideoSwapper(_SwapperBase):
         """
         if isinstance(rgb, torch.Tensor):
             rgb = rgb.detach().cpu().numpy()
-            return np.ascontiguousarray(rgb.astype(np.uint8))
+            return np.ascontiguousarray(
+                _frame_to_uint8(rgb, self.options.zero_copy_frames)
+            )
         return np.ascontiguousarray(rgb)
 
     @staticmethod
