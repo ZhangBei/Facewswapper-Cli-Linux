@@ -1047,6 +1047,17 @@ class Models():
             'swapper', 'swapper_model', self._create_swapper_session,
         )
 
+    def swapper_supports_dynamic_batch(self) -> bool:
+        """当前 swapper ONNX 图是否接受动态 batch 维。
+
+        ``_create_swapper_session`` 在懒加载时探测输入第 0 维；若锁死为 1
+        （日志里的 ``static-batch=1``），N>1 的 ``io_binding`` 会被 ONNX
+        拒绝。这里显式触发一次懒加载，避免调用方在 session 尚未创建时把
+        ``_swapper_batch_unsupported`` 的默认值 ``False`` 误读成「支持」。
+        """
+        self._get_swapper_session()
+        return not bool(getattr(self, '_swapper_batch_unsupported', False))
+
     def _swapper_should_drain_syncvec(self):
         return self._should_drain_syncvec()
     # @profile
@@ -1077,14 +1088,17 @@ class Models():
             self.run_swapper(image_batch, emb_one_caller, output_batch)
             return
 
+        # 先触发 session 懒加载：_create_swapper_session 会探测 ONNX 的
+        # batch 维并设置 _swapper_batch_unsupported。若把检查放在加载之前，
+        # 标志可能还是 __init__ 里的默认 False，首次 N>1 调用会直闯
+        # io_binding 而被 ONNX 拒绝（11-06 受控实验的 CUDA 700）。
+        swapper_session = self._get_swapper_session()
         if getattr(self, '_swapper_batch_unsupported', False):
             for k in range(n):
                 self.run_swapper(
                     image_batch[k:k+1], emb_one_caller, output_batch[k:k+1],
                 )
             return
-
-        swapper_session = self._get_swapper_session()
 
         io_dtype = self._swapper_io_dtype
         if io_dtype == np.float16:

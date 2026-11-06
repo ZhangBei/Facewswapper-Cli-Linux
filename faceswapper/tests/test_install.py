@@ -1,8 +1,7 @@
 """Tests for tools/install.py auto-detection.
 
-No GPU, no torch, no pip install — the detection logic is pure functions
-over the outputs of nvidia-smi / importlib, so it can be exercised by
-stubbing those and reading the source the way test_hyperswap does.
+不依赖本机是否装了 torch / ONNX Runtime / GPU：环境探测一律用 stub 注入，
+因此 bare machine 与装好 CUDA 栈的机器上结论一致。
 
     python -m faceswapper.tests.test_install
 """
@@ -12,7 +11,9 @@ from __future__ import annotations
 import importlib.util
 import re
 import sys
+import tempfile
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -115,31 +116,53 @@ def test_readiness_probes_are_import_based() -> None:
     if "find_spec" not in body:
         fail(f"onnxruntime_cuda_ready should probe with find_spec: {body}")
 
-    # A probe must not raise when the package is absent — on this machine
-    # torch is absent, which is exactly the failure mode to rule out.
-    if install.torch_cuda_ready():
-        fail("torch_cuda_ready reported true with no torch installed")
+    # probe 必须在包缺失时不抛异常。注入 find_spec 模拟 bare machine，
+    # 不假设当前解释器没装 torch：GPU 机器上 torch.cuda.is_available()
+    # 为 True 时，旧断言「本机一定没装 torch」会假失败。
+    with mock.patch.object(
+        install.importlib.util, "find_spec", return_value=None,
+    ):
+        if install.torch_cuda_ready():
+            fail("torch_cuda_ready reported true with no torch installed")
+        if install.onnxruntime_cuda_ready():
+            fail("onnxruntime_cuda_ready reported true with no onnxruntime installed")
     print("  ok  readiness probes use find_spec and tolerate a missing package")
 
 
 def test_missing_requirements_parses_the_file() -> None:
-    """Names come from requirements.txt verbatim, so a comment or a
-    version pin must not become a bogus distribution name."""
-    reqs = REPO_ROOT / "requirements.txt"
-    names = install.missing_requirements(reqs)
-    # Everything in the file is checked as a distribution name; a spec like
-    # "av>=13.0,<19.0" must reduce to "av", and the commented-out
-    # "torchcodec" must not appear at all.
+    """注释行、版本 pin 与空白行都不能变成 bogus distribution name。
+
+    解析行为用一份受控的临时 requirements.txt 验证，不再假设本机是 bare
+    machine —— 装了 av / onnxruntime-gpu 的 GPU 机器上旧断言会假失败。
+    """
+    real = install.missing_requirements(REPO_ROOT / "requirements.txt")
     for bogus in ("torchcodec", "tensorrt", "imageio-ffmpeg", "pynvvideocodec"):
-        if bogus in names:
+        if bogus in real:
             fail(f"commented-out requirement {bogus!r} should not be checked")
-    for pinned in ("av", "onnxruntime-gpu", "opencv-python-headless"):
-        if pinned not in names:
-            fail(f"{pinned!r} should be reported missing on a bare machine")
+
+    # 三个名字保证未安装，因此结果完全由解析逻辑决定，与本机环境无关。
+    expected = {
+        "faceswapper-test-absent-a",
+        "faceswapper-test-absent-b",
+        "faceswapper-test-absent-c",
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = Path(tmp) / "requirements.txt"
+        fake.write_text(
+            "# torchcodec>=0.4\n"
+            "\n"
+            "faceswapper-test-absent-a>=1.0\n"
+            "faceswapper-test-absent-b<2.0,>=1.5\n"
+            "faceswapper-test-absent-c ; python_version >= '3.0'\n",
+            encoding="utf-8",
+        )
+        names = install.missing_requirements(fake)
+    if set(names) != expected:
+        fail(f"pin/comment parsing produced {names!r}, expected {sorted(expected)!r}")
     for name in names:
         if re.search(r"[<>=!~\s#]", name):
             fail(f"distribution name is not clean: {name!r}")
-    print(f"  ok  requirements.txt parsed into {len(names)} distribution names")
+    print(f"  ok  requirements.txt parsing is environment-independent ({len(names)} names)")
 
 
 def test_auto_skips_a_satisfied_environment() -> None:

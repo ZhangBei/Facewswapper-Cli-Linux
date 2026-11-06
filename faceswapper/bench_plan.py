@@ -155,8 +155,12 @@ def parse_metrics(stdout: str) -> dict[str, Any]:
 
 
 def build_gpu_monitor_command(interval: int = 1) -> list[str]:
-    """nvidia-smi dmon：利用率与显存曲线，重定向由调用方处理。"""
-    return ["nvidia-smi", "dmon", "-s", "u,m", "-d", str(max(1, interval))]
+    """nvidia-smi dmon：利用率与显存曲线，重定向由调用方处理。
+
+    ``-s`` 的参数是连续的字母串（``um`` = utilization + memory），写成
+    ``u,m`` 会被 dmon 判为「Failed to find any metric to display」并直接退出。
+    """
+    return ["nvidia-smi", "dmon", "-s", "um", "-d", str(max(1, interval))]
 
 
 def build_ffprobe_command(path: str) -> list[str]:
@@ -170,12 +174,23 @@ def build_ffprobe_command(path: str) -> list[str]:
 
 
 def build_psnr_command(baseline: str, candidate: str) -> list[str]:
-    """比对 workers=1 基线与其它的逐帧 PSNR（输出为纯文本，不落文件）。"""
+    """比对 workers=1 基线与其它的逐帧 PSNR（输出为纯文本，不落文件）。
+
+    PSNR 统计行是 ffmpeg 的 info 级日志，用 ``-loglevel error`` 会把它整个
+    吞掉，只剩返回码 0 却没有数值；``-nostats`` 压掉进度噪声，让统计行留在
+    stderr 末尾便于解析。
+    """
     return [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "ffmpeg", "-hide_banner", "-nostats", "-loglevel", "info",
         "-i", baseline, "-i", candidate,
         "-filter_complex", "psnr", "-f", "null", "-",
     ]
+
+
+def parse_psnr(text: str) -> str | None:
+    """从 ffmpeg psnr 输出里取 average 值；逐像素一致时是 ``inf``。"""
+    match = re.search(r"\bPSNR\b[^\n]*?\baverage:([^\s]+)", text or "")
+    return match.group(1) if match else None
 
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:

@@ -21,6 +21,7 @@ from faceswapper.bench_plan import (
     build_swap_command,
     elapsed_to_seconds,
     parse_metrics,
+    parse_psnr,
     summarize,
     validate_config,
 )
@@ -129,16 +130,44 @@ def test_parse_metrics_tolerates_missing_lines() -> None:
 
 def test_auxiliary_commands() -> None:
     if build_gpu_monitor_command(2) != [
-        "nvidia-smi", "dmon", "-s", "u,m", "-d", "2",
+        "nvidia-smi", "dmon", "-s", "um", "-d", "2",
     ]:
         fail("wrong nvidia-smi command")
+    if build_gpu_monitor_command(0) != [
+        "nvidia-smi", "dmon", "-s", "um", "-d", "1",
+    ]:
+        fail("dmon interval must be clamped to at least 1")
     probe = build_ffprobe_command("out.mp4")
     if "ffprobe" not in probe or "-count_frames" not in probe or "out.mp4" not in probe:
         fail(f"wrong ffprobe command: {probe!r}")
     psnr = build_psnr_command("a.mp4", "b.mp4")
     if "-filter_complex" not in psnr or "psnr" not in psnr:
         fail(f"wrong psnr command: {psnr!r}")
+    # PSNR 统计行是 info 级日志，-loglevel error 会让它只剩 rc=0 没有数值。
+    if "error" in psnr or "-nostats" not in psnr:
+        fail(f"psnr command would swallow the statistics line: {psnr!r}")
     print("  ok  monitor / ffprobe / psnr commands are well formed")
+
+
+def test_parse_psnr_extracts_the_average() -> None:
+    """逐像素一致是 inf；有差异时是数值；没有统计行时返回 None。"""
+    identical = (
+        "  Stream #1:0 (h264) -> psnr (graph 0)\n"
+        "[Parsed_psnr_0 @ 0x1] PSNR y:inf u:inf v:inf "
+        "average:inf min:inf max:inf\n"
+    )
+    if parse_psnr(identical) != "inf":
+        fail("a pixel-identical pair must report inf")
+    lossy = (
+        "[Parsed_psnr_0 @ 0x2] PSNR y:42.11 u:48.20 v:49.01 "
+        "average:43.75 min:38.20 max:55.10\n"
+    )
+    if parse_psnr(lossy) != "43.75":
+        fail(f"average PSNR was not extracted: {parse_psnr(lossy)!r}")
+    for text in ("", "frame= 250 fps= 25 q=-1.0 Lsize=N/A", "average:"):
+        if parse_psnr(text) is not None:
+            fail(f"missing PSNR line should return None: {text!r}")
+    print("  ok  PSNR average is parsed from ffmpeg output")
 
 
 def test_summarize_speedup_does_not_mutate_rows() -> None:
@@ -194,6 +223,7 @@ def main() -> int:
     test_parse_metrics_extracts_all_fields()
     test_parse_metrics_tolerates_missing_lines()
     test_auxiliary_commands()
+    test_parse_psnr_extracts_the_average()
     test_summarize_speedup_does_not_mutate_rows()
     test_runner_dry_run_is_safe_offline()
     print("all tests passed")

@@ -1043,8 +1043,9 @@ class VideoManager():
 
         **当前不启用**：``EXPERIMENTAL_FACE_BATCH=False``，且
         ``_swap_video_inner`` 不会调用本方法。解冻前必须在 GPU 环境用多人脸
-        视频做与逐脸路径的 PSNR 比对；五条阻断条件见
-        ``docs/gpu-utilization-plan.md`` 7.1。
+        视频做与逐脸路径的 PSNR 比对；六条阻断条件见
+        ``docs/gpu-utilization-plan.md`` 7.1。当前
+        ``inswapper_128.fp16.onnx`` 为 ``static-batch=1``，判定会直接回退。
 
         思路：第一遍 ``prepare`` 只填 batch 输入、收集 bbox，完全不写回 img；
         中间一次 ``run_swapper_batched``；第二遍 ``finish`` 按原顺序把各脸的
@@ -1091,6 +1092,7 @@ class VideoManager():
             [FaceCandidate(s["bbox"], s["pipeline_size"]) for s in slots],
             swapper_type=swapper_type,
             parameters=parameters,
+            batch_backend_available=self.models.swapper_supports_dynamic_batch(),
             target_face_filtering=bool(self.target_face_embeddings),
         )
         if not ok:

@@ -22,6 +22,8 @@ models/
 
 # --- Runtime caches (regenerable) ---
 cache/
+# tools/bench_gpu.py 的验收产物：输出视频、报告、GPU 采样日志
+bench-out/
 
 # --- Per-user app state (saved tuning, local folder paths) ---
 saved_parameters.json

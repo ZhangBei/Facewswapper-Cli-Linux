@@ -416,6 +416,40 @@ python tools/check_env.py --models ./models
 全部通过时输出 `all checks passed`。可选模型缺失只警告，不影响退出码。
 每一项失败都会打印对应的修复命令。
 
+### 2.5 离线测试套件
+
+不需要 GPU、模型，也不需要 torch / ORT / OpenCV 的一批行为测试，一条命令
+跑完，适合 clone 之后先做一次自检：
+
+```bash
+python -m faceswapper.tests
+```
+
+每个 `test_*.py` 都是自带 `main()` 的独立脚本，runner 用子进程逐个执行，
+一个模块失败不会中断整轮，也不会在模块间共享 `sys.modules` 状态。输出按
+模块给出状态与耗时，末尾汇总：
+
+| 状态 | 判定 | 退出码 |
+|---|---|---|
+| `PASS` | `rc=0` 且打印 `all tests passed` | `0` |
+| `SKIP` | 缺 `numpy` / `torch` 等白名单里的运行时依赖 | `0` |
+| `FAIL` | 断言失败、超时、缺非可选依赖，或 `rc=0` 却没有完成标记 | `1` |
+
+只有白名单里的运行时依赖缺失才判 `SKIP`，import 拼写错误一律算 `FAIL`，
+不会把代码错误藏成环境问题。GPU 机器上做正式验收时加 `--strict`，让
+`SKIP` 也返回非零：
+
+```bash
+python -m faceswapper.tests --list                # 只列模块，不执行
+python -m faceswapper.tests --module test_cli    # 只跑指定模块，可重复
+python -m faceswapper.tests --strict --timeout 300
+```
+
+`python -m faceswapper.tests.test_cli` 这类单模块命令仍然可用，runner 只是
+把它们收拢成一条命令。这批测试只覆盖离线逻辑，**不能替代**
+[docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md) 里的真机验收
+（3.4 基线矩阵、逐帧 PSNR、nsys 等）。
+
 ---
 
 ## 3. 使用方法
@@ -787,7 +821,13 @@ bbox，但 `run_swapper_batched` 的 N 是 polyphase phase 数而非脸数、
 `pipeline_size` 逐脸不同、`swap_core` 是 438 行单体函数，且输入 warp 会从
 已被前一张脸写回的 `img` 采样——预批量准备会改变重叠人脸的像素。因此
 `face_batch.py` 强制要求 bbox 两两不重叠、只用 `inswapper-128`、关闭多 pass
-开关，任一不满足就回退逐脸路径。五条完整依据与解冻步骤见
+开关，任一不满足就回退逐脸路径。**真机受控实验补充的第六条硬阻断**：当前
+`inswapper_128.fp16.onnx` 是 `static-batch=1`，当时把闸门临时置 `True`
+会让 N>1 的 batch 被 ONNX 以 `Got: 3 Expected: 1` 拒绝，异常回退后触发
+`CUDA failure 700` 崩溃。现已给判定补上必填的 `batch_backend_available`
+并修正 session 探测顺序，复测确认误开闸门会干净回退（PSNR=`inf`、无
+CUDA 错误）。但**两个实验闸门仍必须保持 `False`**：模型本身不支持动态
+batch，要解冻须先换 swapper 模型。六条完整依据、受控实验与解冻步骤见
 [docs/gpu-utilization-plan.md 7.1](docs/gpu-utilization-plan.md)。
 
 改实现了一条逻辑等价、改动更小的优化：headless video 未指定 `--target-face`
@@ -931,7 +971,18 @@ python tools/bench_gpu.py --source face.jpg --target in.mp4 --run \
 结果写到 `bench-out/bench_report.json`。`--extra-flag` 可透传任意开关做 A/B
 （每个 token 单独给一次，例如 `--extra-flag=--encode-thread`）。命令构造与
 输出解析在 `faceswapper/bench_plan.py`，有离线行为测试，因此在没有 GPU 的
-机器上也能安全地预览与自检。
+机器上也能安全地预览与自检。报告现在会把逐帧 PSNR 的 `average` 数值写成
+`psnr_average` 字段；`--monitor-gpu` 用 `nvidia-smi dmon -s um` 采样。
+
+脚本已在 Tesla T4 上跑通 10 秒矩阵（两轮）、30 秒 / 750 帧正式基线，
+以及阶段 2 / 3 / 6 / 7 的 A/B；w2 / w4 对 `workers=1` 的 PSNR 均为
+`inf`（逐像素一致）。正式基线 `workers=1/2/4` 为 `3.3 / 5.0 / 5.4 fps`
+（加速比 `1.0 / 1.50 / 1.63`）。**真机结论**：除 `--workers 2` 外，
+编码独立线程、延迟 D2H、detector 缓冲复用、帧零拷贝均无可测量收益，
+NVENC 在本环境不可用，不建议开启这些开关；`nsys` 已把瓶颈定位到逐脸
+ORT Run 与 `cudaStreamSynchronize`。完整数字、结论与剩余待办见
+[docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md) 的
+「第二轮真机数据」一节。
 
 完整的分阶段实施方案（现状瓶颈、详细实现步骤、验收清单、风险与回滚）见
 [docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md)。

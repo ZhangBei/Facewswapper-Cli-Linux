@@ -27,6 +27,7 @@ def eligible(**overrides):
         ],
         "swapper_type": "inswapper-128",
         "parameters": {},
+        "batch_backend_available": True,
     }
     kwargs.update(overrides)
     return batch_eligibility(**kwargs)
@@ -122,6 +123,98 @@ def test_target_face_filtering_falls_back() -> None:
     print("  ok  --target-face similarity filtering falls back to per-face")
 
 
+def test_static_batch_model_falls_back() -> None:
+    """static-batch=1 的 ONNX 导出必须回退，绝不能进入 N>1 的 io_binding。
+
+    11-06 受控开闸实验里漏掉这条判据，N=3 被 ONNX 拒绝后触发
+    ``CUDA failure 700``。这里把「判据存在 + 必填」一起钉住。
+    """
+    ok, reason = eligible(batch_backend_available=False)
+    if ok or "batch dimension" not in reason:
+        fail(f"static-batch=1 model must fall back, got {(ok, reason)!r}")
+
+    faces = [
+        FaceCandidate((0, 0, 100, 100), 128),
+        FaceCandidate((200, 0, 300, 100), 128),
+    ]
+    ok, _ = batch_eligibility(
+        faces, swapper_type="inswapper-128", parameters={},
+        batch_backend_available=False,
+    )
+    if ok:
+        fail("static batch must override otherwise-eligible faces")
+    try:
+        batch_eligibility(
+            faces, swapper_type="inswapper-128", parameters={},
+        )
+    except TypeError:
+        pass
+    else:
+        fail("batch_backend_available must be required, not defaulted")
+    print("  ok  static-batch=1 models fall back before any batched ORT Run")
+
+
+def test_backend_capability_is_wired() -> None:
+    """7.1 判定必须显式拿到模型能力，且 session 探测早于静态 batch 检查。"""
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    vm = ast.parse((root / "VideoManager.py").read_text(encoding="utf-8"))
+    calls = [
+        node for node in ast.walk(vm)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "batch_eligibility"
+    ]
+    if not calls:
+        fail("batch_eligibility is not called from VideoManager")
+    for call in calls:
+        if "batch_backend_available" not in {kw.arg for kw in call.keywords}:
+            fail("7.1 eligibility must pass batch_backend_available explicitly")
+
+    models = ast.parse((root / "Models.py").read_text(encoding="utf-8"))
+    cls = next(
+        (n for n in models.body
+         if isinstance(n, ast.ClassDef) and n.name == "Models"), None,
+    )
+    if cls is None:
+        fail("Models class not found")
+    methods = {
+        n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)
+    }
+    if "swapper_supports_dynamic_batch" not in methods:
+        fail("Models is missing swapper_supports_dynamic_batch()")
+    probe = methods["swapper_supports_dynamic_batch"]
+    if not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_get_swapper_session"
+        for node in ast.walk(probe)
+    ):
+        fail("the capability probe must trigger swapper session lazy loading")
+
+    batched = methods.get("run_swapper_batched")
+    if batched is None:
+        fail("run_swapper_batched not found")
+    session_lines = [
+        node.lineno for node in ast.walk(batched)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_get_swapper_session"
+    ]
+    guard_lines = [
+        node.lineno for node in ast.walk(batched)
+        if isinstance(node, ast.Constant)
+        and node.value == "_swapper_batch_unsupported"
+    ]
+    if not session_lines or not guard_lines:
+        fail("session probe or static-batch guard is missing")
+    if min(session_lines) > min(guard_lines):
+        fail("session probe must run before the static-batch guard")
+    print("  ok  dynamic-batch capability is wired and probed first")
+
+
 def test_batch_path_is_disabled() -> None:
     """闸门必须关闭、主路径不得挂载 batch、swap_core 的默认参数不变。
 
@@ -207,6 +300,8 @@ def main() -> int:
     test_pipeline_size_must_be_uniform_128()
     test_overlapping_bboxes_fall_back()
     test_target_face_filtering_falls_back()
+    test_static_batch_model_falls_back()
+    test_backend_capability_is_wired()
     test_batch_path_is_disabled()
     print("all tests passed")
     return 0

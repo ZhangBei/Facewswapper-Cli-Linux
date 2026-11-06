@@ -45,6 +45,7 @@ from faceswapper.bench_plan import (  # noqa: E402
     build_gpu_monitor_command,
     build_psnr_command,
     parse_metrics,
+    parse_psnr,
     summarize,
 )
 
@@ -160,7 +161,9 @@ def _execute(cases, args, config: BenchConfig) -> int:
                     prc, pout, perr = _run_probe(build_psnr_command(
                         baseline["output"], row["output"]))
                     row["psnr_returncode"] = prc
-                    row["psnr_output"] = (perr or pout).strip()[-1000:]
+                    psnr_text = perr or pout
+                    row["psnr_output"] = psnr_text.strip()[-1000:]
+                    row["psnr_average"] = parse_psnr(psnr_text)
     finally:
         if monitor is not None:
             monitor.terminate()

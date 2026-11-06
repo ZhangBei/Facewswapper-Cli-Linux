@@ -4,9 +4,15 @@ stdlib-only：这条判定只依赖整数矩形和参数 dict，可以脱离 GPU
 真正的 batch 前向在 ``VideoManager.swap_core_batched``，由
 ``EXPERIMENTAL_FACE_BATCH`` 闸门挡住，当前不会被执行。
 
-判据见 docs/gpu-utilization-plan.md 7.1：只有 128 inswapper、所有脸
-pipeline_size 都是 128、没有多 pass 开关、且 bbox 两两不重叠时，把 N 张脸
-合成一次 swapper 前向才与逐脸路径等价。
+判据见 docs/gpu-utilization-plan.md 7.1：只有 128 inswapper、模型支持
+动态 batch、所有脸 pipeline_size 都是 128、没有多 pass 开关、且 bbox 两两
+不重叠时，把 N 张脸合成一次 swapper 前向才与逐脸路径等价。
+
+``batch_backend_available`` 与 7.2 的 ``cross_frame_batch_eligibility``
+同名同义，且刻意**不设默认值**：调用方必须显式给出模型能力，避免把
+「session 尚未懒加载、探测标志还是默认 False」误读成支持动态 batch。
+11-06 的受控开闸实验正是漏了这条，N=3 的 batch 被 ONNX 拒绝后触发
+``CUDA failure 700``。
 """
 
 from __future__ import annotations
@@ -44,6 +50,7 @@ def batch_eligibility(
     *,
     swapper_type: str,
     parameters: Mapping[str, Any],
+    batch_backend_available: bool,
     target_face_filtering: bool = False,
     min_faces: int = 2,
 ) -> tuple[bool, str]:
@@ -55,6 +62,10 @@ def batch_eligibility(
     最硬的一条是 bbox 不重叠：batch 的 prepare 阶段全部从**原始 img** warp，
     而 finish 阶段按原顺序写回。重叠时后一张脸的 ``pipeline_input_face``
     会与逐脸路径（读到的已是前一张写回后的像素）不同，回填补不回来。
+
+    ``batch_backend_available`` 是 11-06 受控实验后补的硬条件：某些
+    inswapper 导出把 batch 维锁死为 1（日志里的 ``static-batch=1``），
+    此时 N>1 的 io_binding 会被 ONNX 拒绝，绝不能走到 ``run_swapper_batched``。
     """
     n = len(candidates)
     if n < min_faces:
@@ -67,6 +78,8 @@ def batch_eligibility(
         return False, (
             f"swapper {swapper_type!r} is not the 128 inswapper ONNX graph"
         )
+    if not batch_backend_available:
+        return False, "swapper export locks the batch dimension to 1"
     for key in INCOMPATIBLE_SWITCHES:
         if parameters.get(key):
             return False, f"{key} needs more than one swapper pass"
