@@ -20,6 +20,9 @@
   （`--decoder pyav|gpu`）代码均已落地，两个默认值都不变；两者都需要真机
   核对第三方 API/参数。阶段 4 的 7.2 判定 / 分组 / 前向与回填编排均已落地，
   闸门关闭、主流水线未挂载，推理结果仍需真机逐帧 PSNR。
+- 阶段 6 的 `--reuse-detect-buffers` 已落地（默认关闭、`trt` 后端自动关闭），
+  shape 计算 / 闸门 / per-worker 缓存均有离线行为测试，默认帧路径逐字保留；
+  ORT 是否每帧完整覆写复用缓冲、逐帧 PSNR 与实际收益仍需真机核对，见第 14 节。
 - 当前环境没有 GPU 栈，以上均为代码层实现，**未做任何真机性能验证**；
   3.4 的基线矩阵仍是后续所有阶段的前置条件。
 
@@ -506,10 +509,13 @@ ORT 调用后的实际收益——这些必须在 GPU 环境做。解冻步骤�
 | 4.3 | 跨帧 batch（判定/编排/推理骨架） | — | 代码已完成、未挂载 | 高（需逐帧 PSNR） | 是 |
 | 5a | NVENC 编码开关 | 中（只解 CPU 编码瓶颈） | 代码已完成 | 中（画质 / 驱动） | 是 |
 | 5b | GPU 常驻解码（torchcodec） | 未测 | 代码已完成、默认关闭 | 中（frame/PTS 单位） | 是 |
+| 6 | detector 输出缓冲复用 | 未测（省每帧 9 次分配） | 代码已完成、默认关闭 | 低（默认路径逐字保留） | 是 |
 
 建议的**真机验证顺序**：`0 → 1 → 2 →（按 nsys 结果决定）3 → 阶段 4 的 7.1
 单帧多脸 batch → 5`。0–3 的代码已落地，但仍要按这个顺序逐个实测，不要
 因为代码齐了就跳过基线。跨帧 batch 放最后，除非前四步都测过仍不够。
+阶段 6 不改像素、回滚成本为零，可作为 3 之后的低风险 A/B 插队做；它只省
+分配器开销，不要当成吞吐瓶颈的主解法。
 
 ---
 
@@ -587,9 +593,79 @@ ffprobe -v error -select_streams v:0 -show_entries stream=profile,bit_rate \
 | session 共享策略 | `Models.py::_get_model_session`、`set_model_session_mode` |
 | 后端偏好（cuda 不碰 TRT） | `Models.py::set_backend_preference_for_all`、`headless.py::_SwapperBase.__init__` |
 | 同步判断、CUDA EP 选项、session 选项 | `Models.py::_should_drain_syncvec`、`_cuda_ep_provider_options`、`_make_session_options` |
+| detector 输出缓冲 shape / 复用（阶段 6） | `detect_buffers.py::output_buffer_specs`、`resolve_reuse_buffers`、`OutputBufferCache`；`Models.py::set_reuse_detect_buffers`、`_get_retinaface_output_buffers`、`_detect_retinaface_inner` |
 | batch 推理 | `Models.py::run_swapper_batched`、`VideoManager.py::swap_core` |
 | CLI 参数 | `cli.py::build_parser`（`--workers`、`--preset`、`--crf`、`--every-nth`、`--backend`） |
 | 完成计时 / avg fps | `cli.py::main`、`_format_elapsed`、`_format_avg_fps` |
 | 分段计时 | `headless.py::_encode_video`、`cli.py::_format_profile` |
 | 离线测试 | `tests/test_cli.py`、`tests/test_timing.py`、`tests/test_hyperswap.py`、`tests/test_model_store.py` |
 | 命名与 GUI 遗留 | `docs/adr/0001-keep-gui-era-parameter-naming.md`、`CONTEXT.md` |
+
+---
+
+## 14. 阶段 6：detector 输出缓冲复用
+
+> 本节排在「相关代码索引」之后，是为了不改动 2026-11-05 快照里已有的章节号
+> 与交叉引用。实现日期 2026-11-06。
+
+### 14.1 依据
+
+`Models._detect_retinaface_inner` 每帧为 9 个 `io_binding` 输出各调一次
+`torch.empty`：3 个 stride × score/bbox/kps。shape 只由
+`(input_height, input_width, stride)` 决定，而前两个尺寸在一次 video 里恒定
+（除非改 `--detect-input-size`）。同一函数里的输入 letterbox 缓冲
+（`_get_retinaface_input_buffer`）与 anchor centers
+（`_get_retinaface_gpu_anchors`）早就按 worker 缓存了，输出缓冲是这条链上
+唯一还每帧重新分配的一环。
+
+阶段 3 的 6.2 只把 arena 策略做成可配置，没有消除分配本身。阶段 6 补这一环：
+每帧省 9 次 `torch.empty` 与 9 次缓冲回收，代价是常驻 9 个小 tensor。
+**这是分配器开销优化，不是吞吐瓶颈的主解法**；VRAM 数字几乎不变。
+
+### 14.2 实现
+
+| 层 | 改动 |
+|---|---|
+| `detect_buffers.py` | stdlib-only：`BufferSpec`、`output_buffer_specs()`（算 9 个 shape，顺序与 `bind_output` 的三个切片一致）、`resolve_reuse_buffers()`（闸门）、`OutputBufferCache`（按 `(h, w, strides)` 缓存，`alloc` 注入） |
+| `Models.py` | `set_reuse_detect_buffers()`；`_get_retinaface_output_buffers()` 把 `torch.empty` 注入缓存并挂在 `_retinaface_buffers_tls`；`_detect_retinaface_inner` 加一个 `if self._reuse_detect_buffers` 分支 |
+| `headless.py` | `SwapOptions.reuse_detect_buffers`；`_SwapperBase.__init__` 调 setter 并传入 `options.backend` |
+| `cli.py` | `add_common` 新增 `--reuse-detect-buffers`（`swap` / `video` / `inspect` 共有），两处 Options 构造接线 |
+| `tests/` | `test_detect_buffers.py` 7 项真行为测试；`test_cli.py` 加 flag / 默认值 / compose / AST 闸门与 fallback 检查 |
+
+默认 `False`。关闭时 `_detect_retinaface_inner` 的 else 分支逐字保留原来每帧
+9 次 `torch.empty` 的逻辑（只多一层缩进），
+`test_detect_buffer_reuse_wiring` 用 AST 钉住「闸门常量为 False、复用分支唯一、
+else 里仍有至少 3 次 `torch.empty`」。
+
+`resolve_reuse_buffers()` 只接受显式开启 + `backend == "cuda"`；TRT-EP 的
+`io_binding` 输出行为未经真机核对，不猜、不静默套用（与 `decoder.py` 探测
+失败不静默回退是同一条原则）。
+
+### 14.3 为什么按 worker 分开是安全的
+
+每组缓冲挂在 `threading.local` 的 `_retinaface_buffers_tls` 上，与已有的输入
+缓冲同级。不同 worker 的 CUDA stream 并发推进，共享同一组缓冲会让 ORT 的写入
+互相踩；同 worker 内则是串行的：`rf_postprocess` 在 worker 自己的 stream 上
+读完这一帧，下一帧的 ORT 写入才排到它后面。缓存 key 含 `(h, w, strides)`，
+改 `--detect-input-size` 或换 stride 组合会整组重建，不会拿旧 shape 去绑定。
+
+一个已知的边界：`delete_models()` 不清这些缓存——`threading.local` 的属主是
+各 worker 线程，主线程够不到别人的 slot。这与既有的输入 letterbox 缓冲完全
+一致，9 个缓冲合计约 1 MB，CLI 单次运行随进程退出即释放；长驻进程调用
+`delete_models()` 时它们仍常驻，属于既有行为，没有为阶段 6 新增特殊的清理
+语义。
+
+### 14.4 真机验收清单
+
+1. `workers=1` 且不带开关，跑一段多人脸片段，存逐帧 PSNR 基线。
+2. 加 `--reuse-detect-buffers` 重跑，比对帧数、PTS、音画与逐帧 PSNR；
+   **必须逐像素一致**，否则说明 ORT 没有完整覆写缓冲，立即把闸门改回 False。
+3. `--workers 2/4` 下重复第 2 步，确认 per-thread 隔离没有串味。
+4. `--detect-input-size 320/480/640` 各跑一次，确认 key 变化时 shape 正确。
+5. 用 `elapsed` / `avg fps` / `nvidia-smi dmon` 记录收益；预期很小，若没有
+   可测量提升就保持默认关闭，不必为了「用了新开关」而改默认值。
+6. `--backend trt` 下确认 `resolve_reuse_buffers` 自动关闭（离线已测，真机
+   再确认一次没有走复用分支）。
+
+**回滚**：不传 `--reuse-detect-buffers` 即回到原路径；即使代码层改默认值，
+`resolve_reuse_buffers` 也只放行显式开启 + CUDA EP。

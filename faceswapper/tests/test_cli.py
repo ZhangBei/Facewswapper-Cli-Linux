@@ -273,6 +273,97 @@ def test_stage3_flags() -> None:
     print("  ok  --defer-d2h / --arena-strategy default off and parse correctly")
 
 
+def test_reuse_detect_buffers_flag() -> None:
+    """阶段 6 开关默认关闭，且属于 add_common（swap 也能用）。"""
+    parser = build_parser()
+    base = ["video", "--source", "face.jpg", "--target", "in.mp4",
+            "--output", "out.mp4"]
+    plain = parser.parse_args(base)
+    if plain.reuse_detect_buffers is not False:
+        fail(f"reuse flag defaults to {plain.reuse_detect_buffers!r}")
+    tuned = parser.parse_args(base + ["--reuse-detect-buffers"])
+    if tuned.reuse_detect_buffers is not True:
+        fail("--reuse-detect-buffers was not accepted by video")
+    image = parser.parse_args([
+        "swap", "--source", "a.jpg", "--target", "b.jpg",
+        "--output", "o.png", "--reuse-detect-buffers",
+    ])
+    if image.reuse_detect_buffers is not True:
+        fail("--reuse-detect-buffers should be a common flag")
+    print("  ok  --reuse-detect-buffers defaults off and parses for video/swap")
+
+
+def test_detect_buffer_reuse_wiring() -> None:
+    """钉住阶段 6 的闸门与逐帧 fallback，别让复用悄悄变成默认行为。"""
+    import ast
+
+    root = Path(__file__).resolve().parents[1]
+
+    def parse(name):
+        return ast.parse((root / name).read_text(encoding="utf-8"))
+
+    def called_attrs(nodes):
+        return {
+            node.func.attr
+            for node in ast.walk(ast.Module(body=list(nodes), type_ignores=[]))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        }
+
+    models = parse("Models.py")
+    headless = parse("headless.py")
+
+    if "set_reuse_detect_buffers" not in {
+        node.func.attr
+        for node in ast.walk(headless)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }:
+        fail("reuse switch is not wired into the swapper base")
+
+    gates = [
+        node.value.value
+        for node in ast.walk(models)
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Attribute)
+        and node.target.attr == "_reuse_detect_buffers"
+        and isinstance(node.value, ast.Constant)
+    ]
+    if gates != [False]:
+        fail(f"_reuse_detect_buffers default is {gates!r}, expected [False]")
+
+    fn = next(
+        (n for n in ast.walk(models)
+         if isinstance(n, ast.FunctionDef)
+         and n.name == "_detect_retinaface_inner"),
+        None,
+    )
+    if fn is None:
+        fail("_detect_retinaface_inner not found")
+    branches = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.If)
+        and "_reuse_detect_buffers" in ast.dump(n.test)
+    ]
+    if len(branches) != 1:
+        fail(f"expected exactly one reuse branch, found {len(branches)}")
+    branch = branches[0]
+    if "_get_retinaface_output_buffers" not in called_attrs(branch.body):
+        fail("reuse branch does not call _get_retinaface_output_buffers")
+    if not branch.orelse:
+        fail("the per-frame allocation fallback branch is missing")
+    empties = sum(
+        1 for node in ast.walk(
+            ast.Module(body=branch.orelse, type_ignores=[])
+        )
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "empty"
+    )
+    if empties < 3:
+        fail(f"fallback branch has only {empties} torch.empty calls")
+    print("  ok  reuse is gated off by default and keeps the per-frame fallback")
+
+
 def test_video_encoder_flag() -> None:
     """--encoder 默认 libx264，nvenc 需显式选择。"""
     parser = build_parser()
@@ -461,7 +552,8 @@ def test_all_new_video_flags_compose() -> None:
         "--output", "out.mp4",
         "--workers", "4", "--profile", "--encode-thread", "--defer-d2h",
         "--force-recognize", "--encoder", "nvenc", "--decoder", "gpu",
-        "--arena-strategy", "pow2", "--crf", "23", "--preset", "fast",
+        "--arena-strategy", "pow2", "--reuse-detect-buffers",
+        "--crf", "23", "--preset", "fast",
         "--every-nth", "2", "--no-audio", "--backend", "cuda",
     ])
     expected = {
@@ -469,6 +561,7 @@ def test_all_new_video_flags_compose() -> None:
         "defer_d2h": True, "force_recognize": True, "encoder": "nvenc",
         "decoder": "gpu", "arena_strategy": "pow2", "crf": 23, "preset": "fast",
         "every_nth": 2, "no_audio": True, "backend": "cuda",
+        "reuse_detect_buffers": True,
     }
     for key, value in expected.items():
         got = getattr(args, key)
@@ -493,7 +586,7 @@ def test_switch_defaults_match_baseline() -> None:
         "workers": 1, "profile": False, "encode_thread": False,
         "defer_d2h": False, "force_recognize": False,
         "encoder": "libx264", "decoder": "pyav",
-        "arena_strategy": "same",
+        "arena_strategy": "same", "reuse_detect_buffers": False,
         "crf": 18, "preset": "medium", "every_nth": 1,
         "no_audio": False, "backend": "cuda",
     }
@@ -564,7 +657,7 @@ def test_headless_module_syntax() -> None:
         if isinstance(node, ast.ClassDef)
     }
     expected_fields = {
-        "SwapOptions": ("arena_strategy",),
+        "SwapOptions": ("arena_strategy", "reuse_detect_buffers"),
         "VideoOptions": (
             "profile", "encode_thread", "defer_d2h", "force_recognize",
             "encoder", "decoder", "workers",
@@ -755,6 +848,8 @@ def main() -> int:
     test_video_profile_flag()
     test_video_encode_thread_flag()
     test_stage3_flags()
+    test_reuse_detect_buffers_flag()
+    test_detect_buffer_reuse_wiring()
     test_force_recognize_flag()
     test_video_encoder_flag()
     test_recognize_wiring()

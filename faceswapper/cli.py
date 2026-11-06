@@ -210,6 +210,7 @@ def _build_options(args: argparse.Namespace, headless=None) -> "SwapOptions":
         overrides=overrides,
         backend=args.backend,
         arena_strategy=args.arena_strategy,
+        reuse_detect_buffers=args.reuse_detect_buffers,
     )
     return options
 
@@ -375,6 +376,7 @@ def _cmd_video(args: argparse.Namespace) -> int:
         encoder=args.encoder,
         decoder=args.decoder,
         arena_strategy=args.arena_strategy,
+        reuse_detect_buffers=args.reuse_detect_buffers,
     )
 
     def progress(index: int, total: int) -> None:
@@ -521,6 +523,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="CUDA EP 的 VRAM arena 扩展策略：same（默认，按需"
                             "分配）或 pow2（减少重复 cudaMalloc，只是让显存"
                             "数字变大，不是提速手段）")
+        p.add_argument("--reuse-detect-buffers", action="store_true",
+                       help="复用 detector 的 9 个 io_binding 输出缓冲，省掉"
+                            "每帧 9 次显存分配；默认关闭，TRT 后端下自动关闭")
 
     swap = sub.add_parser("swap", help="换一张或多张图片里的脸")
     add_common(swap)

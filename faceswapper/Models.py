@@ -15,6 +15,7 @@ import subprocess as sp
 import threading
 
 from faceswapper._nvtx import nvtx_range
+from faceswapper.detect_buffers import OutputBufferCache, resolve_reuse_buffers
 onnxruntime.set_default_logger_severity(4)
 
 
@@ -111,6 +112,10 @@ class Models():
         # permute+contiguous 往返。按 worker 分开是因为各 worker 会并发
         # 写入各自的副本。
         self._retinaface_buffers_tls = threading.local()
+        # 阶段 6：9 个 io_binding 输出缓冲是否按 worker 复用。默认 False，
+        # 关掉时 _detect_retinaface_inner 逐字走原来的每帧 torch.empty 路径。
+        # 判定与 shape 计算在 stdlib-only 的 detect_buffers.py。
+        self._reuse_detect_buffers: bool = False
         # 主管线 session 加载消息里 [N/M] 前缀的进度计数。计数按 phase
         # 划分：模型加载来自几个互不重叠的用户驱动阶段（find =
         # retinaface + arcface，swap = inswapper 变体），phase 一变计数
@@ -291,6 +296,15 @@ class Models():
                 f"unknown arena strategy {strategy!r}; expected one of {valid}"
             )
         self._arena_strategy = strategy
+
+    def set_reuse_detect_buffers(self, enabled: bool, backend: str = "cuda") -> None:
+        """阶段 6：是否复用 retinaface 的 9 个 io_binding 输出缓冲。
+
+        ``resolve_reuse_buffers`` 会在 TRT-EP / 未知 backend 下关掉它：TRT 的
+        io_binding 输出行为未经真机核对，不猜。默认 False 时
+        ``_detect_retinaface_inner`` 一帧一分配的旧路径逐字保留。
+        """
+        self._reuse_detect_buffers = resolve_reuse_buffers(enabled, backend)
 
     def get_backend_preference(self, attr_name):
         """返回 'trt' / 'onnx' / None（auto）。"""
@@ -613,6 +627,29 @@ class Models():
             )
             bufs[key] = buf
         return buf
+
+    def _get_retinaface_output_buffers(self, input_height, input_width, strides):
+        """阶段 6：按 worker 复用的 9 个 io_binding 输出缓冲。
+
+        shape 只由 ``(input_height, input_width, strides)`` 决定，一次 video
+        里恒定。缓存挂在同一个 ``_retinaface_buffers_tls`` 上，所以每个
+        worker 各有一组——不同 worker 的 stream 并发，共享会让 ORT 的写入
+        互相踩。同 worker 内是安全的：``rf_postprocess`` 在 worker 自己的
+        stream 上读完这一帧，下一帧的 ORT 写入才排到它后面。
+
+        ``OutputBufferCache`` 是 stdlib-only，``torch.empty`` 由这里的 lambda
+        注入，缓存命中/失效的行为因此有离线行为测试覆盖。
+        """
+        tls = self._retinaface_buffers_tls
+        cache = getattr(tls, 'output_cache', None)
+        if cache is None:
+            cache = OutputBufferCache(
+                lambda shape, spec: torch.empty(
+                    shape, dtype=torch.float32, device='cuda',
+                )
+            )
+            tls.output_cache = cache
+        return cache.get(input_height, input_width, strides)
 
     def _get_retinaface_gpu_anchors(self, height, width, stride):
         """给定 det_10g feature map，返回 CUDA 上 (height*width*2, 2) 的
@@ -1718,14 +1755,28 @@ class Models():
             input_height = det_img.shape[2]
             input_width = det_img.shape[3]
             strides = (8, 16, 32)
-            score_bufs = []
-            bbox_bufs = []
-            kps_bufs = []
-            for s in strides:
-                n_anchors = (input_height // s) * (input_width // s) * 2
-                score_bufs.append(torch.empty((n_anchors, 1), dtype=torch.float32, device='cuda'))
-                bbox_bufs.append(torch.empty((n_anchors, 4), dtype=torch.float32, device='cuda'))
-                kps_bufs.append(torch.empty((n_anchors, 10), dtype=torch.float32, device='cuda'))
+            if self._reuse_detect_buffers:
+                # 阶段 6：命中 per-worker 缓存，热路径上不再有每帧 9 次
+                # torch.empty。缓冲顺序是 score×N → bbox×N → kps×N，与下面
+                # det_out_names 的三个切片一致；N 取 len(strides) 而非写死 3。
+                buffers = self._get_retinaface_output_buffers(
+                    input_height, input_width, strides,
+                )
+                n = len(strides)
+                score_bufs = list(buffers[0:n])
+                bbox_bufs = list(buffers[n:2 * n])
+                kps_bufs = list(buffers[2 * n:3 * n])
+            else:
+                # 默认路径：每帧各自分配 9 个输出缓冲，逻辑与改造前逐字相同
+                # （只多了外层 if 的缩进）。
+                score_bufs = []
+                bbox_bufs = []
+                kps_bufs = []
+                for s in strides:
+                    n_anchors = (input_height // s) * (input_width // s) * 2
+                    score_bufs.append(torch.empty((n_anchors, 1), dtype=torch.float32, device='cuda'))
+                    bbox_bufs.append(torch.empty((n_anchors, 4), dtype=torch.float32, device='cuda'))
+                    kps_bufs.append(torch.empty((n_anchors, 10), dtype=torch.float32, device='cuda'))
 
             retinaface_session = self._get_retinaface_session()
             det_img_name, det_out_names = self._retinaface_io_names

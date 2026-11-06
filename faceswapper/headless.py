@@ -64,6 +64,9 @@ class SwapOptions:
     # CUDA EP 的 VRAM arena 扩展策略：same（默认，kSameAsRequested）或 pow2
     # （kNextPowerOfTwo）。后者只减少重复 cudaMalloc，不是提速手段。
     arena_strategy: str = "same"
+    # 阶段 6：复用 retinaface 的 9 个 io_binding 输出缓冲，省掉每帧 9 次
+    # torch.empty。默认关闭；TRT-EP 后端下会被判定逻辑自动关掉。
+    reuse_detect_buffers: bool = False
 
 
 def _read_image(path: str) -> np.ndarray:
@@ -110,6 +113,12 @@ class _SwapperBase:
             "kNextPowerOfTwo"
             if getattr(options, "arena_strategy", "same") == "pow2"
             else "kSameAsRequested"
+        )
+        # 阶段 6：默认关闭；resolve_reuse_buffers 会在 trt / 未知 backend 下
+        # 再关一次，不猜 TRT-EP 的 io_binding 输出行为。
+        self.models.set_reuse_detect_buffers(
+            bool(getattr(options, "reuse_detect_buffers", False)),
+            backend=options.backend,
         )
         if options.backend == "cuda":
             # 这里的 "onnx" 指的是 faceswapper.Models 里那条纯 CUDA

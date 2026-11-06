@@ -848,6 +848,34 @@ torchcodec 各版本的 frame 字段与 PTS 单位不统一，适配层刻意**�
 真机未验证：torchcodec 的实际 frame 布局、PTS 单位、VFR 与音画同步都需要在
 GPU 环境核对。不传该开关即回到原 PyAV 路径。
 
+#### 阶段 6：复用 detector 输出缓冲（每帧少 9 次显存分配）
+
+`Models._detect_retinaface_inner` 每帧为 9 个 `io_binding` 输出各调一次
+`torch.empty`（3 个 stride × score/bbox/kps）。这些缓冲的 shape 只由
+`(input_height, input_width, stride)` 决定，而前两个尺寸在一次 video 里恒定
+（除非改 `--detect-input-size`）。输入缓冲和 anchor centers 早就按 worker
+缓存了，输出缓冲是这条链上唯一还每帧重新分配的一环。
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target input.mp4 --output output.mp4 \
+    --reuse-detect-buffers
+```
+
+形状计算、闸门判定与「按 key 命中缓存、未命中才 alloc」抽在 stdlib-only 的
+`detect_buffers.py`，`torch.empty` 由 `Models.py` 注入，因此缓存命中/失效、
+跨 worker 隔离都能离线做行为测试。每组缓冲挂在已有的
+`_retinaface_buffers_tls` 上——各 worker 的 stream 并发推进，共享会让 ORT 的
+写入互相踩；同一 worker 内则是安全的，`rf_postprocess` 读完这一帧后下一帧的
+写入才排到它后面。
+
+默认**关闭**，不传开关时 `_detect_retinaface_inner` 逐字走原来每帧 9 次
+`torch.empty` 的路径（AST 测试钉住这条 fallback）。`--backend trt` 下判定逻辑
+会自动关闭复用：TRT-EP 的 `io_binding` 输出行为未经真机核对，不猜。
+
+**真机未验证**：ORT 是否每帧完整覆写这 9 个缓冲、复用后逐帧 PSNR、以及省下
+分配后的实际 `avg fps` 收益。按方案第 10 节的 A/B 顺序测；不传该开关即回滚。
+
 #### GPU 基线验收脚本
 
 方案 3.4 的 `workers=1/2/4` 矩阵已封装成 `tools/bench_gpu.py`，**默认
@@ -941,6 +969,7 @@ python -m faceswapper.cli \
 | `--color-match` | 启用 LAB 色彩匹配 | 关闭 |
 | `--backend` | `cuda`（纯 CUDA EP，不尝试 TensorRT）或 `trt`（需 TensorRT 10 运行时） | `cuda` |
 | `--arena-strategy` | `same`（按需分配）或 `pow2`（减少重复 `cudaMalloc`，只是让 VRAM 数字变大，不是提速手段） | `same` |
+| `--reuse-detect-buffers` | 复用 detector 的 9 个 `io_binding` 输出缓冲，省掉每帧 9 次显存分配；`--backend trt` 下自动关闭 | 关闭 |
 
 > **`--detect-input-size` 不要随便调小。** 它只影响检测器输入分辨率，
 > 不影响换脸质量——调小是纯速度交易：`480` ≈ 1.8× 快，`416` ≈ 2.4×，
