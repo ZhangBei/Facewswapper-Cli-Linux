@@ -12,14 +12,14 @@
   异常传播与背压均有离线测试覆盖。
 - 阶段 3 的 6.1 / 6.2 已实现（`--defer-d2h`、`--arena-strategy`，均默认关闭），
   红线同步由 AST 测试守住；**nsys 与真机 A/B 未做**。
-- 阶段 4 的 7.1 代码已编写，但**闸门关闭、未挂载到主路径**
+- 阶段 4 的 7.1 代码已编写，接入点受闸门保护、默认短路
   （`EXPERIMENTAL_FACE_BATCH=False`）；需 GPU 环境做多人脸 PSNR 比对后才能
   解冻，见 7.1 的五条阻断条件与解冻步骤。另实现了一条等价且更安全的优化：
   跳过没有读取方的逐脸 `run_recognize`，`--force-recognize` 可回滚。
 - 阶段 5 的编码侧（`--encoder libx264|nvenc`）与解码侧
   （`--decoder pyav|gpu`）代码均已落地，两个默认值都不变；两者都需要真机
-  核对第三方 API/参数。阶段 4 的 7.2 已落地判定 / 分组 / 闸门（主流水线
-  未挂载），推理侧回填仍需真机逐帧 PSNR。
+  核对第三方 API/参数。阶段 4 的 7.2 判定 / 分组 / 前向与回填编排均已落地，
+  闸门关闭、主流水线未挂载，推理结果仍需真机逐帧 PSNR。
 - 当前环境没有 GPU 栈，以上均为代码层实现，**未做任何真机性能验证**；
   3.4 的基线矩阵仍是后续所有阶段的前置条件。
 
@@ -117,6 +117,22 @@ done
 
 记录 `elapsed`、`avg fps`、GPU 利用率曲线、VRAM 峰值、`ffprobe` 帧数与时长；
 用 `ffmpeg -i out-w1.mp4 -i out-w4.mp4 -filter_complex psnr -f null -` 比对像素。
+
+上面这段已封装成 `tools/bench_gpu.py`，**默认 dry-run**（只打印命令，不碰
+GPU、不写文件），加 `--run` 才执行：
+
+```bash
+python tools/bench_gpu.py --source face.jpg --target in.mp4
+python tools/bench_gpu.py --source face.jpg --target in.mp4 --run \
+    --workers 1,2,4 --monitor-gpu --check-frames --psnr
+```
+
+命令构造与结果解析在 stdlib-only 的 `faceswapper/bench_plan.py`，由
+`tests/test_bench_plan.py` 离线验证（含 dry-run 端到端）；脚本只负责编排
+子进程。它会自动解析 `elapsed` / `avg fps` / `profile` 三段、`ffprobe`
+帧数、与 `workers=1` 基线的加速比和 PSNR，结果写到
+`<output-dir>/bench_report.json`。`--extra-flag` 可把
+`--encode-thread` / `--encoder nvenc` 等开关透传给每次运行，便于做 A/B。
 
 **通过标准**：拿到可复现的数字，且 `workers=1` 的输出与改造前完全一致（回归基线）。
 
@@ -317,18 +333,23 @@ stdlib-only，传入 torch stream 会破坏这条约束；而 `wait_stream` 本�
   模型不符等）因为 prepare 没写回过 img，可以干净地退回逐脸路径。
 - `VideoManager._face_bbox()`：与 paste_back 段同一套 bbox 算法，供 prepare
   提前判定重叠；**改动 paste_back 的 bbox 计算必须同步这里**。
-- 闸门 `EXPERIMENTAL_FACE_BATCH = False`：关闭时 `swap_core_batched` 直接抛
-  `RuntimeError`；`_swap_video_inner` 也**没有**调用它。
+- 闸门 `EXPERIMENTAL_FACE_BATCH = False`：`_swap_video_inner` 的 headless
+  分支有一个**唯一**的接入点，被
+  `if EXPERIMENTAL_FACE_BATCH and not targets` 包住，闸门关闭时短路到原逐脸
+  循环，输出逐字不变。`--target-face` 的相似度筛选也不走 batch——
+  `batch_eligibility` 新增 `target_face_filtering` 参数做第二道保险
+  （`swap_core_batched` 传入 `bool(self.target_face_embeddings)`）。
   `tests/test_face_batch.py::test_batch_path_is_disabled` 用 AST 钉住
-  「闸门为 False、主路径未挂载、`batch_slot` 默认 None」这三条。
+  「闸门为 False、**每一个** `swap_core_batched` 调用都在闸门分支内、
+  `batch_slot` 默认 None」这三条。
 
 #### 解冻步骤（需要 GPU 环境）
 
 1. 准备多人脸视频样本，分别覆盖 bbox 不重叠与重叠两种情况，记录
    `workers=1` 逐脸路径的输出作为 PSNR 基线。
-2. 把 `EXPERIMENTAL_FACE_BATCH` 置 `True`，并在 `_swap_video_inner` 的
-   headless 分支里，仅当 `batch_eligibility()` 返回 `True` 时调用
-   `swap_core_batched`，否则走原逐脸路径。
+2. 把 `EXPERIMENTAL_FACE_BATCH` 置 `True` 即可启用已就位的接入点；
+   `swap_core_batched` 内部仍会在 prepare 之后按 `batch_eligibility()`
+   判定，不适用时干净回退逐脸路径，不需要改 `_swap_video_inner`。
 3. 比对帧数、PTS、音画、逐帧 PSNR；重叠 bbox 的样本必须走回退分支。
 4. 用 `nvidia-smi dmon` 与 `elapsed` / `avg fps` 确认 VRAM 与吞吐收益；
    单人脸视频应自动回退，不得有回归。
@@ -373,15 +394,26 @@ stdlib-only，传入 torch stream 会破坏这条约束；而 `wait_stream` 本�
   `VideoManager.py` 都没有调用被闸门保护的入口」。
 - **主流水线完全未挂载**：没有新 CLI flag，也没有改动任何帧路径。
 
-#### 推理侧为什么没写死代码
+#### 推理侧骨架（已编写，闸门关闭）
 
-一次跨帧 ORT Run 本身可以复用 7.1 的 `swap_core(batch_slot=...)` prepare
-钩子把各帧的 128×128 输入堆成 `(N,3,128,128)`，再调
-`run_swapper_batched`。难点在**回填**：每帧要把自己的输出按原顺序走
-postprocess 与 paste-back，同时保证 PTS、音画与 `--every-nth` 语义不变，
-这需要重构整个帧流水线，且只能靠真机逐帧 PSNR 判断等价性。在闸门关闭的
-前提下写一段永远不会执行的半成品没有价值，因此只交付判定/分组/闸门，
-把推理侧接入点写在这里：
+一次跨帧 ORT Run 复用 7.1 的 `swap_core(batch_slot=...)` prepare/finish 钩子，
+不复制任何 postprocess：
+
+- `cross_frame_batch.py::run_cross_frame_batch()`：纯编排函数，把
+  「闸门 → 判定 → prepare 全部帧 → 一次 infer → 按序 finish」抽成可注入
+  回调的状态机。闸门关闭或判定不通过时**一次 prepare 都不调用**，直接
+  fallback，保证输入帧未被改动。`tests/test_cross_frame_batch.py` 用假回调
+  断言调用顺序、闸门/回退不碰帧、prepare 失败不会触发 infer/finish。
+- `VideoManager.cross_frame_batch_swap()`：把真实回调绑进来——prepare 用
+  `swap_core(mode="prepare")` 收集各帧 128×128 输入，infer 调一次
+  `run_swapper_batched`，finish 按组内顺序用 `mode="finish"` 走原有 mask /
+  restorer / paste_back。各帧 img 互不相干，因此没有 7.1 的 bbox 重叠问题。
+  闸门关闭时由该方法补一次逐脸 fallback，输出与基线一致。
+- **主流水线仍未挂载**：`_swap_video_inner`、`headless.py`、
+  `frame_order.py` 都不调用它，也没有新 CLI flag。AST 测试守住这条。
+
+**仍未验证**：GPU 侧前向与回填本身、逐帧 PSNR、VFR/音画时序、以及省下
+ORT 调用后的实际收益——这些必须在 GPU 环境做。解冻步骤：
 
 1. 有 GPU 环境后，用多人脸 + 单人险混合片段建立 `workers=1` 的逐帧 PSNR 基线。
 2. 在 `frame_order.ordered_swap_frames` 的消费侧，按 `resolve_cross_frame_batch`
@@ -471,7 +503,7 @@ postprocess 与 paste-back，同时保证 PTS、音画与 `--every-nth` 语义�
 | 3 | 延迟 D2H / arena 策略（保守版） | 未测（可能很小） | 代码已完成 | 低（未删同步） | 是 + nsys，未做 |
 | 4.1 | 单帧多脸 batch | 未测 | 代码已完成、闸门关闭 | 高（启用后会改像素） | 是，解冻前必须 |
 | 4.2 | 跳过无用的逐脸 recognize | 中（每帧省 N 次 ORT） | 代码已完成 | 极低 | 是 |
-| 4.3 | 跨帧 batch 判定 / 闸门 | — | 代码已完成、未挂载 | 高（推理侧回填） | 是 |
+| 4.3 | 跨帧 batch（判定/编排/推理骨架） | — | 代码已完成、未挂载 | 高（需逐帧 PSNR） | 是 |
 | 5a | NVENC 编码开关 | 中（只解 CPU 编码瓶颈） | 代码已完成 | 中（画质 / 驱动） | 是 |
 | 5b | GPU 常驻解码（torchcodec） | 未测 | 代码已完成、默认关闭 | 中（frame/PTS 单位） | 是 |
 
@@ -549,7 +581,8 @@ ffprobe -v error -select_streams v:0 -show_entries stream=profile,bit_rate \
 | 7.1 实验实现 | `face_batch.py::batch_eligibility`；`VideoManager.py::swap_core_batched`、`_face_bbox`、`swap_core(batch_slot=...)` |
 | 编码器选择与 NVENC 探测 | `encoder_probe.py::resolve_encoder`；`encoder.py::encoder_worker(codec=...)`、`headless.py::_encode_video` |
 | GPU 解码探测与帧适配 | `decoder.py::resolve_decoder`、`frame_fields`；`headless.py::_gpu_decode_probe`、`_decoded_gpu` |
-| 跨帧 batch 判定 / 分组 | `cross_frame_batch.py::cross_frame_batch_eligibility`、`resolve_cross_frame_batch`、`group_frames` |
+| 跨帧 batch 判定 / 分组 / 编排 | `cross_frame_batch.py::cross_frame_batch_eligibility`、`resolve_cross_frame_batch`、`group_frames`、`run_cross_frame_batch`；`VideoManager.py::cross_frame_batch_swap` |
+| GPU 基线验收 | `tools/bench_gpu.py`；`faceswapper/bench_plan.py::build_cases`、`parse_metrics`、`summarize` |
 | 帧解码与逐脸循环 | `headless.py::decoded()`（局部生成器）、`VideoManager.py::_swap_video_inner` |
 | session 共享策略 | `Models.py::_get_model_session`、`set_model_session_mode` |
 | 后端偏好（cuda 不碰 TRT） | `Models.py::set_backend_preference_for_all`、`headless.py::_SwapperBase.__init__` |

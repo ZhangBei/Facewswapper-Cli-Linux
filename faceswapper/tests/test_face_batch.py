@@ -111,6 +111,17 @@ def test_overlapping_bboxes_fall_back() -> None:
     print("  ok  overlapping bboxes fall back, touching edges do not")
 
 
+def test_target_face_filtering_falls_back() -> None:
+    """--target-face 会按相似度只换选中的脸，batch 语义不同，必须回退。"""
+    ok, reason = eligible(target_face_filtering=True)
+    if ok or "target-face" not in reason:
+        fail(f"target-face filtering must fall back: {(ok, reason)!r}")
+    ok, _ = eligible(target_face_filtering=False)
+    if not ok:
+        fail("turning the filter off must restore eligibility")
+    print("  ok  --target-face similarity filtering falls back to per-face")
+
+
 def test_batch_path_is_disabled() -> None:
     """闸门必须关闭、主路径不得挂载 batch、swap_core 的默认参数不变。
 
@@ -149,12 +160,33 @@ def test_batch_path_is_disabled() -> None:
         if required not in methods:
             fail(f"VideoManager is missing {required}()")
 
-    inner_calls = {
-        node.func.attr for node in ast.walk(methods["_swap_video_inner"])
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    }
-    if "swap_core_batched" in inner_calls:
-        fail("the experimental batch path must not be wired into _swap_video_inner")
+    inner = methods["_swap_video_inner"]
+    all_batch_calls = [
+        node for node in ast.walk(inner)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "swap_core_batched"
+    ]
+    guarded_calls = []
+    for node in ast.walk(inner):
+        if not isinstance(node, ast.If):
+            continue
+        test_names = {
+            n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
+        }
+        if "EXPERIMENTAL_FACE_BATCH" not in test_names:
+            continue
+        guarded_calls.extend(
+            sub for sub in ast.walk(node)
+            if isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr == "swap_core_batched"
+        )
+    if len(all_batch_calls) != len(guarded_calls):
+        fail("every swap_core_batched call must be inside an "
+             "EXPERIMENTAL_FACE_BATCH guard")
+    if not all_batch_calls:
+        fail("the gated 7.1 entry point should exist in _swap_video_inner")
 
     core = methods["swap_core"]
     if not (
@@ -163,7 +195,7 @@ def test_batch_path_is_disabled() -> None:
         and core.args.defaults[-1].value is None
     ):
         fail("swap_core's batch_slot must default to None")
-    print("  ok  batch code is present, gated off and not wired in")
+    print("  ok  batch code is present, gated off and every call is guarded")
 
 
 def main() -> int:
@@ -174,6 +206,7 @@ def main() -> int:
     test_multi_pass_switches_fall_back()
     test_pipeline_size_must_be_uniform_128()
     test_overlapping_bboxes_fall_back()
+    test_target_face_filtering_falls_back()
     test_batch_path_is_disabled()
     print("all tests passed")
     return 0

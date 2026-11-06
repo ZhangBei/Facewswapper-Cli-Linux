@@ -18,6 +18,7 @@ from faceswapper.cross_frame_batch import (
     cross_frame_batch_eligibility,
     group_frames,
     resolve_cross_frame_batch,
+    run_cross_frame_batch,
 )
 
 
@@ -140,19 +141,112 @@ def test_grouping_preserves_decode_order() -> None:
     print("  ok  grouping slices in order and keeps a short tail")
 
 
+def _runner(calls, items, **overrides):
+    kwargs = {
+        "gate_open": True,
+        "eligible": (True, "eligible"),
+        "prepare": lambda i, item: calls.append(("prepare", i)),
+        "infer": lambda n: calls.append(("infer", n)),
+        "finish": lambda i, item: calls.append(("finish", i)),
+        "fallback": lambda: calls.append(("fallback",)),
+        "frame_items": items,
+    }
+    kwargs.update(overrides)
+    return run_cross_frame_batch(**kwargs)
+
+
+def test_runner_gate_and_fallback_never_touch_frames() -> None:
+    """闸门关闭或判定不通过时，prepare 一次都不能调用。"""
+    items = ["a", "b", "c"]
+    calls: list = []
+    result = _runner(calls, items, gate_open=False)
+    if result.status != "gated" or calls:
+        fail(f"a closed gate must do nothing: {result!r} {calls!r}")
+
+    calls.clear()
+    result = _runner(calls, items, eligible=(False, "workers=1"))
+    if result.status != "fallback" or calls != [("fallback",)]:
+        fail(f"fallback must be the only call: {result!r} {calls!r}")
+    print("  ok  gate / fallback leave every input frame untouched")
+
+
+def test_runner_orders_prepare_infer_finish() -> None:
+    """prepare 全部完成才 infer，finish 严格按原顺序。"""
+    items = ["a", "b", "c"]
+    calls: list = []
+    result = _runner(calls, items)
+    expected = (
+        [("prepare", 0), ("prepare", 1), ("prepare", 2)]
+        + [("infer", 3)]
+        + [("finish", 0), ("finish", 1), ("finish", 2)]
+    )
+    if calls != expected:
+        fail(f"unexpected batch order: {calls!r}")
+    if result.status != "batched" or result.frames != 3:
+        fail(f"unexpected result: {result!r}")
+    print("  ok  prepare-all -> one infer -> ordered finish")
+
+
+def test_runner_propagates_prepare_failure() -> None:
+    """prepare 中途抛错时，infer / finish / fallback 都不该执行。"""
+    items = ["a", "b", "c"]
+    calls: list = []
+
+    def prepare(i, item):
+        calls.append(("prepare", i))
+        if i == 1:
+            raise RuntimeError("prepare boom")
+
+    try:
+        _runner(calls, items, prepare=prepare)
+    except RuntimeError as exc:
+        if "boom" not in str(exc):
+            fail(f"wrong exception surfaced: {exc!r}")
+    else:
+        fail("prepare failure must propagate")
+    if calls != [("prepare", 0), ("prepare", 1)]:
+        fail(f"inference started after a failed prepare: {calls!r}")
+    print("  ok  a failed prepare aborts before inference or paste-back")
+
+
 def test_not_wired_into_the_pipeline() -> None:
-    """闸门之外，主流水线也不得调用跨帧 batch 入口。"""
+    """闸门之外，主流水线也不得调用跨帧 batch 入口或实验方法。"""
     root = Path(__file__).resolve().parents[1]
-    for name in ("headless.py", "frame_order.py", "VideoManager.py"):
+    vm = ast.parse((root / "VideoManager.py").read_text(encoding="utf-8"))
+    cls = next(
+        n for n in vm.body
+        if isinstance(n, ast.ClassDef) and n.name == "VideoManager"
+    )
+    methods = {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
+    if "cross_frame_batch_swap" not in methods:
+        fail("the 7.2 forward/backfill skeleton should exist but stay gated")
+
+    vm_calls = {
+        node.func.id
+        for node in ast.walk(vm)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    if "resolve_cross_frame_batch" in vm_calls:
+        fail("VideoManager must not call the gated entry point directly")
+
+    for name in ("headless.py", "frame_order.py"):
         tree = ast.parse((root / name).read_text(encoding="utf-8"))
         calls = {
             node.func.id
             for node in ast.walk(tree)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         }
-        if "resolve_cross_frame_batch" in calls:
+        if "resolve_cross_frame_batch" in calls or "cross_frame_batch_swap" in calls:
             fail(f"{name} must not wire in the experimental cross-frame batch")
-    print("  ok  no production frame path calls the gated entry point")
+
+    inner_calls = {
+        node.func.attr
+        for node in ast.walk(methods["_swap_video_inner"])
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    if "cross_frame_batch_swap" in inner_calls:
+        fail("_swap_video_inner must not call the gated 7.2 method")
+    print("  ok  gated 7.2 skeleton exists but no frame path calls it")
 
 
 def main() -> int:
@@ -163,6 +257,9 @@ def main() -> int:
     test_variable_face_counts_and_sizes_fall_back()
     test_pts_and_index_ordering_is_enforced()
     test_grouping_preserves_decode_order()
+    test_runner_gate_and_fallback_never_touch_frames()
+    test_runner_orders_prepare_infer_finish()
+    test_runner_propagates_prepare_failure()
     test_not_wired_into_the_pipeline()
     print("all tests passed")
     return 0

@@ -44,6 +44,7 @@ def batch_eligibility(
     *,
     swapper_type: str,
     parameters: Mapping[str, Any],
+    target_face_filtering: bool = False,
     min_faces: int = 2,
 ) -> tuple[bool, str]:
     """这一帧能不能把 N 张脸合成一次 ``run_swapper_batched``。
@@ -58,6 +59,10 @@ def batch_eligibility(
     n = len(candidates)
     if n < min_faces:
         return False, f"only {n} face(s), batch needs at least {min_faces}"
+    if target_face_filtering:
+        # --target-face 会按相似度只换选中的脸；batch 路径把所有脸都换成
+        # 同一个 source，语义不同，必须回退逐脸。
+        return False, "--target-face similarity filtering is not batched"
     if swapper_type != "inswapper-128":
         return False, (
             f"swapper {swapper_type!r} is not the 128 inswapper ONNX graph"

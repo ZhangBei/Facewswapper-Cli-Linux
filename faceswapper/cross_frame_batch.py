@@ -12,7 +12,7 @@ stdlib-only：判定只看帧元数据与参数 dict，分组只做有序切片�
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 # 闸门：关闭时 resolve_cross_frame_batch 一律拒绝。主流水线（frame_order /
 # headless / VideoManager._swap_video_inner）不调用本模块，改动它不会改变
@@ -110,3 +110,46 @@ def group_frames(
         list(candidates[start:start + batch_size])
         for start in range(0, len(candidates), batch_size)
     ]
+
+
+@dataclass(frozen=True)
+class BatchRunResult:
+    """一次跨帧 batch 编排的结果。"""
+
+    status: str  # "gated" | "fallback" | "batched"
+    reason: str
+    frames: int = 0
+
+
+def run_cross_frame_batch(
+    *,
+    gate_open: bool,
+    eligible: tuple[bool, str],
+    prepare: Callable[[int, Any], None],
+    infer: Callable[[int], None],
+    finish: Callable[[int, Any], None],
+    fallback: Callable[[], None],
+    frame_items: Sequence[Any],
+) -> BatchRunResult:
+    """编排「prepare 全部帧 → 一次 infer → 按序 finish」，回调全部注入。
+
+    抽成纯函数是为了让顺序契约能在没有 GPU / torch 的环境下做行为测试：
+    ``VideoManager.cross_frame_batch_swap`` 只负责把真实回调绑进来。
+
+    顺序是硬要求：prepare 必须全部完成（收集完各帧输入）才能 infer，finish
+    必须按原顺序执行（paste_back 与 PTS 保序）。闸门关闭或判定不通过时
+    **一次 prepare 都不调用**，直接走 fallback，保证输入帧未被改动。
+    """
+    if not gate_open:
+        return BatchRunResult("gated", "experimental gate is closed")
+    ok, reason = eligible
+    if not ok:
+        fallback()
+        return BatchRunResult("fallback", reason)
+
+    for index, item in enumerate(frame_items):
+        prepare(index, item)
+    infer(len(frame_items))
+    for index, item in enumerate(frame_items):
+        finish(index, item)
+    return BatchRunResult("batched", reason, len(frame_items))

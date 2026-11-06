@@ -778,9 +778,10 @@ python -m faceswapper.cli --models ./models video \
 
 #### 阶段 4：跳过无用的逐脸识别
 
-单帧多脸 batch（方案 7.1）的代码已按「先编写、不启用」落地：由
-`EXPERIMENTAL_FACE_BATCH=False` 闸门挡住，`_swap_video_inner` 不调用它，
-默认输出与基线逐字一致。之所以不能直接启用：paste-back 虽只作用于该脸
+单帧多脸 batch（方案 7.1）的代码已按「先编写、不启用」落地：唯一接入点在
+`_swap_video_inner` 的 headless 分支里，被 `EXPERIMENTAL_FACE_BATCH=False`
+闸门包住，默认短路到原逐脸循环，输出与基线逐字一致；指定 `--target-face`
+时也不会走 batch（相似度筛选语义不同）。之所以不能直接启用：paste-back 虽只作用于该脸
 bbox，但 `run_swapper_batched` 的 N 是 polyphase phase 数而非脸数、
 `pipeline_size` 逐脸不同、`swap_core` 是 438 行单体函数，且输入 warp 会从
 已被前一张脸写回的 `img` 采样——预批量准备会改变重叠人脸的像素。因此
@@ -803,13 +804,15 @@ python -m faceswapper.cli --models ./models video \
 `found_faces` 匹配路径，同样不受影响。判定在 `recognize.py`，离线行为测试覆盖
 四种组合。真机收益未测。
 
-跨帧 batch（方案 7.2）的**适用性判定、有序分组与闸门**也已写进
-`cross_frame_batch.py`，但 `EXPERIMENTAL_CROSS_FRAME_BATCH=False` 且主流水线
-完全没有调用它。判据很硬：`workers >= 2`、不跳帧、仅 `inswapper-128`、
-每帧恰好一张脸、`pipeline_size` 恒为 128、`index` 连续、PTS 严格递增——
-最后两条保证 VFR 时序不被 batch 重排。推理侧的回填必须重构帧流水线并做逐帧
-PSNR 比对，因此没有写一段永不执行的半成品；接入点与五步解冻流程见
-[docs/gpu-utilization-plan.md 7.2](docs/gpu-utilization-plan.md)。
+跨帧 batch（方案 7.2）的**判定、有序分组、前向/回填编排与闸门**均已写进
+代码，但 `EXPERIMENTAL_CROSS_FRAME_BATCH=False` 且主流水线完全没有调用它。
+判据很硬：`workers >= 2`、不跳帧、仅 `inswapper-128`、每帧恰好一张脸、
+`pipeline_size` 恒为 128、`index` 连续、PTS 严格递增——最后两条保证 VFR
+时序不被 batch 重排。编排层「prepare 全部帧 → 一次 ORT Run → 按序 finish」
+抽成注入回调的纯函数并有离线行为测试；`VideoManager.cross_frame_batch_swap`
+复用 7.1 的 prepare/finish 钩子，不复制 postprocess，闸门关闭时补一次逐脸
+fallback 保证输出等价。GPU 侧前向、逐帧 PSNR 与 VFR/音画时序仍需真机核对，
+五步解冻流程见 [docs/gpu-utilization-plan.md 7.2](docs/gpu-utilization-plan.md)。
 
 #### 阶段 5：NVENC 编码开关
 
@@ -844,6 +847,24 @@ torchcodec 各版本的 frame 字段与 PTS 单位不统一，适配层刻意**�
 
 真机未验证：torchcodec 的实际 frame 布局、PTS 单位、VFR 与音画同步都需要在
 GPU 环境核对。不传该开关即回到原 PyAV 路径。
+
+#### GPU 基线验收脚本
+
+方案 3.4 的 `workers=1/2/4` 矩阵已封装成 `tools/bench_gpu.py`，**默认
+dry-run**（只打印命令，不碰 GPU、不写文件），加 `--run` 才真正执行：
+
+```bash
+python tools/bench_gpu.py --source face.jpg --target in.mp4
+python tools/bench_gpu.py --source face.jpg --target in.mp4 --run \
+    --workers 1,2,4 --monitor-gpu --check-frames --psnr
+```
+
+脚本会采集 `elapsed` / `avg fps` / `--profile` 三段耗时、GPU 利用率与显存
+曲线、`ffprobe` 帧数，并以 `workers=1` 为回归基线算加速比和逐帧 PSNR，
+结果写到 `bench-out/bench_report.json`。`--extra-flag` 可透传任意开关做 A/B
+（每个 token 单独给一次，例如 `--extra-flag=--encode-thread`）。命令构造与
+输出解析在 `faceswapper/bench_plan.py`，有离线行为测试，因此在没有 GPU 的
+机器上也能安全地预览与自检。
 
 完整的分阶段实施方案（现状瓶颈、详细实现步骤、验收清单、风险与回滚）见
 [docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md)。

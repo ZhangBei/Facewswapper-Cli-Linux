@@ -8,6 +8,11 @@ from math import floor, ceil
 
 from faceswapper.parameters import default_values
 from faceswapper._nvtx import nvtx_range
+from faceswapper.cross_frame_batch import (
+    EXPERIMENTAL_CROSS_FRAME_BATCH,
+    cross_frame_batch_eligibility,
+    run_cross_frame_batch,
+)
 from faceswapper.face_batch import FaceCandidate, batch_eligibility
 from faceswapper.recognize import should_skip_recognize
 
@@ -438,18 +443,27 @@ class VideoManager():
             # target_face_embeddings 时，只有匹配那些身份的脸会被换掉，其他人
             # 一概不动。
             targets = self.target_face_embeddings
-            for face_kps, face_emb in ret:
-                if targets and not any(
-                    self.findCosineDistance(face_emb, target)
-                    >= self.target_face_threshold
-                    for target in targets
-                ):
-                    continue
-                with nvtx_range("swap_core"):
-                    img = self.swap_core(
-                        img, face_kps, self.force_source_embedding,
-                        parameters,
-                    )
+            if EXPERIMENTAL_FACE_BATCH and not targets:
+                # 阶段 4 的 7.1 接入点：闸门关闭时逐字走下面的原逐脸循环。
+                # 打开后 swap_core_batched 自己按 batch_eligibility 判定并
+                # 在不适用时回退逐脸；--target-face 的相似度筛选不走 batch。
+                img, _ = self.swap_core_batched(
+                    img, [face_kps for face_kps, _ in ret],
+                    self.force_source_embedding, parameters,
+                )
+            else:
+                for face_kps, face_emb in ret:
+                    if targets and not any(
+                        self.findCosineDistance(face_emb, target)
+                        >= self.target_face_threshold
+                        for target in targets
+                    ):
+                        continue
+                    with nvtx_range("swap_core"):
+                        img = self.swap_core(
+                            img, face_kps, self.force_source_embedding,
+                            parameters,
+                        )
 
             img = img.permute(1,2,0)
             if applied_angle != 0.0:
@@ -1054,6 +1068,7 @@ class VideoManager():
             [FaceCandidate(s["bbox"], s["pipeline_size"]) for s in slots],
             swapper_type=swapper_type,
             parameters=parameters,
+            target_face_filtering=bool(self.target_face_embeddings),
         )
         if not ok:
             # prepare 阶段没有写回过 img，这里可以干净地退回逐脸路径。
@@ -1072,6 +1087,95 @@ class VideoManager():
                 precomputed_latent=latent, batch_slot=slot,
             )
         return img, "batched"
+
+    def cross_frame_batch_swap(
+        self,
+        frame_items,
+        s_e,
+        parameters,
+        *,
+        candidates,
+        workers: int,
+        every_nth: int,
+        batch_backend_available: bool,
+    ):
+        """实验性 7.2：跨帧 batch 前向 + 逐帧回填，返回 ``(imgs, result)``。
+
+        **当前不启用**：闸门 ``EXPERIMENTAL_CROSS_FRAME_BATCH=False``，且
+        ``_swap_video_inner`` 不调用本方法。闸门关闭时 ``run_cross_frame_batch``
+        返回 ``gated``，这里补一次逐脸 ``fallback``，因此即便将来误接进主路径，
+        输出也与基线一致。
+
+        ``frame_items`` 是按解码顺序排列的 ``[(img_chw, kps), ...]``；
+        ``candidates`` 是对应的 ``FrameCandidate`` 元数据。prepare / finish
+        复用 7.1 的 ``swap_core(batch_slot=...)`` 钩子，所以各帧的 mask、
+        restorer、paste_back 仍走原有实现；帧与帧之间没有 bbox 重叠问题。
+        """
+        n = len(frame_items)
+        # 闸门关闭时这些 buffer 会被分配但不使用；主路径不调用本方法，
+        # 解冻后才会真正走到这里。
+        batch_in = torch.empty(
+            (n, 3, 128, 128), dtype=torch.float32, device='cuda',
+        )
+        batch_out = torch.empty_like(batch_in)
+        latent_scale = float(parameters.get('LikenessSlider', 100)) / 100.0
+        extrap_amount = float(parameters.get('EmbExtrapSlider', 0)) / 100.0
+        latent = self._get_latent_for(
+            s_e, scale=latent_scale, extrap_amount=extrap_amount,
+            latent_mode='emap',
+        )
+        slots = [
+            {
+                "mode": "prepare", "index": i,
+                "input": batch_in, "output": batch_out,
+            }
+            for i in range(n)
+        ]
+        out_imgs = [item[0] for item in frame_items]
+
+        def prepare(index, item):
+            img, kps = item
+            self.swap_core(
+                img, kps, s_e, parameters,
+                precomputed_latent=latent, batch_slot=slots[index],
+            )
+
+        def infer(count):
+            self.models.run_swapper_batched(batch_in, latent, batch_out)
+
+        def finish(index, item):
+            img, kps = item
+            slots[index]["mode"] = "finish"
+            out_imgs[index] = self.swap_core(
+                img, kps, s_e, parameters,
+                precomputed_latent=latent, batch_slot=slots[index],
+            )
+
+        def fallback():
+            for index, (img, kps) in enumerate(frame_items):
+                out_imgs[index] = self.swap_core(img, kps, s_e, parameters)
+
+        eligible = cross_frame_batch_eligibility(
+            candidates,
+            workers=workers,
+            every_nth=every_nth,
+            swapper_type=str(parameters['SwapperTypeTextSel']),
+            parameters=parameters,
+            batch_backend_available=batch_backend_available,
+        )
+        result = run_cross_frame_batch(
+            gate_open=EXPERIMENTAL_CROSS_FRAME_BATCH,
+            eligible=eligible,
+            prepare=prepare,
+            infer=infer,
+            finish=finish,
+            fallback=fallback,
+            frame_items=frame_items,
+        )
+        if result.status == "gated":
+            # 编排层在闸门关闭时不碰任何帧；由这里补逐脸路径，保证输出等价。
+            fallback()
+        return out_imgs, result
 
     # ------------------------------------------------------------------
     # Polyphase passes
