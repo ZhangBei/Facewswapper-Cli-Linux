@@ -799,7 +799,7 @@ PTS、VFR 时序、音画对齐与逐帧像素都不变。
 完整的分阶段数据、nsys 轨迹与验收顺序见
 [docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md)。
 
-#### 为什么 GPU / 显存占用很低
+#### 流水线结构与同步开销（含实测修正）
 
 > **2026-11-06 真机实测修正**：下面这段是改造前的结构分析。`nsys` 后来
 > 显示主机主要是在**等 GPU**（`cudaStreamSynchronize` 占 CUDA API 时间
