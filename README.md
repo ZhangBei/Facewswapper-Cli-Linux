@@ -23,7 +23,8 @@ NVIDIA GPU** 的云端/服务器环境。没有图形界面，不需要桌面环
 2. [安装步骤](#2-安装步骤)
 3. [使用方法](#3-使用方法)
 4. [常见问题](#4-常见问题)
-5. [免责声明](#5-免责声明)
+5. [侧脸问题：原因与解决方法](#5-侧脸问题原因与解决方法)
+6. [免责声明](#6-免责声明)
 
 ---
 
@@ -300,6 +301,10 @@ python -m faceswapper.cli --models ./models download-models \
 | `inswapper` | `inswapper_128.fp16.onnx` | 是 | `models-3.0.0` |
 | `scrfd` | `scrfd_2.5g_bnkps.onnx` | 否 | `models-3.0.0` |
 | `hyperswap` | `hyperswap_1a_256.onnx` | 否 | `models-3.3.0` |
+| `hyperswap1b` | `hyperswap_1b_256.onnx` | 否 | `models-3.3.0` |
+| `hyperswap1c` | `hyperswap_1c_256.onnx` | 否 | `models-3.3.0` |
+| `arcface100` | `glintr100.onnx` | 否 | 无 GitHub release；HuggingFace / 镜像 / URL（社区转出，sha256） |
+| `landmark68` | `2dfan4.onnx` | 否 | `models-3.0.0` |
 | `gfpgan` | `GFPGANv1.4.onnx` | 否 | `models-3.0.0` |
 | `gpen256` | `GPEN-BFR-256.onnx` | 否 | `models-3.0.0` |
 | `gpen512` | `GPEN-BFR-512.onnx` | 否 | `models-3.0.0` |
@@ -342,10 +347,14 @@ python -m faceswapper.cli --models ./models download-models --model gfpgan
 | 始终 | 3 个基础模型 |
 | `--detect-type SCRDF` | `scrfd_2.5g_bnkps.onnx` |
 | `--swapper-model hyperswap-256` | `hyperswap_1a_256.onnx` |
+| `--swapper-model hyperswap-1b-256` | `hyperswap_1b_256.onnx` |
+| `--swapper-model hyperswap-1c-256` | `hyperswap_1c_256.onnx` |
 | `--restorer [模型]` | 对应的修复模型 |
 | `--occluder` | `occluder.onnx` |
 | `--xseg` | `dfl_xseg.onnx` |
 | `--face-parser` | `faceparser_resnet34.onnx` |
+| `--recognizer glintr100` | `glintr100.onnx` |
+| `--align 68-point` | `2dfan4.onnx` |
 
 也就是说，不打开开关就只下载基础模型，不会为了用不到的功能拉几百 MB。
 已存在且校验通过的文件不会重复下载。
@@ -591,10 +600,13 @@ HyperSwap 只在 `--swapper-model hyperswap-256` 下生效，默认值
 | `inswapper-256` | `inswapper_128.fp16.onnx` | 256×256，NxN polyphase 拼成 |
 | `inswapper-512` | `inswapper_128.fp16.onnx` | 512×512，NxN polyphase 拼成 |
 | `hyperswap-256` | `hyperswap_1a_256.onnx` | 原生 256×256 单次前向 |
+| `hyperswap-1b-256` | `hyperswap_1b_256.onnx` | 同上，1b 轮训练权重 |
+| `hyperswap-1c-256` | `hyperswap_1c_256.onnx` | 同上，1c 轮训练权重 |
 
 注意 `inswapper-256` / `inswapper-512` 里的数字是**输出分辨率**，不是模型
 本身——三者跑的都是同一个 128 模型，靠 polyphase 拼出更大的输出。想要
-原生单次前向的大模型，用 `hyperswap-256`。
+原生单次前向的大模型，用 `hyperswap-256`。三个 hyperswap 变体架构、输入
+规格完全一致，只有训练轮次不同，身份相似度与伪影表现略有差别。
 
 #### 查看目标图里检测到了哪些脸
 
@@ -1152,15 +1164,20 @@ python -m faceswapper.cli \
 |---|---|---|
 | `--params FILE` | 加载 GUI 时代保存的 `saved_parameters.json` | 无 |
 | `--detect-type` | `Retinaface` 或 `SCRDF` | `Retinaface` |
-| `--detect-input-size` | `320/416/480/640` | `640` |
+| `--detect-input-size` | `320/416/480/640/800/960`；侧脸/小脸召回差时加大（960² ≈ 2.25× 640² 检测耗时） | `640` |
 | `--detect-score` | 检测阈值 `1-100` | `50` |
 | `--merge` | 多源脸合并方式 | `Mean` |
-| `--swapper-model` | `inswapper-128`/`inswapper-256`/`inswapper-512`/`hyperswap-256` | `inswapper-128` |
+| `--swapper-model` | `inswapper-128`/`inswapper-256`/`inswapper-512`/`hyperswap-256`/`hyperswap-1b-256`/`hyperswap-1c-256` | `inswapper-128` |
 | `--color-match` | 启用 LAB 色彩匹配 | 关闭 |
 | `--backend` | `cuda`（纯 CUDA EP，不尝试 TensorRT）或 `trt`（需 TensorRT 10 运行时） | `cuda` |
 | `--arena-strategy` | `same`（按需分配）或 `pow2`（减少重复 `cudaMalloc`，只是让 VRAM 数字变大，不是提速手段） | `same` |
 | `--reuse-detect-buffers` | 复用 detector 的 9 个 `io_binding` 输出缓冲，省掉每帧 9 次显存分配；`--backend trt` 下自动关闭 | 关闭 |
 | `--zero-copy-frames` | 帧已是 `uint8` C contiguous 时跳过 `astype` 的整帧复制（H2D 与 D2H 两侧），不改变像素 | 关闭 |
+| `--recognize-mirror` | 识别时把裁剪图水平镜像再各跑一次 ArcFace、取平均，压低侧脸 embedding 方差；识别推理 x2 | 关闭 |
+| `--recognize-dim2` | 识别用 2×2 网格平均（4 个裁剪各跑一次 ArcFace 取平均）；识别推理 x4 | 关闭 |
+| `--detect-retry` | 0 检出帧自动重试一次：检测输入升到 960、分数阈值 +20；只对漏检帧追加推理，`OrientAutoSwitch` 开启时自动让位 | 关闭 |
+| `--recognizer` | B3：识别权重。`w600k_r50`（默认）或 `glintr100`（ResNet100 ArcFace，侧脸/难样本相似度更稳）；识别推理 x4，需下载 `glintr100.onnx` | `w600k_r50` |
+| `--align` | B4：识别对齐。`5-point`（默认，检测 5 点直接算相似变换）或 `68-point`（2dfan4 检 68 点后取两眼/鼻/嘴角再变换，侧脸裁剪更准）；识别前多一次推理，需下载 `2dfan4.onnx` | `5-point` |
 
 > **`--detect-input-size` 不要随便调小。** 它只影响检测器输入分辨率，
 > 不影响换脸质量——调小是纯速度交易：`480` ≈ 1.8× 快，`416` ≈ 2.4×，
@@ -1202,6 +1219,7 @@ python -m faceswapper.cli --models ./models swap \
 | `--source` | 源脸图片，可重复或指向文件夹 | 必填 |
 | `--target-face` | 视频中要替换的人物参考图，可重复。省略则替换所有脸 | 无 |
 | `--target-threshold` | 人物匹配相似度阈值 `0-100` | `55` |
+| `--pose-compensation` | 姿态自适应匹配阈值：全侧脸时判定线比 `--target-threshold` 低多少分（按每张检测脸的关键点正脸度线性插值）；`0` = 关闭 | `0` |
 | `--target` | 输入视频文件 | 必填 |
 | `--output` | 输出视频文件 | 必填 |
 | `--crf` | H.264 质量，越低越好 | `18` |
@@ -1467,7 +1485,135 @@ python tools/install.py cu126
 
 ---
 
-## 5. 免责声明
+## 5. 侧脸问题：原因与解决方法
+
+> **状态（2026-11-07）：本章方案已全部实施**，每个开关默认关闭，不传即与
+> 原行为逐像素一致（PSNR=`inf`），可单独或组合开启做 A/B。真机量化数据
+> 待跑（方法见 5.5）。
+
+### 5.1 侧脸为什么差
+
+侧脸（大偏航角）质量差来自**两个独立环节**，对应的开关也不同：
+
+| 环节 | 问题 | 物理原因 | 对应开关 |
+|---|---|---|---|
+| **检测** | 该换的脸没被换掉 | RetinaFace 对大偏航角召回下降；小脸在 640 输入的特征图上只剩几个像素 | `--detect-input-size`、`--detect-retry` |
+| **识别** | 该匹配的人没匹配上（`--target-face` 路径），或换上去的身份带姿态偏差 | ArcFace 训练集以正脸为主；`recognize()` 的 5 点相似变换对齐在侧脸上裁剪形变严重，embedding 方差大 | `--recognize-mirror`、`--recognize-dim2`、`--recognizer`、`--align`、`--pose-compensation` |
+
+**共同约束**：所有方案都不降低 `--detect-score` 阈值——降阈值以误检为代价
+（误检在换脸路径上意味着把背景当脸换掉），不可接受。下面每个开关都只在
+"本来会漏"的帧/脸上追加工作，正脸路径不受影响。
+
+### 5.2 检测环节：把侧脸找回来
+
+#### `--detect-input-size 800/960`（A3，确定性收益）
+
+侧脸+小脸在 640 输入的特征图上像素太少，是召回下降的物理来源。加大输入
+分辨率后阈值不变，难样本更容易**过**阈值，误检基本持平。
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target input.mp4 --output output.mp4 \
+    --detect-input-size 960
+```
+
+代价：960² ≈ 2.25× 640² 的检测耗时，只影响检测不影响换脸管线。
+
+#### `--detect-retry`（B2，只对漏检帧追加推理）
+
+0 检出帧自动重试一次：检测输入升到 960、分数阈值 +20 再检一次。只在
+本来不会换脸的帧上追加推理；`OrientAutoSwitch`（自动朝向）开启时自动
+让位——横竖颠倒类漏检已由它的 4 向重探覆盖。
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target input.mp4 --output output.mp4 \
+    --detect-retry
+```
+
+### 5.3 识别环节：把侧脸认出来
+
+识别精度有四条独立改进，全部正交，可组合：
+
+#### `--recognize-mirror`（A2，识别 ×2）
+
+ArcFace 对水平镜像各自有偏差但不相关：原图与镜像各跑一次识别、取平均，
+embedding 方差更小，对左右不对称的侧脸收益最明显。
+
+#### `--recognize-dim2`（A4，识别 ×4）
+
+识别用 2×2 网格平均：4 个 112×112 裁剪各跑一次 ArcFace 取平均。侧脸的
+5 点对齐有系统偏差，单一裁剪容易把特征区切偏，多裁剪平均是现成的对冲。
+与 `--recognize-mirror` 正交（都开是 8 次推理）。
+
+#### `--recognizer glintr100`（B3，识别 ×4）
+
+换识别权重：ResNet100 ArcFace（glintr100）替代默认的 ResNet50
+（w600k_r50），接口完全一致（5 点、112×112、512 维），侧脸/难样本相似度
+更稳。模型来自社区 ONNX 转出（sha256 校验），选中后自动按需下载，也可
+先手动 `download-models --model arcface100`。
+
+#### `--align 68-point`（B4，识别前多一次 landmark 推理）
+
+对齐方式从"检测 5 点直接算相似变换"升级为：2dfan4 检 68 点 landmark，
+取两眼均值/鼻尖/两嘴角（FaceFusion `convert_to_face_landmark_5` 的索引）
+再进同一 5 点模板——对极端侧脸，68 点算出的裁剪比检测器给的 5 点准。
+模型为 FaceFusion 官方 release（crc32 校验），选中后自动按需下载，也可
+先手动 `download-models --model landmark68`。
+
+#### `--pose-compensation`（B1a+B1b，匹配阈值补偿）
+
+上面四条让侧脸的 embedding 更稳，但侧脸与正脸的相似度仍有系统性偏低。
+`--pose-compensation N` 按每张检测脸关键点的**正脸度**线性下调
+`--target-threshold` 判定线：正脸帧阈值不变（不增加误换风险），越侧越松，
+全侧脸最多低 N 分；参考图自身的姿态也参与配对补偿（B1b）。无跨帧状态，
+多 worker 乱序安全。
+
+```bash
+# 组合示例：侧脸视频，匹配 + 识别全开
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target-face person.jpg \
+    --target input.mp4 --output output.mp4 \
+    --recognize-mirror --recognize-dim2 \
+    --recognizer glintr100 --align 68-point \
+    --pose-compensation 15
+```
+
+### 5.4 推荐用法
+
+| 场景 | 建议开关 |
+|---|---|
+| 侧脸漏检（该换的帧没换） | `--detect-input-size 960 --detect-retry` |
+| 侧脸匹配不上 / 换错人（`--target-face` 路径） | `--recognize-mirror --pose-compensation 15` 起步，不够再加 `--recognize-dim2`、`--recognizer glintr100`、`--align 68-point` |
+| 源图本身是侧脸 | `--merge Qual`（多源时）+ 识别四开关 |
+| 先验证收益方向（零成本） | `--detect-input-size 960 --recognize-mirror --pose-compensation 10` |
+
+推理开销只落在识别/检测实际运行的路径上：视频未指定 `--target-face` 时
+逐帧识别整体被跳过，此时 `--recognize-*` / `--align` 没有额外成本。
+
+### 5.5 验收方法
+
+- **基线与 A/B**：`tools/bench_gpu.py --run --psnr` 跑通基线后，用
+  `--extra-flag` 透传新开关，对同一段侧脸素材量化。
+- **识别质量**：带 `--target-face` 的视频上统计"target 脚本命中帧率"
+  （命中数/总帧数，日志已有相似度判定点）；纯图片用 `inspect` 的检出数
+  与换脸结果的目测比对。
+- **回归底线**：所有开关默认关闭，不传即与现行为逐像素一致
+  （PSNR=`inf`），与 3.3 节各实验开关同一验收纪律。
+
+### 5.6 曾考虑但放弃的方案
+
+| 方案 | 放弃原因 |
+|---|---|
+| 降低 `--detect-score` | 以误检为代价（把背景当脸换掉），不可接受 |
+| 跨帧 embedding 回拉（用最正帧的 embedding 回拉侧脸帧） | 帧间状态让输出依赖调度顺序（2N 乱序窗口），破坏 workers=1 逐像素回归底线，收益仅省每帧一次 512 维点积 |
+| 检测重试的 4 朝向试探（B2 级 2） | 横竖颠倒类漏检已由 `OrientAutoSwitch` 的 4 向重探覆盖；旋转重试需要 kps 逆映射，重复这套几何得不偿失 |
+| 3D 对齐（B4 备选） | 没有上游规范模板（insightface 官方识别对齐只用 5 点），68 点路径已是已验证的生产做法 |
+| 106 点对齐（2d106det，B4 原方案） | 调研后确认不存在规范的 106 点 ArcFace 对齐模板，改为 FaceFusion 的 2dfan4 68 点路径 |
+
+---
+
+## 6. 免责声明
 
 本项目仅用于合法、负责任和合乎伦理的用途。使用他人肖像前必须获得明确同意。
 

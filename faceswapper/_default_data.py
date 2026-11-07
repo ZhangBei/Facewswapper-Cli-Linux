@@ -69,8 +69,35 @@ DEFAULT_DATA = {
     'DetectTypeTextSelMode': 'Retinaface',
     'DetectTypeTextSelModes': ['Retinaface', 'SCRDF'],
     'DetectInputSizeTextSelMode': '640',
-    'DetectInputSizeTextSelModes': ['320', '416', '480', '640'],
+    'DetectInputSizeTextSelModes': ['320', '416', '480', '640', '800', '960'],
     'DetectScoreSliderAmount': 50,
+    # 识别时把裁剪图水平镜像再各跑一次 ArcFace、取平均，压低侧脸
+    # embedding 的方差。默认关闭。
+    'RecognizeMirrorSwitchState': False,
+    # 识别用 dim=2 的网格平均（4 个 112x112 裁剪各跑一次 ArcFace 取
+    # 平均），对侧脸单一裁剪容易切偏特征区的情况更稳。识别推理 x4，
+    # 默认关闭。
+    'RecognizeDimSwitchState': False,
+    # 姿态自适应匹配阈值：--target-face 相似度筛选时，按检测关键点的
+    # 正脸度下调判定线（全侧脸最多下调这个百分数）。0 = 关闭，判定与
+    # 旧代码逐字等价。合理档 10-30。
+    'PoseCompensationSliderAmount': 0,
+    # 漏检重试：0 检出帧升一档检测输入尺寸（到 960）、抬高分数阈值
+    # +20 分再检一次。只在本来不会换脸的帧上追加推理；auto-orient 开启
+    # 时自动让位。默认关闭。
+    'DetectRetrySwitchState': False,
+    # B3：识别器权重。'w600k_r50'（默认，ResNet50）或 'glintr100'
+    # （ResNet100，侧脸/难样本相似度更稳，识别推理约 x4，需下载
+    # glintr100.onnx）。默认保持旧行为。
+    'RecognizerTypeTextSelMode': 'w600k_r50',
+    'RecognizerTypeTextSelModes': ['w600k_r50', 'glintr100'],
+    # B4：识别对齐方式。'5-point'（默认，直接用检测 5 点，与 GUI 时代
+    # 一致）或 '68-point'（2dfan4 landmark 对齐：检 68 点后取两眼中心/
+    # 鼻尖/两嘴角，对极端侧脸的裁剪更准，需下载 2dfan4.onnx；每次识别
+    # 前多一次 landmark 推理）。默认保持旧行为。
+    'AlignTypeTextSelMode': '5-point',
+    'AlignTypeTextSelModes': ['5-point', '68-point'],
     'SwapperTypeTextSelMode': 'inswapper-128',
-    'SwapperTypeTextSelModes': ['inswapper-128', 'inswapper-256', 'inswapper-512', 'hyperswap-256'],
+    'SwapperTypeTextSelModes': ['inswapper-128', 'inswapper-256', 'inswapper-512',
+                                'hyperswap-256', 'hyperswap-1b-256', 'hyperswap-1c-256'],
 }

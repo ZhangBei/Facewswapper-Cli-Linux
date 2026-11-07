@@ -14,7 +14,9 @@ from faceswapper.cross_frame_batch import (
     run_cross_frame_batch,
 )
 from faceswapper.face_batch import FaceCandidate, batch_eligibility
+from faceswapper.detect_retry import retry_plan
 from faceswapper.frame_upload import normalize_plan
+from faceswapper.frontal_match import effective_threshold_pair
 from faceswapper.recognize import should_skip_recognize
 
 
@@ -142,10 +144,26 @@ class VideoManager():
         # 检测脸才会被换。None 表示"换掉每一张检测到的脸"。
         self.target_face_embeddings: list[np.ndarray] | None = None
         self.target_face_threshold: float = 55.0
+        # 姿态自适应匹配阈值（PoseCompensationSlider）：全侧脸时判定线
+        # 下调的百分数，按每张检测脸的关键点正脸度线性插值。0 = 关闭，
+        # 判定与旧代码逐字等价。frontal_match.effective_threshold 计算。
+        self.target_face_pose_compensation: float = 0.0
+        # 与 target_face_embeddings 一一对应的参考图 kps（B1b）。补偿 >0
+        # 时阈值按（检测脸, 参考图）这对姿态配对计算；None / 长度不符
+        # 时只看检测脸。参考图姿态未知不报错——降级为 B1a 行为。
+        self.target_face_ref_kps: list | None = None
         # True = 显式保留每帧逐脸 run_recognize 的旧路径（--force-recognize）。
         # 默认 False：headless video 且未指定 --target-face 时，那些 embedding
         # 没有任何读取方，跳过可省掉每帧 N 次 ArcFace 推理。
         self.force_recognize: bool = False
+        # 识别精度：True = 每次识别把裁剪图水平镜像再各跑一次 ArcFace、
+        # 取平均，压低侧脸 embedding 的方差。默认 False（单次，行为不变）。
+        # 由 headless._SwapperBase 按 RecognizeMirrorSwitch 注入。
+        self.recognize_mirror: bool = False
+        # 识别精度：True = 逐脸识别用 dim=2 的网格平均（4 个裁剪各跑一次
+        # ArcFace 取平均）。只影响"识别裁剪"那次调用；source 特征提取也
+        # 同样受益。默认 False（dim=1，行为不变）。
+        self.recognize_dim2: bool = False
         # 阶段 7：帧已是 uint8 C contiguous 时跳过 ``astype('uint8')`` 的整帧
         # 复制，直接把原数组交给 torch.from_numpy。默认 False，关掉时
         # _swap_video_inner 的表达式逐字不变。
@@ -422,6 +440,25 @@ class VideoManager():
         # 找出画面里所有的脸，返回 5 点 kpss 列表
         kpss = self.models.run_detect(img, detect_mode, max_num=10, score=detect_score, input_size=detect_input_size)
 
+        # 漏检重试（DetectRetrySwitch）：0 检出帧升一档输入尺寸、抬高分
+        # 数阈值再检一次（detect_retry.retry_plan 的两道防误检闸）。只在
+        # 本来不会换脸的帧上追加推理；auto-orient 开启时不重试（它自己的
+        # 4 向重探已覆盖横竖颠倒类漏检，双开会在同一帧跑两套试探）。
+        if len(kpss) == 0:
+            retry = retry_plan(
+                detected=len(kpss),
+                input_size=detect_input_size,
+                detect_score=detect_score,
+                auto_orient=auto_orient,
+                enabled=bool(parameters.get('DetectRetrySwitch')),
+            )
+            if retry is not None:
+                retry_size, retry_score = retry
+                kpss = self.models.run_detect(
+                    img, detect_mode, max_num=10,
+                    score=retry_score, input_size=retry_size,
+                )
+
         # 自动朝向反馈：统计检测成功次数用于重新试探，并按第一张检测到的脸的
         # 眼轴更新微调角度的 EMA。
         if auto_orient:
@@ -458,7 +495,9 @@ class VideoManager():
         for face_kps in kpss:
             face_emb = None
             if not skip_recognize:
-                face_emb, _ = self.models.run_recognize(img, face_kps)
+                face_emb, _ = self.models.run_recognize(
+                    img, face_kps, dim=2 if self.recognize_dim2 else 1,
+                )
             ret.append([face_kps, face_emb])
         
         if ret and self.force_source_embedding is not None:
@@ -475,11 +514,24 @@ class VideoManager():
                     self.force_source_embedding, parameters,
                 )
             else:
+                # 姿态补偿（PoseCompensationSlider）：按（检测脸, 参考图）
+                # 这对姿态算各自的判定线——侧面参考图匹配正脸帧时相似度
+                # 同样系统性偏低。ref_kps 缺失时退化为只看检测脸（B1a）；
+                # 补偿 0 时全部恒等于 target_face_threshold，与旧判定
+                # 逐字等价。any(>=) 与 best-match 语义一致：只要有参考图
+                # 过线就换，取哪个参考图不影响"换不换"。
+                ref_kps_list = self.target_face_ref_kps
+                if ref_kps_list is None or len(ref_kps_list) != len(targets):
+                    ref_kps_list = [None] * len(targets)
                 for face_kps, face_emb in ret:
                     if targets and not any(
                         self.findCosineDistance(face_emb, target)
-                        >= self.target_face_threshold
-                        for target in targets
+                        >= effective_threshold_pair(
+                            face_kps, kps_ref,
+                            self.target_face_threshold,
+                            self.target_face_pose_compensation,
+                        )
+                        for target, kps_ref in zip(targets, ref_kps_list)
                     ):
                         continue
                     with nvtx_range("swap_core"):
@@ -565,12 +617,13 @@ class VideoManager():
         # "inswapper-512" 选中 inswapper_512 模型：单次前向吃下完整 512x512
         # 脸部裁剪，不做 polyphase 分解。
         # "inswapper-256" 用专门的单次 pass inswapper_256_phase1；
-        # "hyperswap-256" 跑原生 256 生成器。其他任何值——包括来自 marker 的
+        # "hyperswap-256"/"hyperswap-1b-256"/"hyperswap-1c-256" 跑原生 256
+        # 生成器（三个变体只有权重不同）。其他任何值——包括来自 marker 的
         # parameter snapshot 里的陈旧值——都退回到 128 基线，而不是抛异常。
         swapper_type = str(parameters['SwapperTypeTextSel'])
         use_native_512 = (swapper_type == 'inswapper-512')
         use_native_256 = (swapper_type == 'inswapper-256')
-        use_hyperswap = (swapper_type == 'hyperswap-256')
+        use_hyperswap = swapper_type.startswith('hyperswap')
         if use_native_512:
             swap_size = 512
             dim = 1
@@ -707,7 +760,7 @@ class VideoManager():
         # _polyphase_pass_v1（生产路径）、_native_512_pass（单次的
         # inswapper_512，经 "inswapper-512" 选中）、_native_256_pass（单次的
         # inswapper_256_phase1，经 "inswapper-256" 选中）或 _hyperswap_pass
-        # （单次的 hyperswap_1a_256，经 "hyperswap-256" 选中）提供。
+        # （单次的 hyperswap_1a/1b/1c_256，经各 "hyperswap-*-256" 选中）提供。
         # "inswapper-128"（默认值）和任何不认识的旧值都落到
         # _polyphase_pass_v1。
         if use_native_512:
@@ -1277,6 +1330,15 @@ class VideoManager():
         swap_face_output[:] = batch_out[0].permute(1, 2, 0)
         return swap_face_output
 
+    # SwapperTypeTextSel 值 → Models 上对应的 run 方法。三个 hyperswap
+    # 变体共享 _hyperswap_pass，pass 依此挑选权重；未知值（陈旧 snapshot
+    # 等）回到 1a。
+    _HYPERSWAP_RUNS = {
+        'hyperswap-256': 'run_hyperswap',
+        'hyperswap-1b-256': 'run_hyperswap_1b',
+        'hyperswap-1c-256': 'run_hyperswap_1c',
+    }
+
     def _hyperswap_pass(self, swap_face_input, latent, dim, swap_size, parameters):
         """用 HyperSwap 生成器做单块换脸（dim 始终为 1）。
 
@@ -1286,7 +1348,10 @@ class VideoManager():
         调用处；这样也保证第二次强度迭代仍然正确，因为它会把 0-1 的输出回喂
         进来。
         """
-        del dim, parameters  # 与 polyphase pass 保持签名一致；这里用不到。
+        del dim  # 与 polyphase pass 保持签名一致；这里用不到。
+        run_hyperswap = getattr(self.models, self._HYPERSWAP_RUNS.get(
+            str(parameters['SwapperTypeTextSel']), 'run_hyperswap',
+        ))
 
         swap_face_output = self._get_scratch(
             f'poly_out_{swap_size}', (swap_size, swap_size, 3),
@@ -1306,7 +1371,7 @@ class VideoManager():
         batch_in.copy_(normalized)
         emb_in.copy_(latent)
 
-        self.models.run_hyperswap(batch_in, emb_in, batch_out)
+        run_hyperswap(batch_in, emb_in, batch_out)
 
         # (1, 3, H, W) in [-1, 1] -> (H, W, 3) in 0-1.
         swap_face_output[:] = (

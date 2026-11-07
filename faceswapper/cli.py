@@ -97,7 +97,8 @@ VIDEO_EXTENSIONS = {
 # 两边共用同一份列表，以保持步调一致。
 DOWNLOAD_MODEL_CHOICES = [
     "base", "retinaface", "arcface", "inswapper", "gfpgan",
-    "scrfd", "hyperswap", "gpen256", "gpen512", "codeformer",
+    "scrfd", "hyperswap", "hyperswap1b", "hyperswap1c",
+    "gpen256", "gpen512", "codeformer",
     "xseg", "faceparser", "dflxseg", "resnet50", "all",
 ]
 
@@ -186,6 +187,18 @@ def _parameter_overrides(args: argparse.Namespace) -> dict[str, Any]:
         overrides["DFLXSegSwitch"] = True
     if getattr(args, "face_parser", False):
         overrides["FaceParserSwitch"] = True
+    if getattr(args, "recognize_mirror", False):
+        overrides["RecognizeMirrorSwitch"] = True
+    if getattr(args, "recognize_dim2", False):
+        overrides["RecognizeDimSwitch"] = True
+    if getattr(args, "pose_compensation", None):
+        overrides["PoseCompensationSlider"] = args.pose_compensation
+    if getattr(args, "detect_retry", False):
+        overrides["DetectRetrySwitch"] = True
+    if getattr(args, "recognizer", None):
+        overrides["RecognizerTypeTextSel"] = args.recognizer
+    if getattr(args, "align", None):
+        overrides["AlignTypeTextSel"] = args.align
     return overrides
 
 
@@ -212,6 +225,10 @@ def _build_options(args: argparse.Namespace, headless=None) -> "SwapOptions":
         arena_strategy=args.arena_strategy,
         reuse_detect_buffers=args.reuse_detect_buffers,
         zero_copy_frames=args.zero_copy_frames,
+        recognize_mirror=args.recognize_mirror,
+        recognize_dim2=args.recognize_dim2,
+        recognizer=args.recognizer or "w600k_r50",
+        align_type=args.align or "5-point",
     )
     return options
 
@@ -355,6 +372,7 @@ def _cmd_video(args: argparse.Namespace) -> int:
         face_policy="all",
         target_person_paths=target_faces,
         target_threshold=args.target_threshold,
+        pose_compensation=args.pose_compensation,
         detect_type=args.detect_type or "Retinaface",
         detect_input_size=args.detect_input_size or 640,
         detect_score=(
@@ -379,6 +397,10 @@ def _cmd_video(args: argparse.Namespace) -> int:
         arena_strategy=args.arena_strategy,
         reuse_detect_buffers=args.reuse_detect_buffers,
         zero_copy_frames=args.zero_copy_frames,
+        recognize_mirror=args.recognize_mirror,
+        recognize_dim2=args.recognize_dim2,
+        recognizer=args.recognizer or "w600k_r50",
+        align_type=args.align or "5-point",
     )
 
     def progress(index: int, total: int) -> None:
@@ -493,7 +515,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="从中加载默认值的 saved_parameters.json")
         p.add_argument("--detect-type", choices=["Retinaface", "SCRDF"],
                        default=None, help="人脸检测模型")
-        p.add_argument("--detect-input-size", type=int, choices=[320, 416, 480, 640],
+        p.add_argument("--detect-input-size", type=int,
+                       choices=[320, 416, 480, 640, 800, 960],
                        default=None, help="detector 输入分辨率")
         p.add_argument("--detect-score", type=int, default=None,
                        help="检测分数阈值，1-100")
@@ -501,7 +524,8 @@ def build_parser() -> argparse.ArgumentParser:
                        choices=["Mean", "Median", "Sph", "Geo", "Qual"],
                        default=None, help="如何融合多个 source 脸")
         p.add_argument("--swapper-model",
-                       choices=["inswapper-128", "inswapper-256", "inswapper-512", "hyperswap-256"],
+                       choices=["inswapper-128", "inswapper-256", "inswapper-512",
+                                "hyperswap-256", "hyperswap-1b-256", "hyperswap-1c-256"],
                        default=None, help="swapper 模型与输出分辨率")
         p.add_argument("--color-match", action="store_true",
                        help="启用 LAB 色彩匹配")
@@ -531,6 +555,29 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--zero-copy-frames", action="store_true",
                        help="帧已是 uint8 C contiguous 时跳过 astype 的整帧"
                             "复制（H2D 与 D2H 两侧），不改变像素；默认关闭")
+        p.add_argument("--recognize-mirror", action="store_true",
+                       help="识别时把裁剪图水平镜像再各跑一次 ArcFace、取"
+                            "平均，压低侧脸 embedding 的方差；识别推理 x2，"
+                            "默认关闭")
+        p.add_argument("--recognize-dim2", action="store_true",
+                       help="识别用 2x2 网格平均（4 个裁剪各跑一次 ArcFace "
+                            "取平均），对侧脸单一裁剪切偏特征区更稳；识别"
+                            "推理 x4，默认关闭")
+        p.add_argument("--detect-retry", action="store_true",
+                       help="0 检出帧自动重试一次：检测输入升到 960、分数"
+                            "阈值 +20。只对漏检帧追加推理，auto-orient 开启"
+                            "时自动让位；默认关闭")
+        p.add_argument("--recognizer", choices=["w600k_r50", "glintr100"],
+                       default=None,
+                       help="B3：识别权重。w600k_r50（默认）或 glintr100"
+                            "（ResNet100，侧脸/难样本相似度更稳，识别推理 "
+                            "x4，需下载 arcface100）")
+        p.add_argument("--align", choices=["5-point", "68-point"],
+                       default=None,
+                       help="B4：识别对齐。5-point（默认，检测 5 点直接算"
+                            "相似变换）或 68-point（2dfan4 检 68 点后取两"
+                            "眼/鼻/嘴角，侧脸裁剪更准，识别前多一次推理，"
+                            "需下载 2dfan4）")
 
     swap = sub.add_parser("swap", help="换一张或多张图片里的脸")
     add_common(swap)
@@ -561,6 +608,11 @@ def build_parser() -> argparse.ArgumentParser:
     video.add_argument("--target-threshold", type=float, default=55.0,
                        help="匹配 target 人物的相似度阈值（0-100，"
                             "默认 55）")
+    video.add_argument("--pose-compensation", type=float, default=0.0,
+                       choices=[0, 5, 10, 15, 20, 25, 30],
+                       help="姿态自适应匹配阈值：全侧脸时判定线比"
+                            "--target-threshold 低多少分（0 = 关闭，"
+                            "合理档 10-30；默认 0）")
     video.add_argument("--target", required=True,
                        help="输入视频文件")
     video.add_argument("--output", required=True,

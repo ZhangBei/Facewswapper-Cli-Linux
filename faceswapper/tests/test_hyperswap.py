@@ -87,8 +87,8 @@ def test_latent_mode_is_raw() -> None:
         "faceswapper/VideoManager.py",
         r"def swap_core\(.*?(?=\n    def )",
     )
-    if "use_hyperswap = (swapper_type == 'hyperswap-256')" not in body:
-        fail("swap_core does not recognize hyperswap-256")
+    if "use_hyperswap = swapper_type.startswith('hyperswap')" not in body:
+        fail("swap_core does not recognize the hyperswap variants")
     if "latent_mode = 'raw' if use_hyperswap else 'emap'" not in body:
         fail("latent_mode does not switch to raw for HyperSwap")
     if "poly_pass = self._hyperswap_pass" not in body:
@@ -109,8 +109,8 @@ def test_pass_normalizes_both_ways() -> None:
         "faceswapper/VideoManager.py",
         r"def _hyperswap_pass\(.*?(?=\n    def |\n    # @profile)",
     )
-    if "self.models.run_hyperswap" not in body:
-        fail("_hyperswap_pass does not call run_hyperswap")
+    if "run_hyperswap(batch_in, emb_in, batch_out)" not in body:
+        fail("_hyperswap_pass does not call a run_hyperswap* method")
     if "(normalized - 0.5) / 0.5" not in body:
         fail("input is not normalized to [-1, 1]")
     if "mul(0.5).add(0.5)" not in body:
@@ -146,6 +146,82 @@ def test_normalization_roundtrips() -> None:
           f"(naive x255 of 0.1 gives {naive:.1f}, which would clamp to 0)")
 
 
+def test_variants_share_the_pass() -> None:
+    """1b/1c 与 1a 同架构同接口：可选、可下载、specs 映射正确、dispatch
+    仍走同一个 _hyperswap_pass，只是 run 方法按变体切换。"""
+    from faceswapper.parameters import PARAMETER_BY_NAME
+    from faceswapper.model_store import specs_for_parameters
+
+    param = PARAMETER_BY_NAME["SwapperTypeTextSel"]
+    for mode in ("hyperswap-1b-256", "hyperswap-1c-256"):
+        if mode not in param.modes:
+            fail(f"{mode} missing from SwapperTypeTextSel modes: {param.modes}")
+
+    for name, filename in (
+        ("hyperswap1b", "hyperswap_1b_256.onnx"),
+        ("hyperswap1c", "hyperswap_1c_256.onnx"),
+    ):
+        specs = specs_for_names([name])
+        if [s.name for s in specs] != [name]:
+            fail(f"unexpected specs for {name}: {[s.name for s in specs]}")
+        spec = specs[0]
+        if spec.local_name != filename:
+            fail(f"unexpected local name: {spec.local_name}")
+        if not spec.sha256 and not spec.crc32:
+            fail(f"{name} spec has neither sha256 nor crc32")
+        if spec.crc32 and not re.fullmatch(r"[0-9a-f]{8}", spec.crc32):
+            fail(f"malformed crc32: {spec.crc32!r}")
+
+    for mode, spec_name in (
+        ("hyperswap-256", "hyperswap"),
+        ("hyperswap-1b-256", "hyperswap1b"),
+        ("hyperswap-1c-256", "hyperswap1c"),
+    ):
+        chosen = specs_for_parameters({"SwapperTypeTextSel": mode})
+        names = {s.name for s in chosen}
+        if spec_name not in names:
+            fail(f"{mode} selected {sorted(names)}, expected it to include "
+                 f"{spec_name}")
+
+    core = _source(
+        "faceswapper/VideoManager.py",
+        r"def swap_core\(.*?(?=\n    def )",
+    )
+    if "use_hyperswap = swapper_type.startswith('hyperswap')" not in core:
+        fail("swap_core no longer routes every hyperswap variant to 256/raw")
+    passes = _source(
+        "faceswapper/VideoManager.py",
+        r"_HYPERSWAP_RUNS = .*?(?=\n    def )",
+    )
+    for mode, run in (
+        ("hyperswap-256", "run_hyperswap"),
+        ("hyperswap-1b-256", "run_hyperswap_1b"),
+        ("hyperswap-1c-256", "run_hyperswap_1c"),
+    ):
+        if f"'{mode}': '{run}'" not in passes:
+            fail(f"_HYPERSWAP_RUNS lacks the {mode} -> {run} mapping")
+
+    models_src = (REPO_ROOT / "faceswapper" / "Models.py").read_text(
+        encoding="utf-8")
+    for suffix in ("1b", "1c"):
+        for needle in (
+            f"self.hyperswap_{suffix}_model = []",
+            f"def run_hyperswap_{suffix}(",
+            f"def _create_hyperswap_{suffix}_session(",
+            f"def _get_hyperswap_{suffix}_session(",
+            f"'hyperswap_{suffix}_model':",
+        ):
+            if needle not in models_src:
+                fail(f"Models.py missing {needle!r}")
+        delete = _source(
+            "faceswapper/Models.py",
+            r"def delete_models\(.*?(?=\n    def )",
+        )
+        if f"hyperswap_{suffix}_model" not in delete:
+            fail(f"delete_models does not release hyperswap_{suffix}_model")
+    print("  ok  hyperswap 1b/1c selectable, downloadable and sharing the pass")
+
+
 def test_session_is_wired() -> None:
     """The new model must join every registry the other swappers use, or
     Per-Thread mode and VRAM tracking silently skip it."""
@@ -170,7 +246,7 @@ def test_session_is_wired() -> None:
 
     body = _source(
         "faceswapper/Models.py",
-        r"def run_hyperswap\(.*?(?=\n    def )",
+        r"def _run_hyperswap_io\(.*?(?=\n    def )",
     )
     code = re.sub(r'""".*?"""', '', body, flags=re.S)
     bound = re.findall(r"bind_(?:input|output)\(\s*name='([^']+)'", code)
@@ -179,6 +255,23 @@ def test_session_is_wired() -> None:
              "source/target/output tensors)")
     if "(1, 3, 256, 256)" not in code or "(1, 512)" not in code:
         fail("io binding shapes do not match the exported model")
+    # All three variants must route through the shared binder, and the
+    # create/get pairs must exist for each.
+    for needle in (
+        "def run_hyperswap(", "def run_hyperswap_1b(", "def run_hyperswap_1c(",
+        "def _create_hyperswap_session(", "def _create_hyperswap_1b_session(",
+        "def _create_hyperswap_1c_session(", "def _get_hyperswap_1b_session(",
+        "def _get_hyperswap_1c_session(",
+    ):
+        if needle not in models_src:
+            fail(f"Models.py missing {needle!r}")
+    for suffix in ("", "_1b", "_1c"):
+        run = _source(
+            "faceswapper/Models.py",
+            rf"def run_hyperswap{suffix}\(.*?(?=\n    def )",
+        )
+        if "_run_hyperswap_io(" not in run:
+            fail(f"run_hyperswap{suffix} bypasses _run_hyperswap_io")
 
     # delete_models must release it too, or the session leaks past the run.
     delete = _source(
@@ -218,6 +311,7 @@ def main() -> int:
     print("faceswapper HyperSwap tests")
     test_mode_is_selectable()
     test_model_is_downloadable()
+    test_variants_share_the_pass()
     test_latent_mode_is_raw()
     test_pass_normalizes_both_ways()
     test_normalization_roundtrips()

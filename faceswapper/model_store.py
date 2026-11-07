@@ -47,6 +47,10 @@ class ModelSpec:
     # crc32（8 位十六进制）是上游 FaceFusion 发布里给较新模型提供的唯一
     # checksum；有 sha256 的地方仍以它为准，crc32 是在 size 之外额外查的。
     crc32: str = ""
+    # 上游不在 FaceFusion release 里的模型：完整的下载 URL 模板，{name}
+    # 替换为 remote_name。设置后所有 provider 路径都走它（hf-mirror 域名
+    # 替换 huggingface 的），而不是拼 facefusion/<release> 布局。
+    remote_url: str = ""
 
 
 MODEL_SPECS: tuple[ModelSpec, ...] = (
@@ -73,6 +77,36 @@ MODEL_SPECS: tuple[ModelSpec, ...] = (
         ),
         role="ArcFace recognition",
         required=True,
+    ),
+    # B3（候选已落地、默认不启用）：ResNet100 ArcFace（InsightFace glintr100，
+    # 512 维输出与 w600k_r50 同接口）。侧脸/难样本相似度更稳，识别推理约
+    # x4。上游（FaceFusion / insightface 官方仓库）没有发布这个转出文件，
+    # sha256 取自社区 ONNX 转出（HammadNaseer/arcface-glintr100-onnx）。
+    ModelSpec(
+        name="arcface100",
+        local_name="glintr100.onnx",
+        remote_name="arcface_glintr100.onnx",
+        release="models-3.0.0",
+        size=260665334,
+        sha256=(
+            "4ab1d6435d639628a6f3e5008dd4f929edf4c4124b1a7169e1048f9fef534cdf"
+        ),
+        role="ArcFace ResNet100 recognition (alternative to w600k_r50)",
+        remote_url="https://{mirror}/HammadNaseer/arcface-glintr100-onnx/resolve/main/glintr100.onnx",
+    ),
+    # B4（候选已落地、默认不启用）：2dfan4 68 点 landmark。68 → 5 点换算
+    # （两眼各取均值、鼻尖 30、两嘴角 48/54）后再过同一 5 点模板，对极端
+    # 侧脸的裁剪比检测器 5 点更准。官方 FaceFusion release（crc32 校验），
+    # 93.4 MB。
+    ModelSpec(
+        name="landmark68",
+        local_name="2dfan4.onnx",
+        remote_name="2dfan4.onnx",
+        release="models-3.0.0",
+        size=97904803,
+        sha256="",
+        crc32="a948738e",
+        role="68-point face landmark detector (optional alignment)",
     ),
     ModelSpec(
         name="inswapper",
@@ -119,6 +153,28 @@ MODEL_SPECS: tuple[ModelSpec, ...] = (
         sha256="",
         crc32="79e50d4b",
         role="HyperSwap 256 face swapper (ResearchRAIL, non-commercial)",
+    ),
+    # 1b / 1c 与 1a 同架构同接口（同 shape、同 latent、同归一化），只是
+    # 上游的另外两轮训练权重；CRC32 同样来自上游发布的 .hash 文件。
+    ModelSpec(
+        name="hyperswap1b",
+        local_name="hyperswap_1b_256.onnx",
+        remote_name="hyperswap_1b_256.onnx",
+        release="models-3.3.0",
+        size=402742682,
+        sha256="",
+        crc32="36312901",
+        role="HyperSwap 1b 256 face swapper (ResearchRAIL, non-commercial)",
+    ),
+    ModelSpec(
+        name="hyperswap1c",
+        local_name="hyperswap_1c_256.onnx",
+        remote_name="hyperswap_1c_256.onnx",
+        release="models-3.3.0",
+        size=402742682,
+        sha256="",
+        crc32="83c5ce36",
+        role="HyperSwap 1c 256 face swapper (ResearchRAIL, non-commercial)",
     ),
     # ---- 可选功能模型。普通换脸一个都不需要；每个都对应一个 CLI 已经暴露
     # 出来的 parameter switch（--restorer / --occluder / --xseg / --face-parser）。
@@ -212,6 +268,16 @@ def build_download_url(provider: str, spec: ModelSpec) -> str:
     Hugging Face endpoint 的基址，所以任何 mirror（包括 $HF_ENDPOINT 指向的
     那个）不用在这里登记也能用。
     """
+    # 上游不在 FaceFusion release 里的模型：专用 URL 模板，{mirror} 在
+    # 镜像下载时替换为 hf-mirror.com；这类模型没有 GitHub release。
+    if spec.remote_url:
+        if provider == "github":
+            raise HeadlessError(
+                f"model {spec.name!r} is not published on the GitHub release; "
+                "use huggingface / hf-mirror / a URL provider"
+            )
+        mirror = "hf-mirror.com" if provider == "hf-mirror" else "huggingface.co"
+        return spec.remote_url.format(name=spec.remote_name, mirror=mirror)
     if provider == "github":
         return (
             "https://github.com/facefusion/facefusion-assets/releases/download/"
@@ -681,6 +747,16 @@ def specs_for_parameters(
     swapper = str(parameters.get("SwapperTypeTextSel") or "")
     if swapper == "hyperswap-256":
         add("hyperswap")
+    elif swapper == "hyperswap-1b-256":
+        add("hyperswap1b")
+    elif swapper == "hyperswap-1c-256":
+        add("hyperswap1c")
+
+    # B3/B4：识别器权重与 68 点对齐模型（均默认关闭——选中才拉取）。
+    if str(parameters.get("RecognizerTypeTextSel") or "") == "glintr100":
+        add("arcface100")
+    if str(parameters.get("AlignTypeTextSel") or "") == "68-point":
+        add("landmark68")
 
     # RestorerSwitch 决定用哪一族，RestorerTypeTextSel 决定具体哪个文件。
     if parameters.get("RestorerSwitch"):

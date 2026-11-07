@@ -68,6 +68,19 @@ class SwapOptions:
     # 阶段 6：复用 retinaface 的 9 个 io_binding 输出缓冲，省掉每帧 9 次
     # torch.empty。默认关闭；TRT-EP 后端下会被判定逻辑自动关掉。
     reuse_detect_buffers: bool = False
+    # 识别精度（RecognizeMirrorSwitch）：识别时把裁剪图水平镜像再各跑一次
+    # ArcFace、取平均，压低侧脸 embedding 的方差。识别 ×2，默认关闭。
+    recognize_mirror: bool = False
+    # 识别精度（RecognizeDimSwitch）：识别用 dim=2 的网格平均（4 个裁剪
+    # 各跑一次 ArcFace 取平均）。识别 ×4，默认关闭。
+    recognize_dim2: bool = False
+    # B3（RecognizerTypeTextSel）：识别权重。'w600k_r50'（默认）或
+    # 'glintr100'（ResNet100，侧脸/难样本相似度更稳，推理约 ×4）。必须在
+    # 任何识别调用前设置。
+    recognizer: str = "w600k_r50"
+    # B4（AlignTypeTextSel）：识别对齐。'5-point'（默认）或 '68-point'
+    # （2dfan4 landmark 对齐，每次识别前多一次 landmark 推理）。
+    align_type: str = "5-point"
     # 阶段 7：帧已是 uint8 C contiguous 时跳过 astype 的整帧复制。默认关闭，
     # 关掉时所有帧路径逐字保留原来的 astype 表达式。
     zero_copy_frames: bool = False
@@ -162,6 +175,24 @@ class _SwapperBase:
             # 才能让它们各自占用 GPU（代价是每 worker 多一份显存）。
             self.models.set_model_session_mode("Per-Thread")
         self.vm = VideoManager(self.models)
+        # 识别精度（RecognizeMirrorSwitch）：镜像平均，压低侧脸 embedding
+        # 的方差。默认关闭。必须在任何识别调用前设置——即下一次
+        # _apply_parameters() 读到参数之前。
+        self.models.set_recognize_mirror(bool(
+            getattr(options, "recognize_mirror", False)
+        ))
+        # 识别精度（RecognizeDimSwitch）：dim=2 网格平均。默认关闭。
+        self.vm.recognize_dim2 = bool(
+            getattr(options, "recognize_dim2", False)
+        )
+        # B3/B4：识别权重与对齐方式。默认值 = 旧行为，必须在任何识别调用
+        # 前设置。set_recognizer/set_align_type 对未知值回退默认。
+        self.models.set_recognizer(
+            str(getattr(options, "recognizer", "w600k_r50"))
+        )
+        self.models.set_align_type(
+            str(getattr(options, "align_type", "5-point"))
+        )
         self.vm.force_recognize = bool(
             getattr(options, "force_recognize", False)
         )
@@ -203,8 +234,11 @@ class _SwapperBase:
 
     # -- source embedding -----------------------------------------------------
 
-    def source_embedding(self, path: str) -> np.ndarray:
-        """检测并识别 `path` 里的那一张脸。"""
+    def source_embedding(self, path: str, *, return_kps: bool = False):
+        """检测并识别 `path` 里的那一张脸。
+
+        return_kps=True 时连同那张脸的 5 点关键点一起返回
+        (embedding, kps)——姿态补偿需要参考图自身的姿态。"""
         rgb = _read_image(path)
         img_chw = torch.from_numpy(
             _frame_to_uint8(rgb, self.options.zero_copy_frames)
@@ -218,8 +252,12 @@ class _SwapperBase:
         )
         if len(kpss) == 0:
             raise HeadlessError(f"no face detected in source image: {path}")
-        emb, _cropped = self.models.run_recognize(img_chw, kpss[0])
-        return np.asarray(emb, dtype=np.float32)
+        emb, _cropped = self.models.run_recognize(
+            img_chw, kpss[0],
+            dim=2 if self.options.recognize_dim2 else 1,
+        )
+        emb = np.asarray(emb, dtype=np.float32)
+        return (emb, kpss[0]) if return_kps else emb
 
     def source_embedding_from_many(
         self, paths: list[str],
@@ -253,7 +291,10 @@ class _SwapperBase:
         )
         slots: list[dict] = []
         for kps in kpss:
-            emb, _cropped = self.models.run_recognize(img_chw, kps)
+            emb, _cropped = self.models.run_recognize(
+                img_chw, kps,
+                dim=2 if self.options.recognize_dim2 else 1,
+            )
             emb = np.asarray(emb, dtype=np.float32)
             if any(
                 _cosine_similarity_pct(emb, s["Embedding"]) >= threshold
@@ -382,6 +423,9 @@ class VideoOptions(SwapOptions):
     target_person_paths: list[str] = field(default_factory=list)
     # 一张检测脸要被认定为目标人物的最低相似度（0-100）。越高越严格。
     target_threshold: float = 55.0
+    # 姿态自适应匹配阈值（PoseCompensationSlider）：全侧脸时判定线比
+    # --target-threshold 低多少分。0 = 关闭，判定与旧行为逐字等价。
+    pose_compensation: float = 0.0
     # H.264 质量: 数值越低越好。18 在视觉上接近无损，23 是交付时常用的
     # "够好就行" 默认值。
     crf: int = 18
@@ -460,6 +504,13 @@ class VideoSwapper(_SwapperBase):
             for path in self.options.target_person_paths
         ]
 
+    def _target_refs_with_kps(self) -> list[tuple[np.ndarray, object]]:
+        """参考 embedding 连同检测时的 kps，供姿态补偿配对用。"""
+        return [
+            self.source_embedding(path, return_kps=True)
+            for path in self.options.target_person_paths
+        ]
+
     def swap(
         self,
         source_paths: list[str],
@@ -481,11 +532,23 @@ class VideoSwapper(_SwapperBase):
                 f"PyAV is not installed ({exc}). Install it with: pip install av"
             ) from exc
 
-        targets = self._target_embeddings()
+        # 开了姿态补偿才需要参考图的 kps（多一趟检测+识别）；关闭时与
+        # 旧路径完全一致，不多跑推理。
+        if self.options.pose_compensation > 0 and self.options.target_person_paths:
+            refs = self._target_refs_with_kps()
+            targets = [emb for emb, _kps in refs]
+            ref_kps = [kps for _emb, kps in refs]
+        else:
+            targets = self._target_embeddings()
+            ref_kps = None
         # 只有匹配参考图的脸会被换。未提供参考图时每一张脸都会被换。
         self.vm.force_source_embedding = embedding
         self.vm.target_face_embeddings = targets or None
+        self.vm.target_face_ref_kps = ref_kps
         self.vm.target_face_threshold = self.options.target_threshold
+        self.vm.target_face_pose_compensation = float(
+            getattr(self.options, "pose_compensation", 0.0)
+        )
 
         # 阶段 5b：解析 --decoder。默认 pyav 分支不调用 probe，既不 import
         # torchcodec 也不碰 CUDA；gpu 探测失败会明确报错，不静默回退。

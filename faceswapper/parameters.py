@@ -131,6 +131,18 @@ PARAMETERS: list[Parameter] = [
     SelectParam("DetectInputSizeTextSel"),
     SliderParam("DetectScoreSlider"),
     SelectParam("SwapperTypeTextSel"),
+
+    # ---- 识别精度
+    SwitchParam("RecognizeMirrorSwitch"),
+    SwitchParam("RecognizeDimSwitch"),
+
+    # ---- 匹配
+    SliderParam("PoseCompensationSlider"),
+
+    # ---- 检测
+    SwitchParam("DetectRetrySwitch"),
+    SelectParam("RecognizerTypeTextSel"),
+    SelectParam("AlignTypeTextSel"),
 ]
 
 

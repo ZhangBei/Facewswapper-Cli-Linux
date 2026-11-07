@@ -30,8 +30,10 @@ class Models():
         'retinaface_model', 'scrdf_model', 'resnet50_model',
         'recognition_model', 'swapper_model',
         'swapper_512_model', 'swapper_256_model', 'hyperswap_model',
+        'hyperswap_1b_model', 'hyperswap_1c_model',
         'GFPGAN_model', 'GPEN_256_model', 'GPEN_512_model', 'codeformer_model',
         'occluder_model', 'faceparser_model', 'dfl_xseg_model',
+        'landmark68_model',
     ])
 
     def __setattr__(self, name, value):
@@ -53,6 +55,9 @@ class Models():
         self.resnet50_model, self.anchors  = [], []
 
         self.recognition_model = []
+        # 2dfan4 68 点 landmark（B4 识别对齐，默认关闭）。首次
+        # _get_landmark68_session 调用时懒加载。
+        self.landmark68_model = []
         self.swapper_model = []
         # inswapper_512: 与之并列的 512x512 进 / 512x512 出变体。首次
         # run_swapper_512 调用时懒加载；source conditioning 格式与 128
@@ -67,6 +72,11 @@ class Models():
         # 裁剪图按 (x/255 - 0.5) / 0.5 归一化到 [-1, 1]。首次
         # run_hyperswap 调用时懒加载。
         self.hyperswap_model = []
+        # hyperswap_1b_256 / hyperswap_1c_256: 同架构的另外两轮训练权重，
+        # 张量接口、latent 与归一化和 1a 完全一致，只是 session 文件不同。
+        # 分别由 run_hyperswap_1b / run_hyperswap_1c 懒加载。
+        self.hyperswap_1b_model = []
+        self.hyperswap_1c_model = []
 
         self.emap = []
         self.GFPGAN_model = []
@@ -134,6 +144,14 @@ class Models():
         # 不是提速手段（见 docs/gpu-utilization-plan.md 6.2）。必须在任何
         # session 构建前设置，运行时切换对已加载的 session 无效。
         self._arena_strategy: str = 'kSameAsRequested'
+        # 识别精度：recognize() 是否对裁剪图做水平镜像再跑一轮 ArcFace、
+        # 取平均（RecognizeMirrorSwitch）。默认 False。
+        self._recognize_mirror: bool = False
+        # B3/B4：识别权重与对齐方式，默认与 GUI 时代行为一致。由
+        # headless._SwapperBase 按 RecognizerTypeTextSel / AlignTypeTextSel
+        # 注入。
+        self._recognizer: str = 'w600k_r50'
+        self._align_type: str = '5-point'
         self.syncvec = torch.empty((1,1), dtype=torch.float32, device='cuda:0')
 
         # model session mode——控制主管线用到的每一个 ORT-TRT-EP session
@@ -206,8 +224,11 @@ class Models():
         'swapper_512_model':   'swapper_512',
         'swapper_256_model':   'swapper_256',
         'hyperswap_model':     'hyperswap',
+        'hyperswap_1b_model':  'hyperswap_1b',
+        'hyperswap_1c_model':  'hyperswap_1c',
         'retinaface_model':    'retinaface',
         'recognition_model':   'recognition',
+        'landmark68_model':    'landmark68',
     }
 
     def is_model_loaded(self, attr_name):
@@ -240,8 +261,8 @@ class Models():
     # 这个开关对它们没有意义。
     _BACKEND_PREF_ATTRS = frozenset([
         'swapper_model', 'swapper_512_model', 'swapper_256_model',
-        'hyperswap_model',
-        'retinaface_model', 'recognition_model',
+        'hyperswap_model', 'hyperswap_1b_model', 'hyperswap_1c_model',
+        'retinaface_model', 'recognition_model', 'landmark68_model',
     ])
 
     def set_backend_preference(self, attr_name, backend, *, unload=True):
@@ -297,6 +318,32 @@ class Models():
             )
         self._arena_strategy = strategy
 
+    def set_recognize_mirror(self, enabled: bool) -> None:
+        """识别精度：True = 每次识别把裁剪图水平镜像再各跑一次 ArcFace、
+        取平均，压低侧脸 embedding 的方差。必须在任何识别调用前设置；
+        默认 False，`recognize()` 行为逐字不变。"""
+        self._recognize_mirror = bool(enabled)
+
+    def set_recognizer(self, recognizer: str) -> None:
+        """选择识别权重（B3）：'w600k_r50'（默认）或 'glintr100'。
+
+        必须在任何识别调用前设置；已加载的 session 不受影响，直到下次
+        `delete_models` / 换进程。glintr100 需要先下载
+        （download-models --model arcface100）。"""
+        self._recognizer = (
+            recognizer if recognizer in self._RECOGNIZER_FILES else 'w600k_r50'
+        )
+
+    def set_align_type(self, align_type: str) -> None:
+        """选择识别对齐方式（B4）：'5-point'（默认，直接用检测 5 点做
+        相似变换）或 '68-point'（先跑 2dfan4 检 68 点 landmark、换算成
+        两眼/鼻/嘴角 5 点再变换，对极端侧脸裁剪更准；每次识别前多一次
+        landmark 推理）。未知值退回 5 点。"""
+        self._align_type = (
+            align_type if align_type in ('5-point', '68-point')
+            else '5-point'
+        )
+
     def set_reuse_detect_buffers(self, enabled: bool, backend: str = "cuda") -> None:
         """阶段 6：是否复用 retinaface 的 9 个 io_binding 输出缓冲。
 
@@ -316,10 +363,13 @@ class Models():
         self.scrdf_model = []
         self.resnet50_model = []
         self.recognition_model = []
+        self.landmark68_model = []
         self.swapper_model = []
         self.swapper_512_model = []
         self.swapper_256_model = []
         self.hyperswap_model = []
+        self.hyperswap_1b_model = []
+        self.hyperswap_1c_model = []
         self.GFPGAN_model = []
         self.GPEN_256_model = []
         self.GPEN_512_model = []
@@ -336,6 +386,8 @@ class Models():
         self._swapper_512_batch_unsupported = False
         self._swapper_256_uses_trt = False
         self._hyperswap_uses_trt = False
+        self._hyperswap_1b_uses_trt = False
+        self._hyperswap_1c_uses_trt = False
         self._retinaface_uses_trt = False
         self._recognition_uses_trt = False
 
@@ -546,11 +598,11 @@ class Models():
                 # 换后续加载的速度——那条路径与绝对 cache 目录相处良好，
                 # 也正是它让 Per-Thread 模式在首次构建之后变得便宜。
                 # 动态输入 profile: 一个 engine 覆盖所有 DetectInputSize
-                # 取值（320 / 416 / 480 / 640）。opt 取 640——TRT 会针对
+                # 取值（320 … 960）。opt 取 640——最常用档，TRT 会针对
                 # 这个点做特化。
                 'trt_profile_min_shapes': '%s:1x3x320x320' % det_img_name,
                 'trt_profile_opt_shapes': '%s:1x3x640x640' % det_img_name,
-                'trt_profile_max_shapes': '%s:1x3x640x640' % det_img_name,
+                'trt_profile_max_shapes': '%s:1x3x960x960' % det_img_name,
             }
             try:
                 cur_stream = torch.cuda.current_stream()
@@ -682,10 +734,23 @@ class Models():
         self._retinaface_center_cache[key] = anchors
         return anchors
 
-    def _create_recognition_session(self):
-        """构建一个新的 arcface (w600k_r50) ORT-TRT-EP session。与
-        retinaface 同一套模式: 默认 TRT-EP，失败回退 CUDA-EP。输入是
-        固定的 (1, 3, 112, 112) 人脸 chip——不需要动态 profile。"""
+    # RecognizerTypeTextSel 值 → 权重文件。两个识别器接口完全一致
+    # （5 点对齐、112x112 输入、512 维输出），只换权重；未知的陈旧值
+    # 退回 w600k_r50。
+    _RECOGNIZER_FILES = {
+        'w600k_r50': 'w600k_r50.onnx',
+        'glintr100': 'glintr100.onnx',
+    }
+
+    def _recognition_onnx_path(self, recognizer: str = 'w600k_r50') -> str:
+        filename = self._RECOGNIZER_FILES.get(recognizer, 'w600k_r50.onnx')
+        return self._mp(filename)
+
+    def _create_recognition_session(self, recognizer: str = 'w600k_r50'):
+        """构建一个新的 arcface ORT-TRT-EP session。recognizer 选权重
+        （w600k_r50 默认 / glintr100 ResNet100，B3）。与 retinaface 同一套
+        模式: 默认 TRT-EP，失败回退 CUDA-EP。输入是固定的 (1, 3, 112, 112)
+        人脸 chip——不需要动态 profile。"""
         try:
             onnxruntime.set_default_logger_severity(3)
         except (AttributeError, OSError):
@@ -693,7 +758,7 @@ class Models():
 
         pref = self._backend_pref.get('recognition_model')
         want_trt = pref != 'onnx'
-        onnx_path = self._mp('w600k_r50.onnx')
+        onnx_path = self._recognition_onnx_path(recognizer)
         sess = None
 
         if want_trt:
@@ -753,16 +818,93 @@ class Models():
         active = sess.get_providers()
         self._recognition_uses_trt = bool(active) and active[0] == 'TensorrtExecutionProvider'
         backend = 'TensorrtExecutionProvider' if self._recognition_uses_trt else 'CUDAExecutionProvider'
-        print(f'[Models] arcface (w600k_r50): {backend}')
+        print(f'[Models] arcface ({self._RECOGNIZER_FILES.get(recognizer, "w600k_r50.onnx")}): {backend}')
         return sess
 
     def _load_recognition_model(self):
-        self.recognition_model = self._create_recognition_session()
+        self.recognition_model = self._create_recognition_session(self._recognizer)
 
     def _get_recognition_session(self):
+        # 会话键带上 recognizer 名——换权重后旧 session 不会错配。
+        name = f'recognition_{self._recognizer}'
         return self._get_model_session(
-            'recognition', 'recognition_model', self._create_recognition_session,
+            name, 'recognition_model',
+            lambda: self._create_recognition_session(self._recognizer),
         )
+
+    # ------------------------------------------------------------------
+    # B4: 68 点 landmark 对齐（2dfan4，默认关闭）
+    # ------------------------------------------------------------------
+
+    def _create_landmark68_session(self):
+        """构建 2dfan4 的 ORT CUDA session。输入 `input` (1,3,256,256)
+        0-1 RGB；输出 `landmarks` (1,68,3)（x/y 是 256 裁剪里 64 网格的
+        网格坐标）+ `heatmaps` (1,68,64,64)。固定 shape，不需要 TRT
+        profile；识别不是逐帧热点路径，CUDA EP 足够。"""
+        cuda_options = self._cuda_ep_provider_options(cudnn_algo='EXHAUSTIVE')
+        sess_options = self._make_session_options()
+        return onnxruntime.InferenceSession(
+            self._mp('2dfan4.onnx'),
+            sess_options=sess_options,
+            providers=[('CUDAExecutionProvider', cuda_options)],
+        )
+
+    def _get_landmark68_session(self):
+        return self._get_model_session(
+            'landmark68', 'landmark68_model',
+            self._create_landmark68_session,
+        )
+
+    def _landmark68_to_kps(self, img_chw, face_kps):
+        """用 2dfan4 在 `img_chw`（(3,H,W) float32 CUDA 0-1 RGB）上检测
+        68 点 landmark，再按 FaceFusion convert_to_face_landmark_5 的索引
+        换算成 5 点 kps（numpy (5,2)，与 arcface_dst 同语义位）。face_kps
+        提供人脸位置（裁剪中心与尺度）。"""
+        kps = np.asarray(face_kps, dtype=np.float32)
+        c = kps.mean(axis=0)
+        eye_dist = float(np.linalg.norm(kps[1] - kps[0])) or 1.0
+        # 裁剪边长 ≈ 4 倍眼距（眼距约占检测框边长一半，FaceFusion 用
+        # scale = 195 / bbox_max，bbox_max ≈ 2 倍眼距），把整脸框进
+        # 256x256 裁剪。
+        size = 4.0 * eye_dist
+        h, w = int(img_chw.shape[1]), int(img_chw.shape[2])
+        x0 = float(np.clip(c[0] - size / 2, 0, max(0.0, w - size)))
+        y0 = float(np.clip(c[1] - size / 2, 0, max(0.0, h - size)))
+        crop = img_chw[:, int(y0):int(y0 + size), int(x0):int(x0 + size)]
+        crop = torch.nn.functional.interpolate(
+            crop.unsqueeze(0), size=(256, 256), mode='bilinear',
+            align_corners=False,
+        ).squeeze(0).contiguous()
+
+        session = self._get_landmark68_session()
+        output = np.empty((1, 68, 3), dtype=np.float32)
+        io_binding = session.io_binding()
+        io_binding.bind_input(
+            name=session.get_inputs()[0].name, device_type='cuda', device_id=0,
+            element_type=np.float32, shape=(1, 3, 256, 256),
+            buffer_ptr=crop.data_ptr(),
+        )
+        # 坐标输出 'landmarks'：x/y 在 64 网格坐标里，/64*256 回裁剪像素。
+        # heatmap 输出不绑，省掉一次 (1,68,64,64) 的回传。
+        io_binding.bind_output(
+            name=session.get_outputs()[0].name, device_type='cpu', device_id=0,
+            element_type=np.float32, shape=(1, 68, 3),
+            buffer_ptr=output.data_ptr(),
+        )
+        if self._should_drain_syncvec():
+            self.syncvec.cpu()
+        session.run_with_iobinding(io_binding)
+        lm68 = output[0, :, :2] / 64.0 * 256.0
+        # 256 裁剪坐标 -> 原图坐标。
+        lm68[:, 0] = lm68[:, 0] / 256.0 * size + x0
+        lm68[:, 1] = lm68[:, 1] / 256.0 * size + y0
+        return np.array([
+            lm68[36:42].mean(axis=0),
+            lm68[42:48].mean(axis=0),
+            lm68[30],
+            lm68[48],
+            lm68[54],
+        ], dtype=np.float32)
 
     def _create_swapper_session(self):
         """构建并返回一个新的 inswapper ORT InferenceSession，按用户的
@@ -1436,8 +1578,19 @@ class Models():
         （output*mask + target*(1-mask)），所以它保持不绑定，不为它
         付代价。
         """
-        session = self._get_hyperswap_session()
+        self._run_hyperswap_io(self._get_hyperswap_session(), image, embedding, output)
 
+    def run_hyperswap_1b(self, image, embedding, output):
+        """同 run_hyperswap，跑 hyperswap_1b_256 的权重。"""
+        self._run_hyperswap_io(self._get_hyperswap_1b_session(), image, embedding, output)
+
+    def run_hyperswap_1c(self, image, embedding, output):
+        """同 run_hyperswap，跑 hyperswap_1c_256 的权重。"""
+        self._run_hyperswap_io(self._get_hyperswap_1c_session(), image, embedding, output)
+
+    def _run_hyperswap_io(self, session, image, embedding, output):
+        """三个 hyperswap 变体共用的 io_binding 主体——它们的张量接口
+        （target/source 输入、output 输出）完全一致，只有权重文件不同。"""
         io_binding = session.io_binding()
         io_binding.bind_input(
             name='target', device_type='cuda', device_id=0,
@@ -1481,6 +1634,40 @@ class Models():
     def _get_hyperswap_session(self):
         return self._get_model_session(
             'hyperswap', 'hyperswap_model', self._create_hyperswap_session,
+        )
+
+    def _create_hyperswap_1b_session(self):
+        """同 _create_hyperswap_session，构建 hyperswap_1b_256 的 session。"""
+        return self._create_single_pass_swapper_session(
+            'hyperswap_1b_256.onnx',
+            fp16=True,
+            profiles=None,
+            label='hyperswap_1b_256',
+            backend_pref='hyperswap_1b_model',
+            uses_trt_attr='_hyperswap_1b_uses_trt',
+        )
+
+    def _get_hyperswap_1b_session(self):
+        return self._get_model_session(
+            'hyperswap_1b', 'hyperswap_1b_model',
+            self._create_hyperswap_1b_session,
+        )
+
+    def _create_hyperswap_1c_session(self):
+        """同 _create_hyperswap_session，构建 hyperswap_1c_256 的 session。"""
+        return self._create_single_pass_swapper_session(
+            'hyperswap_1c_256.onnx',
+            fp16=True,
+            profiles=None,
+            label='hyperswap_1c_256',
+            backend_pref='hyperswap_1c_model',
+            uses_trt_attr='_hyperswap_1c_uses_trt',
+        )
+
+    def _get_hyperswap_1c_session(self):
+        return self._get_model_session(
+            'hyperswap_1c', 'hyperswap_1c_model',
+            self._create_hyperswap_1c_session,
         )
 
     def run_GFPGAN(self, image, output):
@@ -2073,10 +2260,17 @@ class Models():
 
     def recognize(self, img, face_kps, dim):
         with nvtx_range("rec_preprocess"):
-            # 求变换
+            # 求变换。68 点对齐（B4，默认关闭）：先跑 2dfan4 检 68 点
+            # landmark，按 FaceFusion convert_to_face_landmark_5 的索引换
+            # 算成两眼中心/鼻尖/两嘴角 5 点，再与 5 点路径共用同一
+            # arcface_dst 模板。5 点路径与 GUI 时代逐字一致。
+            if self._align_type == '68-point':
+                kps_for_align = self._landmark68_to_kps(img, face_kps)
+            else:
+                kps_for_align = face_kps
             dst = self.arcface_dst.copy() * dim
 
-            tform = trans.SimilarityTransform.from_estimate(face_kps, dst)
+            tform = trans.SimilarityTransform.from_estimate(kps_for_align, dst)
 
             # 施加变换
             img = v2.functional.affine(img, tform.rotation*57.2958, (tform.translation[0], tform.translation[1]) , tform.scale, 0, center = (0,0) )
@@ -2101,19 +2295,27 @@ class Models():
             )
 
             drain = self._should_drain_syncvec()
-            for j in range(dim):
-                for i in range(dim):
-                    input = img[j::dim, i::dim].permute(2, 0, 1)
-                    input = torch.unsqueeze(input, 0).contiguous()
-                    io_binding.bind_input(
-                        name=recognition_session.get_inputs()[0].name, device_type='cuda', device_id=0,
-                        element_type=np.float32, shape=(1, 3, 112, 112),
-                        buffer_ptr=input.data_ptr(),
-                    )
-                    if drain:
-                        self.syncvec.cpu()
-                    recognition_session.run_with_iobinding(io_binding)
-                    temp_holder.append(torch.squeeze(output).cpu().numpy())
+            # 识别精度（RecognizeMirrorSwitch）：镜像开关打开时，水平翻转
+            # 的图也各跑一遍网格，进同一个 temp_holder 取平均。ArcFace 对
+            # 水平镜像各自有偏差但不相关，平均后方差更小，对左右不对称的
+            # 侧脸收益最明显。默认关闭，循环体逐字只跑一遍。
+            views = [img]
+            if self._recognize_mirror:
+                views.append(torch.flip(img, [1]))  # 水平镜像（W 维）
+            for view in views:
+                for j in range(dim):
+                    for i in range(dim):
+                        input = view[j::dim, i::dim].permute(2, 0, 1)
+                        input = torch.unsqueeze(input, 0).contiguous()
+                        io_binding.bind_input(
+                            name=recognition_session.get_inputs()[0].name, device_type='cuda', device_id=0,
+                            element_type=np.float32, shape=(1, 3, 112, 112),
+                            buffer_ptr=input.data_ptr(),
+                        )
+                        if drain:
+                            self.syncvec.cpu()
+                        recognition_session.run_with_iobinding(io_binding)
+                        temp_holder.append(torch.squeeze(output).cpu().numpy())
 
             # 返回 embedding
             out = np.mean(temp_holder, 0)
