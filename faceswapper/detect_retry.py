@@ -12,9 +12,11 @@ stdlib-only：``VideoManager`` 需要 torch / OpenCV 才能 import，而「这�
 1. 重试轮用更高的分数阈值（+0.2，即 20 分）：背景误检通常是低置信度，
    第一遍用用户阈值没检出的帧，第二遍用更高阈值检出，误检增量严格小于
    正检。
-2. auto-orient（OrientAutoSwitch）开启时不重试——它自己的
-   ``orient_miss_streak`` 已在检测失败后做 4 向重探，横竖颠倒类漏检由它
-   负责，双开会在同一帧跑两套试探。
+2. GUI 时代的 ``OrientAutoSwitch`` 开启时不重试——它的
+   ``orient_miss_streak`` 会在连续漏检后做 4 向重探，双开会在同一帧跑
+   两套试探。注意这与默认开启、逐帧无状态的整帧朝向兜底
+   （``orientation.py``）是两回事：兜底排在重试之前，命中后帧上已有脸，
+   本函数根本不会被调用；兜底也没探到脸时，仍会轮到这里的升档重试。
 """
 
 from __future__ import annotations
@@ -40,8 +42,8 @@ def retry_plan(
     """0 检出帧的重试参数 ``(input_size, score)``；其余情况返回 None。
 
     - detected > 0：帧上有脸，绝不重试。
-    - auto_orient：4 向重探已由 OrientAutoSwitch 负责，双开会在同一帧
-      跑两套试探。
+    - auto_orient：GUI 的 OrientAutoSwitch 已负责 4 向重探，双开会在同一
+      帧跑两套试探。不指 orientation.py 的无状态兜底（它在本函数之前）。
     - 输入尺寸已升到最大档（>= RETRY_INPUT_SIZE）时再升没有意义，放弃。
     """
     if not enabled or detected > 0 or auto_orient:

@@ -17,6 +17,7 @@ from faceswapper.face_batch import FaceCandidate, batch_eligibility
 from faceswapper.detect_retry import retry_plan
 from faceswapper.frame_upload import normalize_plan
 from faceswapper.frontal_match import effective_threshold_pair
+from faceswapper.orientation import PROBE_ANGLES, choose_angle, should_probe
 from faceswapper.recognize import should_skip_recognize
 
 
@@ -178,6 +179,13 @@ class VideoManager():
         self.orient_fine_angle = 0.0
         self.orient_miss_streak = 0
         self.orient_miss_threshold = 5
+
+        # 逐帧无状态的整帧朝向兜底，默认开启（--no-auto-orient 关闭）。
+        # 与上面的 GUI 时代状态机互不依赖：只在第一遍 0 检出时试 90/180/270，
+        # 命中后整帧转正再检测，最后逆旋回来。无跨帧状态，因此
+        # workers > 1 下不会竞态；只用 90 倍数，expand=True 可逆、尺寸不变。
+        # 由 headless._SwapperBase 按 options.no_auto_orient 注入。
+        self.auto_orient_fallback: bool = True
 
         # 每帧性能缓存。_blur_cache 在所有 worker 线程间共享
         # （transforms.GaussianBlur 一旦构造完就是无状态的；dict.get +
@@ -439,6 +447,46 @@ class VideoManager():
 
         # 找出画面里所有的脸，返回 5 点 kpss 列表
         kpss = self.models.run_detect(img, detect_mode, max_num=10, score=detect_score, input_size=detect_input_size)
+
+        # 整帧朝向兜底（默认开启，--no-auto-orient 关闭）：只在第一遍 0
+        # 检出的帧上试 90/180/270，命中后把整帧转正重新检测。正常视频
+        # 第一遍就检出，零额外推理、零旋转，输出逐像素不变。
+        # GUI 时代的 OrientAutoSwitch / OrientSwitch 在检测前已经转过一次，
+        # 这里让位，避免两次旋转叠加后逆旋不完整。
+        if should_probe(
+            detected=len(kpss),
+            enabled=self.auto_orient_fallback,
+            already_rotated=(
+                auto_orient
+                or bool(parameters.get('OrientSwitch', False))
+                or applied_angle != 0.0
+            ),
+        ):
+            counts = {}
+            for angle in PROBE_ANGLES:
+                probe_img = v2.functional.rotate(
+                    img, angle=angle,
+                    interpolation=v2.InterpolationMode.BILINEAR, expand=True,
+                )
+                counts[angle] = len(self.models.run_detect(
+                    probe_img, detect_mode, max_num=10,
+                    score=detect_score, input_size=detect_input_size,
+                ))
+            fallback_angle = choose_angle(counts)
+            if fallback_angle:
+                # 只用 90 倍数：正旋 H×W → W×H，末尾的逆旋 W×H → H×W，
+                # 输出尺寸与原帧严格一致，编码器不会看到变尺寸的帧。
+                # 命中角度的图重新转一次，避免把 3 张全尺寸 CHW tensor
+                # 同时留在显存里（workers>1 时这份开销会乘以 worker 数）。
+                applied_angle = float(fallback_angle)
+                img = v2.functional.rotate(
+                    img, angle=applied_angle,
+                    interpolation=v2.InterpolationMode.BILINEAR, expand=True,
+                )
+                kpss = self.models.run_detect(
+                    img, detect_mode, max_num=10,
+                    score=detect_score, input_size=detect_input_size,
+                )
 
         # 漏检重试（DetectRetrySwitch）：0 检出帧升一档输入尺寸、抬高分
         # 数阈值再检一次（detect_retry.retry_plan 的两道防误检闸）。只在

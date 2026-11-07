@@ -84,6 +84,9 @@ class SwapOptions:
     # 阶段 7：帧已是 uint8 C contiguous 时跳过 astype 的整帧复制。默认关闭，
     # 关掉时所有帧路径逐字保留原来的 astype 表达式。
     zero_copy_frames: bool = False
+    # 整帧朝向兜底的回滚开关。True = 关闭兜底（旧行为）。默认 False 即开启：
+    # 只在 0 检出帧试 90/180/270 度，转正后重新检测换脸，正常帧零额外开销。
+    no_auto_orient: bool = False
 
 
 def _read_image(path: str) -> np.ndarray:
@@ -199,6 +202,11 @@ class _SwapperBase:
         # 阶段 7：闸门默认关闭；开启后才在 VM 的 H2D 分支跳过整帧复制。
         self.vm.zero_copy_frames = bool(
             getattr(options, "zero_copy_frames", False)
+        )
+        # 整帧朝向兜底默认开启，--no-auto-orient 才关。与 GUI 时代的
+        # OrientAutoSwitch 无关：这里是无状态、逐帧的 90 度倍数试探。
+        self.vm.auto_orient_fallback = not bool(
+            getattr(options, "no_auto_orient", False)
         )
         self._apply_parameters()
 

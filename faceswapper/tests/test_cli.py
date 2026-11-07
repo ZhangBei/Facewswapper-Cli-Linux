@@ -691,6 +691,83 @@ def test_main_reports_avg_fps() -> None:
     print("  ok  elapsed line carries avg fps for video only, never on failure")
 
 
+def test_auto_orient_flag() -> None:
+    """整帧朝向兜底默认开启，只有 --no-auto-orient 能关；属于 add_common。"""
+    parser = build_parser()
+    base = ["video", "--source", "face.jpg", "--target", "in.mp4",
+            "--output", "out.mp4"]
+    plain = parser.parse_args(base)
+    if plain.no_auto_orient is not False:
+        fail(f"no-auto-orient defaults to {plain.no_auto_orient!r}")
+    tuned = parser.parse_args(base + ["--no-auto-orient"])
+    if tuned.no_auto_orient is not True:
+        fail("--no-auto-orient was not accepted by video")
+    image = parser.parse_args([
+        "swap", "--source", "a.jpg", "--target", "b.jpg",
+        "--output", "o.png", "--no-auto-orient",
+    ])
+    if image.no_auto_orient is not True:
+        fail("--no-auto-orient should be a common flag")
+
+    # 它走 options 字段，不写进 parameter dict——saved_parameters.json 的
+    # 磁盘契约与 GUI 时代的 OrientAutoSwitch 保持原样。
+    for args in (plain, tuned):
+        overrides = _parameter_overrides(args)
+        if "OrientAutoSwitch" in overrides or "OrientSwitch" in overrides:
+            fail(f"fallback must not touch GUI orient parameters: {overrides!r}")
+    from faceswapper.parameters import default_values
+    if default_values().get("OrientAutoSwitch") is not False:
+        fail("GUI OrientAutoSwitch must stay off by default")
+    print("  ok  --no-auto-orient defaults off (fallback on) for video/swap")
+
+
+def test_auto_orient_wiring() -> None:
+    """钉住兜底的默认开启、接线点，以及"不用跨帧 EMA"这条底线。"""
+    import ast
+
+    root = Path(__file__).resolve().parents[1]
+    vm = (root / "VideoManager.py").read_text(encoding="utf-8")
+    headless = (root / "headless.py").read_text(encoding="utf-8")
+    cli = (root / "cli.py").read_text(encoding="utf-8")
+
+    # VM 的默认值是 True（AnnAssign 常量），不是靠 --params 打开。
+    vals = [
+        n.value.value
+        for n in ast.walk(ast.parse(vm))
+        if isinstance(n, ast.AnnAssign)
+        and isinstance(n.value, ast.Constant)
+        and isinstance(n.target, ast.Attribute)
+        and n.target.attr == "auto_orient_fallback"
+    ]
+    if vals != [True]:
+        fail(f"auto_orient_fallback must default to True, got {vals!r}")
+
+    # 三处接线缺一不可：VM 用纯逻辑决策、headless 注入回滚值、CLI 两面传参。
+    for needle in (
+        "from faceswapper.orientation import",
+        "should_probe(",
+        "choose_angle(counts)",
+        "PROBE_ANGLES",
+    ):
+        if needle not in vm:
+            fail(f"VideoManager.py missing {needle!r}")
+    if "self.vm.auto_orient_fallback = not bool(" not in headless:
+        fail("headless.py does not inject the fallback flag")
+    if 'getattr(options, "no_auto_orient", False)' not in headless:
+        fail("headless.py does not read options.no_auto_orient")
+    if cli.count("no_auto_orient=args.no_auto_orient") != 2:
+        fail("--no-auto-orient must reach both SwapOptions and VideoOptions")
+
+    # 兜底分支只许用 90 倍数常量，不许碰 GUI 的跨帧 EMA 状态——否则
+    # workers>1 竞态与 expand=True 尺寸漂移会一起回来。
+    branch = vm.split("if should_probe(", 1)[-1].split("漏检重试", 1)[0]
+    if "orient_fine_angle" in branch or "detected_orient_angle" in branch:
+        fail("fallback branch must not touch the GUI cross-frame orient state")
+    if "applied_angle = float(fallback_angle)" not in branch:
+        fail("fallback branch must set applied_angle so the frame is rotated back")
+    print("  ok  auto-orient fallback wired, stateless, quarter-turns only")
+
+
 def test_all_new_video_flags_compose() -> None:
     """所有新开关同时给出时不能互相覆盖，也不能被 argparse 判成歧义。"""
     parser = build_parser()
@@ -701,7 +778,7 @@ def test_all_new_video_flags_compose() -> None:
         "--workers", "4", "--profile", "--encode-thread", "--defer-d2h",
         "--force-recognize", "--encoder", "nvenc", "--decoder", "gpu",
         "--arena-strategy", "pow2", "--reuse-detect-buffers",
-        "--zero-copy-frames",
+        "--zero-copy-frames", "--no-auto-orient",
         "--crf", "23", "--preset", "fast",
         "--every-nth", "2", "--no-audio", "--backend", "cuda",
     ])
@@ -711,6 +788,7 @@ def test_all_new_video_flags_compose() -> None:
         "decoder": "gpu", "arena_strategy": "pow2", "crf": 23, "preset": "fast",
         "every_nth": 2,         "no_audio": True, "backend": "cuda",
         "reuse_detect_buffers": True, "zero_copy_frames": True,
+        "no_auto_orient": True,
     }
     for key, value in expected.items():
         got = getattr(args, key)
@@ -720,11 +798,13 @@ def test_all_new_video_flags_compose() -> None:
 
 
 def test_switch_defaults_match_baseline() -> None:
-    """不传新开关时，除 recognize 跳过外所有默认值都回到基线。
+    """不传开关时所有 CLI 默认值都回到基线。
 
-    唯一默认生效的变化是 ``--force-recognize=False`` —— 它让没有读取方的
-    逐脸 ArcFace 推理被跳过（像素输出不变，但 ORT 调用次数变了）。这里把
-    事实钉住，避免有人误以为所有新功能都默认关闭。
+    两处默认生效的行为变化钉在这里，避免误以为"全部默认关闭"：
+    - ``--force-recognize=False``：无读取方的逐脸 ArcFace 推理被跳过
+      （像素输出不变，ORT 调用次数变了）。
+    - ``--no-auto-orient=False``：整帧朝向兜底默认开启，但只在第一遍
+      0 检出的帧上追加推理；正常帧零额外开销、输出逐像素不变。
     """
     parser = build_parser()
     args = parser.parse_args([
@@ -736,7 +816,7 @@ def test_switch_defaults_match_baseline() -> None:
         "defer_d2h": False, "force_recognize": False,
         "encoder": "libx264", "decoder": "pyav",
         "arena_strategy": "same", "reuse_detect_buffers": False,
-        "zero_copy_frames": False,
+        "zero_copy_frames": False, "no_auto_orient": False,
         "crf": 18, "preset": "medium", "every_nth": 1,
         "no_audio": False, "backend": "cuda",
     }
@@ -744,7 +824,7 @@ def test_switch_defaults_match_baseline() -> None:
         got = getattr(args, key)
         if got != value:
             fail(f"default {key} = {got!r}, expected baseline {value!r}")
-    print("  ok  switch defaults match baseline (recognize skip is the one change)")
+    print("  ok  switch defaults match baseline (two default-on changes documented)")
 
 
 def test_docs_stay_in_sync() -> None:
@@ -1010,6 +1090,8 @@ def main() -> int:
     test_sync_red_lines_preserved()
     test_main_reports_avg_fps()
     test_headless_module_syntax()
+    test_auto_orient_flag()
+    test_auto_orient_wiring()
     test_all_new_video_flags_compose()
     test_switch_defaults_match_baseline()
     test_docs_stay_in_sync()

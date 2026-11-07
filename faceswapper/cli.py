@@ -229,6 +229,7 @@ def _build_options(args: argparse.Namespace, headless=None) -> "SwapOptions":
         recognize_dim2=args.recognize_dim2,
         recognizer=args.recognizer or "w600k_r50",
         align_type=args.align or "5-point",
+        no_auto_orient=args.no_auto_orient,
     )
     return options
 
@@ -401,6 +402,7 @@ def _cmd_video(args: argparse.Namespace) -> int:
         recognize_dim2=args.recognize_dim2,
         recognizer=args.recognizer or "w600k_r50",
         align_type=args.align or "5-point",
+        no_auto_orient=args.no_auto_orient,
     )
 
     def progress(index: int, total: int) -> None:
@@ -567,6 +569,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="0 检出帧自动重试一次：检测输入升到 960、分数"
                             "阈值 +20。只对漏检帧追加推理，auto-orient 开启"
                             "时自动让位；默认关闭")
+        p.add_argument("--no-auto-orient", action="store_true",
+                       help="关闭整帧朝向兜底（默认开启）：0 检出帧原本会"
+                            "自动试 90/180/270 度、转正后重新检测换脸，"
+                            "用于手机竖拍 / 横竖颠倒的视频；正常帧零额外"
+                            "开销。此开关用于回滚与 A/B")
         p.add_argument("--recognizer", choices=["w600k_r50", "glintr100"],
                        default=None,
                        help="B3：识别权重。w600k_r50（默认）或 glintr100"
