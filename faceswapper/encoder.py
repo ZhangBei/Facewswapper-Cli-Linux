@@ -102,6 +102,10 @@ def encoder_worker(
             else {"crf": str(int(crf)), "preset": str(preset)}
         )
         out_stream.time_base = in_tb
+        # 同 headless._encode_video：编码器 time_base 默认 1/rate，对 VFR
+        # 源太粗，量化后会出现重复 dts 被 mp4 muxer 拒绝（EINVAL）。设成
+        # 源的精细 tb 以保留原始帧间隔。
+        out_stream.codec_context.time_base = in_tb
         out_tb = out_stream.time_base or in_tb
         pts_scale = float(in_tb / out_tb)
 

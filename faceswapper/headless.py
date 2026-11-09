@@ -931,6 +931,12 @@ class VideoSwapper(_SwapperBase):
             # 保留源 time base，这样 PTS 值可以直接照抄，不累积舍入
             # 误差。
             out_stream.time_base = in_tb
+            # 编码器自己的 time_base 默认是 1/rate（这里即 1/平均帧率），
+            # 对 VFR 源来说粒度太粗：相邻帧间隔小于一个 tick 时，pts 量化
+            # 后会出现重复值，mp4 muxer 会以 EINVAL 拒绝（
+            # "non monotonically increasing dts"）。把编码器 time_base 也
+            # 设成源的精细 tb，帧间隔就能被原样保留。
+            out_stream.codec_context.time_base = in_tb
             out_tb = out_stream.time_base or in_tb
             pts_scale = float(in_tb / out_tb)
 
