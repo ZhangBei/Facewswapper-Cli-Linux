@@ -33,6 +33,11 @@ import traceback
 from typing import Any
 
 from faceswapper.errors import HeadlessError
+from faceswapper.detect_retry import (
+    DEFAULT_ALIGN_FOR_SWAP_SIDENESS,
+    DEFAULT_RETRY_QUALITY_SPEC, parse_retry_quality,
+)
+from faceswapper.orientation import parse_probe_angles
 from faceswapper.model_store import (
     DEFAULT_PROVIDER,
     ENDPOINT_ENV,
@@ -46,6 +51,51 @@ from faceswapper.model_store import (
 )
 from faceswapper.parameters import PARAMETER_BY_NAME
 from faceswapper.parameters_io import load as load_params
+
+
+def _probe_step(value: str) -> str:
+    """在 argparse 阶段校验 ``--probe-angles`` 的步长，原样返回字符串。
+
+    保留 str 是为了让 ``SwapOptions.probe_angles`` 保持「原始 CLI 值」的
+    语义，真正的候选轴由 ``headless`` 里的 ``parse_probe_angles`` 解析。
+    非法步长在这里就给出 usage 级报错，不拖到模型下载或逐帧热路径。
+    """
+    try:
+        parse_probe_angles(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
+
+
+def _retry_quality_spec(value: str) -> str:
+    """在 argparse 阶段校验 ``--detect-retry-quality`` 的两个阈值。
+
+    保留 str 让 ``SwapOptions`` 存原始 CLI 值，真正的解析在 headless 里
+    做；非法格式在这里就给 usage 级报错，不拖到模型下载或逐帧路径。
+    """
+    try:
+        parse_retry_quality(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return value
+
+
+def _sideness_spec(value: str) -> str:
+    """在 argparse 阶段校验 ``--align-for-swap`` 的侧度阈值（0-1）。
+
+    NaN / inf 也会让 ``0 <= v <= 1`` 为 False，无需额外 import math。
+    """
+    try:
+        v = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"--align-for-swap 须为 0-1 的侧度阈值，得到 {value!r}"
+        ) from exc
+    if not (0.0 <= v <= 1.0):
+        raise argparse.ArgumentTypeError(
+            f"--align-for-swap 须为 0-1 的侧度阈值，得到 {value!r}"
+        )
+    return value
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -230,6 +280,10 @@ def _build_options(args: argparse.Namespace, headless=None) -> "SwapOptions":
         recognizer=args.recognizer or "w600k_r50",
         align_type=args.align or "5-point",
         no_auto_orient=args.no_auto_orient,
+        probe_angles=args.probe_angles,
+        probe_on_target_miss=args.probe_on_target_miss,
+        detect_retry_quality=args.detect_retry_quality,
+        align_for_swap=args.align_for_swap,
     )
     return options
 
@@ -403,6 +457,10 @@ def _cmd_video(args: argparse.Namespace) -> int:
         recognizer=args.recognizer or "w600k_r50",
         align_type=args.align or "5-point",
         no_auto_orient=args.no_auto_orient,
+        probe_angles=args.probe_angles,
+        probe_on_target_miss=args.probe_on_target_miss,
+        detect_retry_quality=args.detect_retry_quality,
+        align_for_swap=args.align_for_swap,
     )
 
     def progress(index: int, total: int) -> None:
@@ -569,11 +627,33 @@ def build_parser() -> argparse.ArgumentParser:
                        help="0 检出帧自动重试一次：检测输入升到 960、分数"
                             "阈值 +20。只对漏检帧追加推理，auto-orient 开启"
                             "时自动让位；默认关闭")
+        p.add_argument("--detect-retry-quality", type=_retry_quality_spec,
+                       nargs="?", const=DEFAULT_RETRY_QUALITY_SPEC,
+                       default=None,
+                       help="把 --detect-retry 的触发从「0 检出」放宽到"
+                            "「检出了但不可靠」的一正一侧混合帧。可接"
+                            " MIN_CONF:MIN_KPS_QUALITY（默认 0.60:0.50，"
+                            "两个阈值都需真机标定）；重检结果只追加不替换。"
+                            "默认不传 = 旧行为逐像素不变，需配合"
+                            " --detect-retry 使用")
         p.add_argument("--no-auto-orient", action="store_true",
                        help="关闭整帧朝向兜底（默认开启）：0 检出帧原本会"
                             "自动试 90/180/270 度、转正后重新检测换脸，"
                             "用于手机竖拍 / 横竖颠倒的视频；正常帧零额外"
                             "开销。此开关用于回滚与 A/B")
+        p.add_argument("--probe-angles", type=_probe_step, default=None,
+                       help="朝向探测的角度步长（度）：45 = 8 向、"
+                            "22.5 = 16 向、90 = 4 向；须整除 360。"
+                            "默认不传 = 旧的整帧旋转路径，逐像素行为不变。"
+                            "显式传入时只旋转检测副本、不旋转用于换脸的"
+                            "原帧，kps 逆映射回原帧坐标后交给 swap_core")
+        p.add_argument("--probe-on-target-miss", action="store_true",
+                       help="指定 --target-face 且本帧已有脸、却没有任何一张"
+                            "匹配上目标人物时，补做多向探测并跨角度合并去重"
+                            "（只追加、不替换已有检出）。默认关闭；未给"
+                            " --probe-angles 时补探测按 8 向。帧最多 3 张脸"
+                            "才触发，目标人物不在画面里的帧也会触发，建议"
+                            "先 A-B 评估成本")
         p.add_argument("--recognizer", choices=["w600k_r50", "glintr100"],
                        default=None,
                        help="B3：识别权重。w600k_r50（默认）或 glintr100"
@@ -585,6 +665,15 @@ def build_parser() -> argparse.ArgumentParser:
                             "相似变换）或 68-point（2dfan4 检 68 点后取两"
                             "眼/鼻/嘴角，侧脸裁剪更准，识别前多一次推理，"
                             "需下载 2dfan4）")
+        p.add_argument("--align-for-swap", type=_sideness_spec,
+                       nargs="?", const=str(DEFAULT_ALIGN_FOR_SWAP_SIDENESS),
+                       default=None,
+                       help="把 68 点派生的 5 点复用到 swap_core 的替换几何，"
+                            "修 L3「侧脸换上去但贴歪」。可接 MIN_SIDENESS"
+                            "（默认 0.35，需真机标定）：只有旋转不变的侧度"
+                            "超过阈值才启用，正脸帧保持原 kps 逐像素不变。"
+                            "强制要求 --align 68-point 与 --target-face；"
+                            "不传 = 旧行为")
 
     swap = sub.add_parser("swap", help="换一张或多张图片里的脸")
     add_common(swap)

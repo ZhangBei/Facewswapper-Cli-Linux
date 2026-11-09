@@ -12,6 +12,7 @@ NVIDIA GPU** 的云端/服务器环境。没有图形界面，不需要桌面环
 
 - 图片换脸：单张、批量、多人脸或只处理最大人脸
 - 视频换脸：替换所有人，或只替换参考图指定的目标人物
+- 整帧旋转（90/180/270°）的视频自动扶正，**不需要额外参数**（见 3.1.1）
 - 多张源脸合并为一个身份
 - 换脸模型可选 inswapper_128（polyphase 拼接到 256/512）或 hyperswap-256
 - 按需下载模型、多下载源、完整性校验
@@ -23,7 +24,7 @@ NVIDIA GPU** 的云端/服务器环境。没有图形界面，不需要桌面环
 2. [安装步骤](#2-安装步骤)
 3. [使用方法](#3-使用方法)
 4. [常见问题](#4-常见问题)
-5. [侧脸问题：原因与解决方法](#5-侧脸问题原因与解决方法)
+5. [侧脸与旋转](#5-侧脸与旋转)
 6. [免责声明](#6-免责声明)
 
 ---
@@ -493,8 +494,47 @@ Hugging Face 官方仓库获取（来源见 [2.3](#23-模型下载)）。下面�
 带参数的版本。
 
 > 视频想提速，只需加 `--workers 2`（实测约 1.5×）。其余实验开关在真机上
-> 均无收益，数据、原因与不要叠加的清单见 3.3 节的
-> 「提速办法（2026-11-06 真机实测）」。
+> 均无收益，A/B 数据见 3.3 节的「提速办法（2026-11-06 真机实测）」。
+> 改造后的完整命令写法见下一节 3.1.1。
+
+### 3.1.1 改造后命令速查（2026-11-07）
+
+> **一句话**：整帧被转过 90/180/270 度的视频，现在**不用加任何参数**就能
+> 正常识别和换脸；正常视频的命令一个字都不用改。
+
+| 场景 | 在最小命令后追加 | 说明 |
+|---|---|---|
+| 普通视频 / 图片 | 无 | 与改造前完全一致 |
+| 手机竖拍、横竖颠倒、剪辑转过 90° | **无** | 默认自动扶正，见 5.2 |
+| 目标脸在画面内大角度歪头（roll）导致漏检 | `--probe-angles 45` | 8 向探测，只旋转检测副本；默认路径不变 |
+| 多人镜头里目标人物歪头漏检、别人正脸还在 | `--target-face person.jpg --probe-angles 45 --probe-on-target-miss` | 受控补探测 + 跨角度合并去重 |
+| 关掉自动扶正（回滚 / A-B） | `--no-auto-orient` | 回到改造前行为 |
+| 侧脸漏检 | `--detect-input-size 960 --detect-retry` | 见 5.1 |
+| 一正一侧混合帧（正脸检出、侧脸漏掉） | `--detect-retry --detect-retry-quality` | 低置信度 / kps 几何差时重检，只追加不替换 |
+| 侧脸换上去但贴歪（L3 几何） | `--align 68-point --align-for-swap` | 仅 video + `--target-face`；正脸帧保持原 kps |
+| 侧脸匹配不上 | `--recognize-mirror --pose-compensation 15` | 见 5.1 |
+| 提速 | `--workers 2` | 唯一实测有效，可与自动扶正叠加 |
+
+**旋转视频的完整命令**（推荐写法，与最小命令只差文件名）：
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target rotated90.mp4 --output out.mp4 \
+    --workers 2
+```
+
+**不需要再写**：用 `--params saved_parameters.json` 去开 `OrientAutoSwitch`、
+手工指定旋转角度，或任何「朝向」相关参数——这些都是改造前的做法。
+
+旋转与侧脸同时存在时，直接叠加开关即可：
+
+```bash
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target-face person.jpg \
+    --target rotated90.mp4 --output out.mp4 \
+    --workers 2 --detect-input-size 960 --recognize-mirror \
+    --pose-compensation 15
+```
 
 ### 3.2 图片换脸
 
@@ -739,23 +779,14 @@ python -m faceswapper.cli --models ./models video \
 
 #### 提速办法（2026-11-06 真机实测）
 
-**结论先行**：唯一被真机验证有效的提速手段是 `--workers 2`。在 Tesla T4 /
-720p / 25 fps 的 30 秒 / 750 帧样本上约 **1.5×**；其余可选开关全部持平或
-负收益，NVENC、GPU 常驻解码、batch 推理在当前环境不可用。
-
-推荐命令 —— 只加这一个开关，不要叠加下面列出的实验开关：
+**结论**：唯一实测有效的提速手段是 `--workers 2`（Tesla T4 / 720p / 30 秒
+750 帧样本约 **1.5×**）；其余实验开关全部持平或负收益，不建议叠加。
 
 ```bash
 python -m faceswapper.cli --models ./models video \
-    --source face.jpg \
-    --target input.mp4 \
-    --output output.mp4 \
-    --workers 2 \
-    --preset ultrafast --crf 23
+    --source face.jpg --target input.mp4 --output output.mp4 \
+    --workers 2 --preset ultrafast --crf 23
 ```
-
-**实测数据**（`tools/bench_gpu.py --run --workers 1,2,4`，30 秒正式基线，
-报告在 `bench-out/baseline-30s/bench_report.json`）：
 
 | workers | elapsed | avg fps | 加速比 | 对 w1 逐帧 PSNR |
 |---:|---:|---:|---:|---|
@@ -763,312 +794,37 @@ python -m faceswapper.cli --models ./models video \
 | 2 | 151.0s | 5.0 | **1.50** | `inf` |
 | 4 | 139.1s | 5.4 | **1.63** | `inf` |
 
-`inf` 表示逐像素完全一致，并发没有改变输出。w2 → w4 只多 0.4 fps，
-收益已递减，**不建议加到 4 以上**。
+`inf` = 逐像素一致，并发没改变输出；w2 → w4 只多 0.4 fps，不必超过 2。
+`nsys` 把瓶颈定位到逐脸 ORT Run 与 `cudaStreamSynchronize`（占 CUDA API
+时间 75.6%），H2D + D2H memcpy 仅 0.243s / 36.1s——针对主机数据搬运的
+优化上限不到 1%。
 
-##### 提速原因
+| 实验开关 | 作用 | A/B（10 秒 250 帧，基线 60.9s / 4.1 fps） | 状态 |
+|---|---|---|---|
+| `--encode-thread` | 编码移到独立线程 | 64.8s / 3.9 fps（**负收益**） | 默认关，不建议开 |
+| `--defer-d2h` | D2H 挪到帧消费侧 | 63.0s / 4.0 fps（与 `--arena-strategy pow2` 同开） | 默认关，仅 `--workers > 1` 生效 |
+| `--arena-strategy pow2` | 减少重复 `cudaMalloc` | 同上 | 只让 VRAM 数字变大，不提速 |
+| `--reuse-detect-buffers` | 复用 detector 9 个输出缓冲 | 62.6s / 4.0 fps | 默认关，`--backend trt` 下自动关 |
+| `--zero-copy-frames` | 跳过整帧 `astype` 复制 | 63.3s / 3.9 fps | 默认关 |
+| `--encoder nvenc` | NVENC 硬件编码 | 本容器权限不足，明确报错 | 默认 `--encoder libx264` |
+| `--decoder gpu` | GPU 常驻解码 | torchcodec 0.17 与 torch 2.10 ABI 不匹配，明确报错 | 默认 `--decoder pyav` |
+| 7.1 / 7.2 batch | 单帧多脸 / 跨帧 batch | 动态 batch 模型数值等价，但 7.1 输出仅 PSNR 45.69 dB | 两个闸门保持 `False` |
 
-`nsys profile -t cuda,nvtx` 的轨迹显示，耗时集中在逐脸 swapper 推理与
-同步等待，而不是主机侧数据搬运：
+上表 A/B 的逐帧 PSNR 均为 `inf`（像素一致），只是吞吐无收益。各开关的实现、
+闸门与离线测试见 [docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md)。
 
-| 观测 | 数值 | 含义 |
-|---|---|---|
-| `cudaStreamSynchronize` | 13.41s / 2618 次，占 CUDA API 时间 **75.6%** | 主机在等 GPU 完成 |
-| `ort_run_swapper`（NVTX） | 11.77s / 225 次（每帧 3 张脸 × 75 帧） | 逐脸 ORT Run 是主体 |
-| `syncvec_drain` | 0.323s | 原先以为的主瓶颈，实测可忽略 |
-| H2D + D2H memcpy | 0.243s | 相对 36.1s 总用时不足 1% |
-| `cudaMalloc` + `cudaFree` | 0.074s | 分配器开销可忽略 |
+`--force-recognize` 是唯一默认生效的性能变化：未指定 `--target-face` 时
+跳过无读取方的逐帧 ArcFace 推理（像素不变），传该 flag 可退回旧路径。
+`--every-nth` 是抽样验证、不是加速；`--target-face` 只影响人脸筛选。
 
-`--workers N` 让 N 个 worker 各持一份 ORT session 和一条 CUDA stream，
-把「主机等某一次 ORT Run」的时间与另一帧的推理重叠起来；解码与编码仍在
-主线程，输出严格按解码顺序（`frame_order.py` 的 `2N` 有序窗口），因此
-PTS、VFR 时序、音画对齐与逐帧像素都不变。
-
-反过来，编码、D2H、memcpy、显存分配这些环节的收益上限本来就不到 1%，
-针对它们的开关在 A/B 里全部测不出收益：
-
-| 开关 | 10 秒 / 250 帧 A/B（基线 60.9s / 4.1 fps） | 逐帧 PSNR |
-|---|---|---|
-| `--encode-thread` | 64.8s / 3.9 fps（**负收益**） | `inf` |
-| `--defer-d2h --arena-strategy pow2` | 63.0s / 4.0 fps | `inf` |
-| `--reuse-detect-buffers` | 62.6s / 4.0 fps | `inf` |
-| `--zero-copy-frames` | 63.3s / 3.9 fps | `inf` |
-| 阶段 6 + 7 组合 | 62.8s / 4.0 fps | `inf` |
-
-##### 不要这样提速
-
-- 不要叠加上面那批实验开关：全部无收益，`--encode-thread` 还会变慢。
-- 不要把显存占用当提速指标：VRAM 随 worker 数上升只是各持一份 session
-  的副产物；`--arena-strategy pow2` 只让数字变大，不提速。本机同机还有
-  4 个外部 GPU 进程，`nvidia-smi` 读数无法归因于本工具。
-- `--every-nth` 是抽样验证、不是加速；降分辨率、`--preset ultrafast`、
-  关掉可选功能是减少总耗时，不改变换脸计算量。
-- NVENC（`--encoder nvenc`）在本容器权限不足会明确报错；GPU 常驻解码
-  （`--decoder gpu`）因 torchcodec 与 torch ABI 不匹配不可用；单帧多脸
-  batch 虽有数值等价的动态 batch 模型可用，但输出 PSNR 仅 45.69 dB，
-  闸门保持关闭。
-
-完整的分阶段数据、nsys 轨迹与验收顺序见
-[docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md)。
-
-#### 流水线结构与同步开销（含实测修正）
-
-> **2026-11-06 真机实测修正**：下面这段是改造前的结构分析。`nsys` 后来
-> 显示主机主要是在**等 GPU**（`cudaStreamSynchronize` 占 CUDA API 时间
-> 75.6%），并非 GPU 空闲；且本机同机有 4 个外部 GPU 进程，`nvidia-smi`
-> 读数无法归因于本工具。因此「GPU / 显存占用很低」这一旧判断在这台机器上
-> 未得到证实。实测有效的提速办法与原因见上一节。
-
-改造前（`workers=1`）的流水线结构：
-
-- 解码（PyAV，CPU）、GPU 推理、libx264 编码都在**同一个线程逐帧串行**
-  （`headless.py` 的 `_encode_video`），任意时刻只有一帧在推进；
-- 每次 ORT 调用前有 `syncvec.cpu()` 的 CPU↔GPU 同步，每帧结束还有一次
-  `result.cpu().numpy()` 回拷；
-- 换脸按脸逐次执行，没有跨帧 batch；ORT session 是单份 `Shared`，CUDA EP
-  用 `kSameAsRequested` 按需分配显存。
-
-所以单纯调大显存池不会提速，`saved_parameters.json` 里的 `ThreadsSlider`
-是没有读取方的遗留参数，改它无效。前面「低显存 / 最快配置」里列的
-`--preset ultrafast`、降分辨率、关掉可选功能等仍然有效，但它们是减少总
-耗时，不会让 GPU 吃满。`--every-nth` 是抽样验证、不是加速。`--target-face`
-只影响人脸筛选：未指定时逐脸识别 embedding 默认已跳过（见阶段 4，像素不变，
-省每帧 N 次 ArcFace 推理）；指定时要按相似度筛人，embedding 照常计算。
-
-真正有效的是增加并发，即 `--workers N`（默认 `1`，走串行路径）：
-
-```bash
-python -m faceswapper.cli --models ./models video \
-    --source face.jpg --target input.mp4 --output output.mp4 \
-    --workers 2
-```
-
-`N` 个 worker 各持一份 ORT session 和一条 CUDA stream，解码/编码留在主线程，
-换脸推理在线程池里并行；输出仍严格按解码顺序，PTS、VFR 时序和音画对齐与
-串行路径一致。显存约为 `N × 3 份模型 session`。**实测 w2 → w4 只多
-0.4 fps，取 2 即可**；本机 `nvidia-smi` 读数受同机其它进程污染，不能用来
-判断本工具的利用率。
-
-| 方案 | 真机效果 | 状态 |
-|---|---|---|
-| `--workers N` 多 worker 并行帧 | **约 1.5×（w2）**，唯一有效 | 见「提速办法」 |
-| 编码移到独立线程 | **负收益** | 保持默认关闭 |
-| 跨帧 batch 推理 | 上限最高 | 代码已编写、闸门关闭；像素等价未通过 |
-
-`--workers > 1` 会启用 Per-Thread session，此时不要通过 `--params` 打开
-GUI 时代的 `OrientAutoSwitch`：它维护跨帧共享状态，多线程下会竞态。默认
-参数是关闭的，正常使用不受影响。**5.7 节默认开启的整帧朝向兜底不在此列**
-——它逐帧无状态，与 `--workers 2` 可以一起用。
-
-观察利用率请用 `nvidia-smi dmon -s um -d 1`（`-s u,m` 是非法写法）；
-但要得到可归因的数字，需先隔离同机其它 GPU 进程。
-
-#### 编码独立线程 `--encode-thread`
-
-```bash
-python -m faceswapper.cli --models ./models video \
-    --source face.jpg --target input.mp4 --output output.mp4 \
-    --workers 4 --encode-thread --profile
-```
-
-主线程按解码顺序把帧投进有界队列（`maxsize=2*workers`），编码线程按 FIFO
-取用并负责创建、使用和关闭全部 PyAV 对象；因此 PTS、VFR 时序、音画对齐
-和逐帧输出顺序与串行路径一致，进度回调也仍按序触发。编码线程出错会写回
-异常并置停止标志，主线程立即中断，不会静默产出半个视频。
-
-可与 `--workers` 叠加，但**默认关闭，不传该参数即走原来的主线程编码路径**，
-不需要回滚代码。`--workers > 1` 的 2N 有序窗口已经让编码与推理部分重叠；
-`--profile` 里 `encode` 仅占总用时约 5–8%，可争取的空间本来就很有限。
-PyAV 的 libx264 编码是否在 C 层释放 GIL 未单独验证，但实测的负收益与
-「不释放 GIL 反而卡住主线程」这一推测一致。
-离线测试覆盖了队列保序、flush、异常传播与背压。**真机 A/B 已测为负收益**
-（64.8s / 3.9 fps，基线 60.9s / 4.1 fps；PSNR=`inf`），不建议开启。
-
-#### 阶段 3：延迟 D2H 与显存策略
-
-两个默认关闭的开关，**都不删除任何 CUDA 同步**：
-
-```bash
-python -m faceswapper.cli --models ./models video \
-    --source face.jpg --target input.mp4 --output output.mp4 \
-    --workers 4 --defer-d2h --arena-strategy pow2
-```
-
-- `--defer-d2h`：把逐帧 `.cpu().numpy()` 从 worker 线程挪到帧的消费侧，
-  worker 不再被 D2H 阻塞。仅 `--workers > 1` 生效，串行路径自动忽略。
-  `VideoManager.swap_video` 里的 `default_stream().wait_stream(worker_stream)`
-  仍保证拷贝读到已写完的缓冲，`Models` 里的 `syncvec.cpu()` 与
-  `user_compute_stream` 保持原样。
-- `--arena-strategy pow2`：CUDA EP 的 `arena_extend_strategy` 从
-  `kSameAsRequested` 换成 `kNextPowerOfTwo`。它只减少重复 `cudaMalloc`、
-  让 VRAM 占用数字变大，**不是提速手段**（所有命令均可用）。
-
-与实施方案的差别：D2H 推迟到**帧的消费侧（主线程）**而非编码线程，顺序继续
-靠已有的 `wait_stream`，没有新增 CUDA event、也没有把 stream 对象跨线程传递，
-因此 `encoder.py` 仍是 stdlib-only。代价是收益可能低于预期：D2H 仍在主线程
-串行，跨 worker 的默认 stream 隐式屏障也还在。开启 `--defer-d2h` 时，D2H
-耗时不计入 `--profile` 的三段。后续 `nsys` 已确认 host stall 主体是
-`cudaStreamSynchronize`（占 CUDA API 时间 75.6%），而 D2H memcpy 仅
-0.062s；真机 A/B 也显示该开关无收益（63.0s / 4.0 fps，PSNR=`inf`）。
-不传这两个开关即回到原行为。
-
-#### 阶段 4：跳过无用的逐脸识别
-
-单帧多脸 batch（方案 7.1）的代码已按「先编写、不启用」落地：唯一接入点在
-`_swap_video_inner` 的 headless 分支里，被 `EXPERIMENTAL_FACE_BATCH=False`
-闸门包住，默认短路到原逐脸循环，输出与基线逐字一致；指定 `--target-face`
-时也不会走 batch（相似度筛选语义不同）。之所以不能直接启用：paste-back 虽只作用于该脸
-bbox，但 `run_swapper_batched` 的 N 是 polyphase phase 数而非脸数、
-`pipeline_size` 逐脸不同、`swap_core` 是 438 行单体函数，且输入 warp 会从
-已被前一张脸写回的 `img` 采样——预批量准备会改变重叠人脸的像素。因此
-`face_batch.py` 强制要求 bbox 两两不重叠、只用 `inswapper-128`、关闭多 pass
-开关，任一不满足就回退逐脸路径。**真机受控实验补充的第六条硬阻断**：当前
-`inswapper_128.fp16.onnx` 是 `static-batch=1`，当时把闸门临时置 `True`
-会让 N>1 的 batch 被 ONNX 以 `Got: 3 Expected: 1` 拒绝，异常回退后触发
-`CUDA failure 700` 崩溃。现已给判定补上必填的 `batch_backend_available`
-并修正 session 探测顺序，复测确认误开闸门会干净回退（PSNR=`inf`、无
-CUDA 错误）。动态 batch 模型也已通过本地图改写构造并验证数值等价
-（逐脸路径 PSNR=`inf`），但用它开闸后 batch 对逐脸只有 **PSNR 45.69 dB**。
-因此**两个实验闸门仍必须保持 `False`**：剩余阻断是 7.1 prepare/finish
-的像素等价性，不是模型能力。六条完整依据、受控实验与解冻步骤见
-[docs/gpu-utilization-plan.md 7.1](docs/gpu-utilization-plan.md)。
-
-改实现了一条逻辑等价、改动更小的优化：headless video 未指定 `--target-face`
-时，所有检测到的人脸都换成同一个 `--source` 身份，逐帧 `run_recognize` 算出的
-embedding **没有任何读取方**。现在默认跳过这些调用，每帧少 N 次 ArcFace 推理
-（N = 检测到的脸数），像素输出完全不变。
-
-```bash
-# 退回旧路径，便于 A/B 或排查
-python -m faceswapper.cli --models ./models video \
-    --source face.jpg --target input.mp4 --output output.mp4 --force-recognize
-```
-
-指定 `--target-face` 时会自动照常计算 embedding（要按相似度筛人）；图片换脸走
-`found_faces` 匹配路径，同样不受影响。判定在 `recognize.py`，离线行为测试覆盖
-四种组合。`nsys` 已确认逐脸调用被跳过（`:run_recognize` 全程仅 1 次，
-即源特征提取），但收益数字未单独做 A/B。
-
-跨帧 batch（方案 7.2）的**判定、有序分组、前向/回填编排与闸门**均已写进
-代码，但 `EXPERIMENTAL_CROSS_FRAME_BATCH=False` 且主流水线完全没有调用它。
-判据很硬：`workers >= 2`、不跳帧、仅 `inswapper-128`、每帧恰好一张脸、
-`pipeline_size` 恒为 128、`index` 连续、PTS 严格递增——最后两条保证 VFR
-时序不被 batch 重排。编排层「prepare 全部帧 → 一次 ORT Run → 按序 finish」
-抽成注入回调的纯函数并有离线行为测试；`VideoManager.cross_frame_batch_swap`
-复用 7.1 的 prepare/finish 钩子，不复制 postprocess，闸门关闭时补一次逐脸
-fallback 保证输出等价。GPU 侧前向、逐帧 PSNR 与 VFR/音画时序仍需真机核对，
-五步解冻流程见 [docs/gpu-utilization-plan.md 7.2](docs/gpu-utilization-plan.md)。
-
-#### 阶段 5：NVENC 编码开关
-
-```bash
-python -m faceswapper.cli --models ./models video \
-    --source face.jpg --target input.mp4 --output output.mp4 --encoder nvenc
-```
-
-默认 `--encoder libx264`，行为与之前逐字一致。选择 `nvenc` 时会先探测当前
-PyAV/FFmpeg 是否提供 `h264_nvenc`；不可用直接报错并给出修复提示，**不会静默
-回退**。`--encode-thread` 与默认编码路径共用同一个编码器选择结果。
-
-参数**不是等价替换**：x264 的 `--crf` 映射成 NVENC 的 `cq`（配合 `rc=vbr`），
-`--preset` 的六档映射成 `p1..p7`。CRF 与 CQ 的率控行为不同，`p1..p7` 也不是
-x264 档位的一一对应；较旧的 FFmpeg 可能不认 `p1..p7`，遇到未知 preset 请回退
-`--encoder libx264`。NVENC 是独立硬件单元，**不提高 CUDA SM 利用率**，只解除
-CPU 编码瓶颈；PyAV 目前仍吃 CPU `rgb24` frame，那次 D2H 并没有省掉。
-
-#### GPU 常驻解码 `--decoder gpu`（实验性）
-
-`--decoder pyav` 是默认，完全不 import torchcodec、也不碰 CUDA。显式
-`--decoder gpu` 时会先探测 `torchcodec>=0.4`、`VideoDecoder` 是否接受
-`device=`，以及 `torch.cuda.is_available()`；任一不满足直接报错并提示回退，
-**不静默回退**。通过后用 `VideoDecoder(video_path, device="cuda")` 产出
-CUDA tensor——`_swap_video_inner` 本来就能吃 CUDA tensor，于是省掉
-`torch.from_numpy(...).to('cuda')` 这次上传。
-
-torchcodec 各版本的 frame 字段与 PTS 单位不统一，适配层刻意**不猜**：取不到
-`data` / `frame`、拿不到 PTS、或 PTS 是小数（多半是秒）时一律明确报错，避免
-静默产出坏帧或错时序。首帧绝对 PTS 由 GPU 路径自己记录，音频 mux 的偏移照常
-恢复。判定与字段提取在 `decoder.py`，有离线行为测试。
-
-真机已核对（本环境不可用）：装上 `torchcodec 0.17.0` 后 import 即报
-`libtorchcodec_image.so: undefined symbol: torch_from_blob`，当前
-`torch 2.10.0+cu128` 与 torchcodec ABI 不匹配；`--decoder gpu` 会明确
-报 `GPU decode unavailable` 并提示用默认路径，不会静默回退。验证后已
-卸载该可选包。因此 frame 布局、PTS 单位、VFR 与音画同步仍未能核对。
-不传该开关即回到原 PyAV 路径。
-
-#### 阶段 6：复用 detector 输出缓冲（每帧少 9 次显存分配）
-
-`Models._detect_retinaface_inner` 每帧为 9 个 `io_binding` 输出各调一次
-`torch.empty`（3 个 stride × score/bbox/kps）。这些缓冲的 shape 只由
-`(input_height, input_width, stride)` 决定，而前两个尺寸在一次 video 里恒定
-（除非改 `--detect-input-size`）。输入缓冲和 anchor centers 早就按 worker
-缓存了，输出缓冲是这条链上唯一还每帧重新分配的一环。
-
-```bash
-python -m faceswapper.cli --models ./models video \
-    --source face.jpg --target input.mp4 --output output.mp4 \
-    --reuse-detect-buffers
-```
-
-形状计算、闸门判定与「按 key 命中缓存、未命中才 alloc」抽在 stdlib-only 的
-`detect_buffers.py`，`torch.empty` 由 `Models.py` 注入，因此缓存命中/失效、
-跨 worker 隔离都能离线做行为测试。每组缓冲挂在已有的
-`_retinaface_buffers_tls` 上——各 worker 的 stream 并发推进，共享会让 ORT 的
-写入互相踩；同一 worker 内则是安全的，`rf_postprocess` 读完这一帧后下一帧的
-写入才排到它后面。
-
-默认**关闭**，不传开关时 `_detect_retinaface_inner` 逐字走原来每帧 9 次
-`torch.empty` 的路径（AST 测试钉住这条 fallback）。`--backend trt` 下判定逻辑
-会自动关闭复用：TRT-EP 的 `io_binding` 输出行为未经真机核对，不猜。
-
-**真机已验证**：10 秒 / 250 帧 `workers=2` 下逐帧 PSNR=`inf`（说明 ORT
-每帧完整覆写复用缓冲）、帧数与音画正常；但吞吐无可测量收益（62.6s /
-4.0 fps vs 基线 60.9s / 4.1 fps）。默认保持关闭，不传开关即回滚。
-
-#### 阶段 7：帧路径零拷贝归一化（少一次整帧 memcpy）
-
-帧路径上有多处 `frame.astype("uint8")`：numpy 的 `astype` 默认 `copy=True`，
-哪怕输入已经是 `uint8` 且 C contiguous，也会**无条件**复制一整帧。PyAV 的
-`to_ndarray(format="rgb24")`（H2D 侧）与 `_finalize_frame` 的 D2H 结果恰好常
-常已经满足这两个条件。1080p RGB 单侧约 6.2 MB，H2D + D2H 两侧合计约
-12.4 MB/帧，60 秒 30fps 就是约 22 GB 纯内存带宽——不碰 GPU 计算，也不改一个
-像素。
-
-```bash
-python -m faceswapper.cli --models ./models video \
-    --source face.jpg --target input.mp4 --output output.mp4 \
-    --zero-copy-frames
-```
-
-判定抽在 stdlib-only 的 `frame_upload.py`：`normalize_plan()` 只吃 `dtype` /
-`c_contiguous` / `height` / `width` / 闸门，返回 `FramePlan`（是否要复制、省下
-的字节数、原因）。生产代码读取 `rgb.dtype.name` 与
-`rgb.flags.c_contiguous` 后按 plan 决定直接复用原数组，或用
-`np.ascontiguousarray(..., dtype=np.uint8)` 一次完成转换 + 整理。模块本身不
-import numpy，因此闸门关闭、命中、dtype 不符、布局不连续、字节预算都能离线
-做真行为测试。
-
-共接了 5 个调用点：`VideoManager._swap_video_inner` 的 CPU numpy H2D 分支，
-以及 `headless.py` 的 `source_embedding()`、`_detect_face_slots()`、
-`ImageSwapper.swap()`、`_finalize_frame()`。跳过复制时返回的是与输入共享内存
-的数组，调用方只把它交给同步的 `torch.from_numpy(...).to("cuda")` /
-`VideoFrame.from_ndarray`，不会原地写它；PyAV 每帧 `to_ndarray` 都产出新数组，
-不存在跨帧复用。
-
-默认**关闭**：闸门关闭时所有 `astype` 表达式逐字保留（AST 测试钉住 H2D 分支
-与 `_frame_to_uint8` 两条 fallback）。开启后也不改像素——dtype 或布局不满足时
-仍照旧复制，只是不再对已经合格的帧做无用功。
-
-**真机已验证**：10 秒 / 250 帧 `workers=2` 下逐帧 PSNR=`inf`（dtype /
-layout 判定与实际内存一致）、帧数与音画正常；但吞吐无可测量收益（63.3s /
-3.9 fps vs 基线 60.9s / 4.1 fps）。`nsys` 显示 H2D + D2H memcpy 合计仅
-0.243s / 36s，收益上限 <1%。默认保持关闭，不传开关即回滚。
+> `--workers > 1` 时不要通过 `--params` 打开 GUI 时代的 `OrientAutoSwitch`
+> （跨帧状态会竞态）。5.2 节默认开启的整帧朝向兜底**不在此列**，它逐帧
+> 无状态，可与 `--workers 2` 一起用。
 
 #### GPU 基线验收脚本
 
-方案 3.4 的 `workers=1/2/4` 矩阵已封装成 `tools/bench_gpu.py`，**默认
-dry-run**（只打印命令，不碰 GPU、不写文件），加 `--run` 才真正执行：
+`workers=1/2/4` 矩阵封装成 `tools/bench_gpu.py`，**默认 dry-run**（只打印
+命令，不碰 GPU），加 `--run` 才执行：
 
 ```bash
 python tools/bench_gpu.py --source face.jpg --target in.mp4
@@ -1076,29 +832,11 @@ python tools/bench_gpu.py --source face.jpg --target in.mp4 --run \
     --workers 1,2,4 --monitor-gpu --check-frames --psnr
 ```
 
-脚本会采集 `elapsed` / `avg fps` / `--profile` 三段耗时、GPU 利用率与显存
-曲线、`ffprobe` 帧数，并以 `workers=1` 为回归基线算加速比和逐帧 PSNR，
-结果写到 `bench-out/bench_report.json`。`--extra-flag` 可透传任意开关做 A/B
-（每个 token 单独给一次，例如 `--extra-flag=--encode-thread`）。命令构造与
-输出解析在 `faceswapper/bench_plan.py`，有离线行为测试，因此在没有 GPU 的
-机器上也能安全地预览与自检。报告现在会把逐帧 PSNR 的 `average` 数值写成
-`psnr_average` 字段；`--monitor-gpu` 用 `nvidia-smi dmon -s um` 采样。
-
-脚本已在 Tesla T4 上跑通 10 秒矩阵（两轮）、30 秒 / 750 帧正式基线，
-以及阶段 2 / 3 / 6 / 7 的 A/B；w2 / w4 对 `workers=1` 的 PSNR 均为
-`inf`（逐像素一致）。正式基线 `workers=1/2/4` 为 `3.3 / 5.0 / 5.4 fps`
-（加速比 `1.0 / 1.50 / 1.63`）。**真机结论**：除 `--workers 2` 外，
-编码独立线程、延迟 D2H、detector 缓冲复用、帧零拷贝均无可测量收益，
-NVENC 在本环境不可用，不建议开启这些开关；`nsys` 已把瓶颈定位到逐脸
-ORT Run 与 `cudaStreamSynchronize`。后续又验证了 P0（动态 batch 模型可
-本地构造且数值等价，但 7.1 batch 路径 PSNR 仅 45.69 dB）与 P2
-（`torchcodec 0.17` 与 `torch 2.10` ABI 不匹配，GPU 解码不可用）。
-完整数字、结论与剩余待办见
-[docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md) 的
-「第二 / 第三轮真机数据」两节。
-
-完整的分阶段实施方案（现状瓶颈、详细实现步骤、验收清单、风险与回滚）见
-[docs/gpu-utilization-plan.md](docs/gpu-utilization-plan.md)。
+采集 `elapsed` / `avg fps` / `--profile` 三段、GPU 利用率与显存、`ffprobe`
+帧数，以 `workers=1` 为基线算加速比与逐帧 PSNR，报告写
+`bench-out/bench_report.json`。`--extra-flag` 可透传任意开关做 A/B（每个
+token 单独给一次，例如 `--extra-flag=--recognize-mirror`）。命令构造与解析在
+`faceswapper/bench_plan.py`，无 GPU 也能离线自检。
 
 #### 完成后的总用时
 
@@ -1177,9 +915,13 @@ python -m faceswapper.cli \
 | `--recognize-mirror` | 识别时把裁剪图水平镜像再各跑一次 ArcFace、取平均，压低侧脸 embedding 方差；识别推理 x2 | 关闭 |
 | `--recognize-dim2` | 识别用 2×2 网格平均（4 个裁剪各跑一次 ArcFace 取平均）；识别推理 x4 | 关闭 |
 | `--detect-retry` | 0 检出帧自动重试一次：检测输入升到 960、分数阈值 +20；只对漏检帧追加推理，`OrientAutoSwitch` 开启时自动让位 | 关闭 |
-| `--no-auto-orient` | 关闭整帧朝向兜底。默认**开启**：0 检出帧自动试 90/180/270 度、转正后重新检测换脸，专治手机竖拍 / 横竖颠倒的视频；正常帧零额外开销。详见 5.7 节 | 关闭（即兜底开启） |
+| `--detect-retry-quality [SPEC]` | 把 `--detect-retry` 放宽到「检出了但不可靠」的一正一侧混合帧。`SPEC` = `MIN_CONF:MIN_KPS_QUALITY`，省略值用默认 `0.60:0.50`（**两个阈值都需真机标定**）。判据是本帧最高 confidence 过低或 5 点构型质量过低（旋转不变，不受歪头污染）；重检结果按 5 点 RMS 去重后**只追加不替换**。默认不传 = 旧行为逐像素不变；需配合 `--detect-retry` | 不传（关闭） |
+| `--no-auto-orient` | 关闭**默认开启**的整帧朝向兜底（0 检出帧试 90/180/270 度、转正后换脸，正常帧零开销），用于回滚 / A-B。见 5.2 | 关闭（即兜底开启） |
+| `--probe-angles STEP` | 朝向探测的角度步长：`45` = 8 向、`22.5` = 16 向、`90` = 4 向（须整除 360）。用于**脸在画面内大角度 roll 导致 detector 漏检**：显式传入后只旋转检测副本、不旋转用于换脸的原帧，5 点 kps 逆映射回原帧坐标，输出尺寸不变。默认不传 = 旧的整帧旋转路径，逐像素行为不变。只在 0 检出帧触发，8 向最多多跑 7 次检测 | 不传（旧路径） |
+| `--probe-on-target-miss` | 指定 `--target-face` 且本帧已有脸、却没有任何一张匹配上目标人物时，补做多向探测并跨角度合并去重（5 点 RMS 去重、0° 检出优先保留，只追加不替换）。未给 `--probe-angles` 时补探测按 8 向；仅对帧内 ≤3 张脸的帧触发，0 检出帧仍由原兜底负责。**目标人物不在画面里的帧也会触发**，成本可能显著上升，建议先 A-B | 关闭 |
 | `--recognizer` | B3：识别权重。`w600k_r50`（默认）或 `glintr100`（ResNet100 ArcFace，侧脸/难样本相似度更稳）；识别推理 x4，需下载 `glintr100.onnx` | `w600k_r50` |
 | `--align` | B4：识别对齐。`5-point`（默认，检测 5 点直接算相似变换）或 `68-point`（2dfan4 检 68 点后取两眼/鼻/嘴角再变换，侧脸裁剪更准）；识别前多一次推理，需下载 `2dfan4.onnx` | `5-point` |
+| `--align-for-swap [MIN_SIDENESS]` | 把识别阶段已算出的 68 点派生 5 点**复用到 `swap_core` 的替换几何**（`SimilarityTransform` 与 `paste_back` 一起跟随），修 L3「侧脸换上去但贴歪」。可接侧度阈值（默认 `0.35`，需真机标定）：用旋转不变的 `yaw_sideness` 判定，只有大 yaw 帧启用，正脸帧保持原 kps 逐像素不变；另加 68 点几何质量门，遮挡导致 68 点不自洽时自动回退。**强制要求 `--align 68-point` 与 `--target-face`**（否则明确报错），仅 video 路径；不传 = 旧行为，无额外推理 | 不传（关闭） |
 
 > **`--detect-input-size` 不要随便调小。** 它只影响检测器输入分辨率，
 > 不影响换脸质量——调小是纯速度交易：`480` ≈ 1.8× 快，`416` ≈ 2.4×，
@@ -1487,185 +1229,67 @@ python tools/install.py cu126
 
 ---
 
-## 5. 侧脸问题：原因与解决方法
+## 5. 侧脸与旋转
 
-> **状态（2026-11-07）：本章方案已全部实施**，每个开关默认关闭，不传即与
-> 原行为逐像素一致（PSNR=`inf`），可单独或组合开启做 A/B。真机量化数据
-> 待跑（方法见 5.5）。
+> 2026-11-07 落地。除 5.2 的整帧朝向兜底**默认开启**外，本章开关全部默认
+> 关闭，不传即逐像素一致（PSNR=`inf`）。**真机收益数据仍待跑**，下表是开关
+> 与命令，不是已验证的收益承诺。
 
-### 5.1 侧脸为什么差
+先分清三种「转」：脸在画面里**歪着**（roll）不用管，5 点相似变换天然吸收；
+脸**侧过去**（yaw）用 5.1；**整个画面**被转了 90 度（手机竖拍 / 横竖颠倒）
+用 5.2，默认自动处理。
 
-侧脸（大偏航角）质量差来自**两个独立环节**，对应的开关也不同：
+### 5.1 侧脸：症状 → 命令
 
-| 环节 | 问题 | 物理原因 | 对应开关 |
-|---|---|---|---|
-| **检测** | 该换的脸没被换掉 | RetinaFace 对大偏航角召回下降；小脸在 640 输入的特征图上只剩几个像素 | `--detect-input-size`、`--detect-retry` |
-| **识别** | 该匹配的人没匹配上（`--target-face` 路径），或换上去的身份带姿态偏差 | ArcFace 训练集以正脸为主；`recognize()` 的 5 点相似变换对齐在侧脸上裁剪形变严重，embedding 方差大 | `--recognize-mirror`、`--recognize-dim2`、`--recognizer`、`--align`、`--pose-compensation` |
+| 症状 | 追加开关 | 代价 |
+|---|---|---|
+| 该换的帧没换（漏检） | `--detect-input-size 960`，再加 `--detect-retry` | 960² ≈ 2.25× 640² 检测耗时；retry 只对 0 检出帧多一次检测 |
+| 指定 `--target-face` 时匹配不上 / 换错人 | `--recognize-mirror --pose-compensation 15` 起步 | 识别 ×2；正脸阈值不变，越侧越松 |
+| 还不够 | 再加 `--recognize-dim2`、`--recognizer glintr100`、`--align 68-point` | 识别 ×4 / ×4 / +1 次 landmark；后两者按需下载模型 |
+| 源图本身是侧脸 | `--merge Qual`（多源时）+ 上面的识别开关 | — |
 
-**共同约束**：所有方案都不降低 `--detect-score` 阈值——降阈值以误检为代价
-（误检在换脸路径上意味着把背景当脸换掉），不可接受。下面每个开关都只在
-"本来会漏"的帧/脸上追加工作，正脸路径不受影响。
-
-### 5.2 检测环节：把侧脸找回来
-
-#### `--detect-input-size 800/960`（A3，确定性收益）
-
-侧脸+小脸在 640 输入的特征图上像素太少，是召回下降的物理来源。加大输入
-分辨率后阈值不变，难样本更容易**过**阈值，误检基本持平。
+开关正交、可组合。**不要降 `--detect-score`**：降阈值换来的误检会把背景
+当脸换掉。视频未指定 `--target-face` 时逐帧识别整体被跳过，识别类开关此时
+没有额外成本。
 
 ```bash
-python -m faceswapper.cli --models ./models video \
-    --source face.jpg --target input.mp4 --output output.mp4 \
-    --detect-input-size 960
-```
-
-代价：960² ≈ 2.25× 640² 的检测耗时，只影响检测不影响换脸管线。
-
-#### `--detect-retry`（B2，只对漏检帧追加推理）
-
-0 检出帧自动重试一次：检测输入升到 960、分数阈值 +20 再检一次。只在
-本来不会换脸的帧上追加推理；GUI 时代的 `OrientAutoSwitch` 开启时自动
-让位。顺序上排在 5.7 节的整帧朝向兜底之后：先解决画面方向，仍检不到脸
-才轮到升分辨率，所以横竖颠倒的素材不会把这次推理浪费在横躺图上。
-
-```bash
-python -m faceswapper.cli --models ./models video \
-    --source face.jpg --target input.mp4 --output output.mp4 \
-    --detect-retry
-```
-
-### 5.3 识别环节：把侧脸认出来
-
-识别精度有四条独立改进，全部正交，可组合：
-
-#### `--recognize-mirror`（A2，识别 ×2）
-
-ArcFace 对水平镜像各自有偏差但不相关：原图与镜像各跑一次识别、取平均，
-embedding 方差更小，对左右不对称的侧脸收益最明显。
-
-#### `--recognize-dim2`（A4，识别 ×4）
-
-识别用 2×2 网格平均：4 个 112×112 裁剪各跑一次 ArcFace 取平均。侧脸的
-5 点对齐有系统偏差，单一裁剪容易把特征区切偏，多裁剪平均是现成的对冲。
-与 `--recognize-mirror` 正交（都开是 8 次推理）。
-
-#### `--recognizer glintr100`（B3，识别 ×4）
-
-换识别权重：ResNet100 ArcFace（glintr100）替代默认的 ResNet50
-（w600k_r50），接口完全一致（5 点、112×112、512 维），侧脸/难样本相似度
-更稳。模型来自社区 ONNX 转出（sha256 校验），选中后自动按需下载，也可
-先手动 `download-models --model arcface100`。
-
-#### `--align 68-point`（B4，识别前多一次 landmark 推理）
-
-对齐方式从"检测 5 点直接算相似变换"升级为：2dfan4 检 68 点 landmark，
-取两眼均值/鼻尖/两嘴角（FaceFusion `convert_to_face_landmark_5` 的索引）
-再进同一 5 点模板——对极端侧脸，68 点算出的裁剪比检测器给的 5 点准。
-模型为 FaceFusion 官方 release（crc32 校验），选中后自动按需下载，也可
-先手动 `download-models --model landmark68`。
-
-#### `--pose-compensation`（B1a+B1b，匹配阈值补偿）
-
-上面四条让侧脸的 embedding 更稳，但侧脸与正脸的相似度仍有系统性偏低。
-`--pose-compensation N` 按每张检测脸关键点的**正脸度**线性下调
-`--target-threshold` 判定线：正脸帧阈值不变（不增加误换风险），越侧越松，
-全侧脸最多低 N 分；参考图自身的姿态也参与配对补偿（B1b）。无跨帧状态，
-多 worker 乱序安全。
-
-```bash
-# 组合示例：侧脸视频，匹配 + 识别全开
+# 侧脸 + 指定人：识别与匹配全开
 python -m faceswapper.cli --models ./models video \
     --source face.jpg --target-face person.jpg \
     --target input.mp4 --output output.mp4 \
     --recognize-mirror --recognize-dim2 \
-    --recognizer glintr100 --align 68-point \
-    --pose-compensation 15
+    --recognizer glintr100 --align 68-point --pose-compensation 15
 ```
 
-### 5.4 推荐用法
+### 5.2 整帧旋转：默认自动扶正
 
-| 场景 | 建议开关 |
-|---|---|
-| 侧脸漏检（该换的帧没换） | `--detect-input-size 960 --detect-retry` |
-| 侧脸匹配不上 / 换错人（`--target-face` 路径） | `--recognize-mirror --pose-compensation 15` 起步，不够再加 `--recognize-dim2`、`--recognizer glintr100`、`--align 68-point` |
-| 源图本身是侧脸 | `--merge Qual`（多源时）+ 识别四开关 |
-| 先验证收益方向（零成本） | `--detect-input-size 960 --recognize-mirror --pose-compensation 10` |
-
-推理开销只落在识别/检测实际运行的路径上：视频未指定 `--target-face` 时
-逐帧识别整体被跳过，此时 `--recognize-*` / `--align` 没有额外成本。
-
-### 5.5 验收方法
-
-- **基线与 A/B**：`tools/bench_gpu.py --run --psnr` 跑通基线后，用
-  `--extra-flag` 透传新开关，对同一段侧脸素材量化。
-- **识别质量**：带 `--target-face` 的视频上统计"target 脚本命中帧率"
-  （命中数/总帧数，日志已有相似度判定点）；纯图片用 `inspect` 的检出数
-  与换脸结果的目测比对。
-- **回归底线**：本章各侧脸开关默认关闭，不传即与现行为逐像素一致
-  （PSNR=`inf`），与 3.3 节各实验开关同一验收纪律。唯一默认开启的是 5.7
-  节的整帧朝向兜底，它只在第一遍 0 检出的帧上追加推理，正常帧逐像素不变。
-
-### 5.6 曾考虑但放弃的方案
-
-| 方案 | 放弃原因 |
-|---|---|
-| 降低 `--detect-score` | 以误检为代价（把背景当脸换掉），不可接受 |
-| 跨帧 embedding 回拉（用最正帧的 embedding 回拉侧脸帧） | 帧间状态让输出依赖调度顺序（2N 乱序窗口），破坏 workers=1 逐像素回归底线，收益仅省每帧一次 512 维点积 |
-| 在 `--detect-retry` 里叠 4 朝向试探 | 已由 5.7 节的逐帧无状态朝向兜底独立实现：整帧转正后检测、识别、换脸都在旋转域跑完，不需要 kps 逆映射。两者职责分开，`--detect-retry` 只管分辨率 |
-| 3D 对齐（B4 备选） | 没有上游规范模板（insightface 官方识别对齐只用 5 点），68 点路径已是已验证的生产做法 |
-| 106 点对齐（2d106det，B4 原方案） | 调研后确认不存在规范的 106 点 ArcFace 对齐模板，改为 FaceFusion 的 2dfan4 68 点路径 |
-
-### 5.7 整帧旋转视频：自动朝向兜底（默认开启）
-
-> **状态（2026-11-07）：代码已落地，真机未验证**（本地无 GPU 栈）。
-
-手机竖拍、横竖颠倒、剪辑时转过 90° 的素材里，RetinaFace 对横躺脸的召回
-显著下降——表现是整段「该换的脸没被换掉」。这跟 5.1 节的侧脸是两回事：
-侧脸是人脸姿态，这里是**整个画面**的方向。
-
-GUI 时代留下的 `OrientAutoSwitch` 本来能做 4 向探测，但它默认关闭、没有
-命令行开关（只能靠 `--params saved_parameters.json`），而且跨帧状态在
-`--workers > 1` 下会竞态、眼轴倾角 EMA 产生的非 90° 角度会让
-`rotate(..., expand=True)` 的正逆两次调用把画布越滚越大。所以这里换成一套
-**逐帧无状态**的兜底，默认开启：
-
-1. 先按原样做一次检测。**只要检出脸就结束**——正常视频零额外推理、
-   零旋转，输出逐像素不变。
-2. 只有 0 检出的帧才依次试 `90/180/270`，取检出脸数最多的角度（平手取
-   最小角度；全部为 0 就保持原帧，不冒误检风险）。
-3. 命中后把整帧转正，检测、识别、换脸**都在旋转域里跑完**，最后整帧逆旋
-   回原尺寸。kps 全程留在旋转域，不需要逆映射。
-4. 仍未检出时，`--detect-retry`（若开启）再按原来的升档逻辑重试一次。
-
-三个刻意的设计约束：
-
-| 约束 | 原因 |
-|---|---|
-| 只用 90° 倍数 | `expand=True` 的 H×W → W×H → H×W 严格可逆，输出帧尺寸不变，编码器（写死输入宽高）不会收到变尺寸的帧；也避开了正旋 BILINEAR / 逆旋 NEAREST 的插值不对称——90° 倍数下两者都是纯索引重排 |
-| 不跨帧保存状态 | 2N 有序窗口下帧会跨 worker 乱序完成，任何缓存角度 / EMA 都会让输出依赖调度顺序；因此 `--workers 2` 与它不冲突 |
-| 不做亚 90° 微调 | 歪头（平面内 roll）由 `recognize()` 的 5 点相似变换天然吸收，不需要动整帧 |
-
-开销只落在漏检帧：最多 3 次额外检测 + 1 次重检 + 2 次整帧旋转。**空镜头多
-（片头、转场、无人脸画面）的素材会逐帧重复这笔开销**——这是「不跨帧缓存
-角度」换来的确定性代价，GUI 时代的状态机便宜但会让输出依赖调度顺序。
-另外判定只看「检出脸数最多」，极端误检画面理论上可能选出错误朝向；发现
-误转可用 `--no-auto-orient` 关掉，或抬高 `--detect-score`。GUI 时代的
-`OrientAutoSwitch` / `OrientSwitch` 若通过 `--params` 显式打开，兜底会自动
-让位，不会出现两次旋转叠加。
+画面整体转过 90/180/270 度时 RetinaFace 对横躺脸召回下降，表现为整段「该换
+的脸没换掉」。现在**默认处理，无需任何参数**：
 
 ```bash
-# 默认就是开启的，不需要额外参数
+# 旋转视频：命令与最小命令完全一样
 python -m faceswapper.cli --models ./models video \
-    --source face.jpg --target rotated90.mp4 --output out.mp4 --workers 2
+    --source face.jpg --target rotated90.mp4 --output out.mp4
 
-# 回滚 / 做 A/B：关掉兜底
-python ... --no-auto-orient
+# 回滚 / A-B：关掉兜底
+python -m faceswapper.cli --models ./models video \
+    --source face.jpg --target rotated90.mp4 --output out.mp4 \
+    --no-auto-orient
 ```
 
-**验收（待真机）**：拿一段 90° 旋转素材跑「默认 vs `--no-auto-orient`」，
-比对换脸命中帧数与 `ffprobe` 的输出宽高；再用同一段正着放的素材确认
-默认路径 PSNR=`inf`。离线测试只覆盖了决策逻辑与接线，GPU 侧的旋转几何
-没有跑过。
+机制：第一遍检出脸就结束（正常帧零额外推理、零旋转）；只有 0 检出的帧才试
+90/180/270，取检出脸数最多的角度转正，检测、识别、换脸在旋转域跑完再整帧
+逆旋回来。只用 90 倍数 → 帧尺寸不变、插值不影响画质；不跨帧存状态 → 与
+`--workers 2` 不冲突、输出不依赖调度顺序。GUI 时代的 `OrientAutoSwitch`
+若通过 `--params` 显式打开，兜底会让位，不会叠加两次旋转。
+
+代价与风险：漏检帧最多多 3 次检测 + 1 次重检 + 2 次整帧旋转，空镜头多的
+素材会逐帧重复这笔开销；判定只看检出脸数，极端误检画面可能选错朝向，此时
+用 `--no-auto-orient` 关掉或抬高 `--detect-score`。
+
+**验收（待真机）**：`tools/bench_gpu.py --run --psnr` 配合 `--extra-flag`
+做「默认 vs `--no-auto-orient`」A/B，比对命中帧数、`ffprobe` 输出宽高，以及
+正着放素材的 PSNR=`inf`。GPU 侧旋转几何尚未跑过。
 
 ---
 

@@ -33,6 +33,8 @@ from faceswapper.encoder_probe import EncoderPlan, resolve_encoder
 from faceswapper.errors import HeadlessError
 from faceswapper.frame_order import ordered_swap_frames
 from faceswapper.frame_upload import normalize_plan
+from faceswapper.detect_retry import parse_retry_quality
+from faceswapper.orientation import parse_probe_angles
 from faceswapper.Models import Models
 from faceswapper.VideoManager import VideoManager
 
@@ -87,6 +89,19 @@ class SwapOptions:
     # 整帧朝向兜底的回滚开关。True = 关闭兜底（旧行为）。默认 False 即开启：
     # 只在 0 检出帧试 90/180/270 度，转正后重新检测换脸，正常帧零额外开销。
     no_auto_orient: bool = False
+    # --probe-angles：朝向探测的角度步长字符串。None = 旧的整帧旋转路径
+    # （逐像素行为不变）；"45" / "22.5" = 只旋转检测副本的 8/16 向路径。
+    # 放在 SwapOptions 里，VideoOptions 继承后 image / video 都能用。
+    probe_angles: str | None = None
+    # --probe-on-target-miss：有 --target-face 且本帧已有脸却没匹配上目标
+    # 人物时补做多向探测 + 合并去重。默认关闭，正常帧零额外推理。
+    probe_on_target_miss: bool = False
+    # --detect-retry-quality：原始 "MIN_CONF:MIN_KPS_QUALITY" 字符串。
+    # None = 关闭（旧行为）；解析在 _SwapperBase 里做，非法值提前失败。
+    detect_retry_quality: str | None = None
+    # --align-for-swap：原始 MIN_SIDENESS 字符串。None = 关闭（旧行为）。
+    # 前置校验（--align 68-point / --target-face）在 _SwapperBase 里做。
+    align_for_swap: str | None = None
 
 
 def _read_image(path: str) -> np.ndarray:
@@ -208,6 +223,35 @@ class _SwapperBase:
         self.vm.auto_orient_fallback = not bool(
             getattr(options, "no_auto_orient", False)
         )
+        # None = 逐字保留旧的整帧旋转路径。非法步长在这里就抛 ValueError，
+        # 不让它拖到逐帧热路径里才失败。
+        self.vm.probe_angles = parse_probe_angles(
+            getattr(options, "probe_angles", None)
+        )
+        self.vm.probe_on_target_miss = bool(
+            getattr(options, "probe_on_target_miss", False)
+        )
+        self.vm.detect_retry_quality = parse_retry_quality(
+            getattr(options, "detect_retry_quality", None)
+        )
+        # --align-for-swap 必须复用识别阶段已算出的 68 点结果，所以两个
+        # 前置缺一不可：没有 68-point 就没有 2dfan4 输出；没有 target-face
+        # 时 should_skip_recognize 会跳过逐脸识别，连识别都不会跑。
+        align_swap_spec = getattr(options, "align_for_swap", None)
+        if align_swap_spec is not None:
+            if str(getattr(options, "align_type", "5-point")) != "68-point":
+                raise HeadlessError(
+                    "--align-for-swap 需要 --align 68-point：5-point 模式下"
+                    "没有 2dfan4 的 68 点结果可复用"
+                )
+            if not list(getattr(options, "target_person_paths", []) or []):
+                raise HeadlessError(
+                    "--align-for-swap 需要 --target-face：未指定目标人物时"
+                    "逐脸识别被跳过，没有 68 点结果可用"
+                )
+            self.vm.align_for_swap = float(align_swap_spec)
+        else:
+            self.vm.align_for_swap = None
         self._apply_parameters()
 
     # -- 生命周期 ------------------------------------------------------------

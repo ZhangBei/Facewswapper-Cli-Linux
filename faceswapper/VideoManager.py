@@ -14,10 +14,16 @@ from faceswapper.cross_frame_batch import (
     run_cross_frame_batch,
 )
 from faceswapper.face_batch import FaceCandidate, batch_eligibility
-from faceswapper.detect_retry import retry_plan
+from faceswapper.detect_retry import (
+    align_kps_for_swap, kps_quality, retry_plan,
+)
 from faceswapper.frame_upload import normalize_plan
 from faceswapper.frontal_match import effective_threshold_pair
-from faceswapper.orientation import PROBE_ANGLES, choose_angle, should_probe
+from faceswapper.orientation import (
+    PROBE_ANGLES, choose_angle, should_probe,
+    invert_affine, map_kps_back, normalized_grid_matrix, rotation_affine,
+    merge_probe_landmarks, parse_probe_angles, should_probe_on_miss,
+)
 from faceswapper.recognize import should_skip_recognize
 
 
@@ -25,6 +31,7 @@ import onnxruntime
 import torchvision
 from torchvision.transforms.functional import normalize # 迁移到 v2
 import torch
+import torch.nn.functional
 from torchvision import transforms
 torchvision.disable_beta_transforms_warning()
 from torchvision.transforms import v2
@@ -187,6 +194,24 @@ class VideoManager():
         # 由 headless._SwapperBase 按 options.no_auto_orient 注入。
         self.auto_orient_fallback: bool = True
 
+        # --probe-angles 的探测轴。None = 旧的整帧旋转路径（默认，逐像素
+        # 行为不变）；显式传参后由 headless 注入 (45,90,...,315) 之类，
+        # 走「只旋转检测副本」路径。无跨帧状态，workers > 1 下安全。
+        self.probe_angles: tuple[float, ...] | None = None
+
+        # --probe-on-target-miss：指定 --target-face 且本帧有脸却没匹配上
+        # 目标人物时，补做多向探测并合并去重。默认关闭，正常帧零额外推理。
+        # 由 headless._SwapperBase 按 options 注入。
+        self.probe_on_target_miss: bool = False
+
+        # --detect-retry-quality：解析后的 (min_conf, min_kps_quality)；
+        # None = 关闭，旧行为逐字不变。由 headless._SwapperBase 注入。
+        self.detect_retry_quality: tuple[float, float] | None = None
+
+        # --align-for-swap：大 yaw 帧启用 68 点派生 kps 的侧度阈值。
+        # None = 关闭，旧行为逐字不变。由 headless._SwapperBase 注入。
+        self.align_for_swap: float | None = None
+
         # 每帧性能缓存。_blur_cache 在所有 worker 线程间共享
         # （transforms.GaussianBlur 一旦构造完就是无状态的；dict.get +
         # 赋值是 GIL 原子的，所以重复构建的竞争无害）。
@@ -322,6 +347,126 @@ class VideoManager():
             cache[name] = t
         return t
 
+    def _rotate_detect_copy(self, img, angle):
+        """生成一份旋转检测副本，返回 ``(probe_img, inv_A)``。
+
+        ``img`` 是 (3,H,W) uint8 CUDA tensor，全程不被修改。旋转用
+        ``orientation.rotation_affine`` 自构造的 A 配 affine_grid +
+        grid_sample，所以 A 的逆就是 kps 的回程，不需要去猜（或在 GPU 上
+        现场标定）torchvision rotate 的矩阵——那是原方案唯一没法离线
+        验证的环节。副本由调用方逐个生成、检测完立刻释放，避免同时留
+        多张全尺寸 CHW tensor 在显存里（workers > 1 时这份开销会乘以
+        worker 数）。
+        """
+        src_hw = (int(img.shape[1]), int(img.shape[2]))
+        A, dst_hw = rotation_affine(float(angle), src_hw)
+        inv_A = invert_affine(A)
+        theta = normalized_grid_matrix(inv_A, src_hw, dst_hw)
+        theta_t = torch.tensor(
+            [list(theta[0]), list(theta[1])],
+            dtype=torch.float32, device=img.device,
+        ).unsqueeze(0)
+        grid = torch.nn.functional.affine_grid(
+            theta_t, [1, 3, dst_hw[0], dst_hw[1]], align_corners=False,
+        )
+        probe = torch.nn.functional.grid_sample(
+            img.unsqueeze(0).to(torch.float32), grid,
+            mode='bilinear', padding_mode='zeros', align_corners=False,
+        )
+        return probe.squeeze(0).to(torch.uint8), inv_A
+
+    def _collect_angle_candidates(self, img, angles, detect_mode,
+                                  detect_score, detect_input_size):
+        """逐个生成旋转检测副本，返回 ``[(angle, kpss_frame, scores)]``。
+
+        ``kpss_frame`` 全部是原帧坐标（``map_kps_back`` 之后）；scores 供
+        跨角度合并去重排序。副本逐个生成、检测完立刻释放，不把多张全尺寸
+        CHW tensor 同时留在显存里（workers > 1 时这份开销会乘以 worker 数）。
+        """
+        candidates = []
+        for angle in angles:
+            probe_img, inv_A = self._rotate_detect_copy(img, angle)
+            kpss_rot, scores = self.models.run_detect(
+                probe_img, detect_mode, max_num=10,
+                score=detect_score, input_size=detect_input_size,
+                with_scores=True,
+            )
+            candidates.append((angle, map_kps_back(kpss_rot, inv_A), scores))
+            del probe_img
+        return candidates
+
+    def _probe_on_target_miss(self, img, ret, detect_mode, detect_score,
+                              detect_input_size, already_rotated):
+        """目标人物本帧未匹配上时补做多向探测，只把新增脸追加到 ``ret``。
+
+        匹配判定与下面 swap 循环里的 ``any(>=)`` 语义保持一致（含姿态
+        补偿），改动其一需同步。0 度第一遍检出永远保留，补回的脸只追加
+        不替换；新增脸补齐 embedding 后照常走原有的目标脸筛选。
+        """
+        targets = self.target_face_embeddings
+        if not targets:
+            return ret
+        ref_kps_list = self.target_face_ref_kps
+        if ref_kps_list is None or len(ref_kps_list) != len(targets):
+            ref_kps_list = [None] * len(targets)
+
+        def matched(face_kps, face_emb):
+            if face_emb is None:
+                return False
+            return any(
+                self.findCosineDistance(face_emb, target)
+                >= effective_threshold_pair(
+                    face_kps, kps_ref,
+                    self.target_face_threshold,
+                    self.target_face_pose_compensation,
+                )
+                for target, kps_ref in zip(targets, ref_kps_list)
+            )
+
+        matched_any = any(matched(face_kps, face_emb)
+                          for face_kps, face_emb in ret)
+        if not should_probe_on_miss(
+            enabled=self.probe_on_target_miss,
+            has_targets=bool(targets),
+            detected=len(ret),
+            matched_any=matched_any,
+            already_rotated=already_rotated,
+        ):
+            return ret
+
+        angles = self.probe_angles
+        if angles is None:
+            # 没给 --probe-angles 时补探测按 8 向；0 检出帧仍走旧整帧路径，
+            # 两者互不干扰。
+            angles = parse_probe_angles("45")
+        candidates = self._collect_angle_candidates(
+            img, angles, detect_mode, detect_score, detect_input_size,
+        )
+        added = merge_probe_landmarks(
+            [face_kps for face_kps, _ in ret], candidates, max_faces=10,
+        )
+        if not added:
+            return ret
+        dim = 2 if self.recognize_dim2 else 1
+        for face_kps in added:
+            kps_array = np.asarray(face_kps, dtype=np.float32)
+            face_emb, _ = self.models.run_recognize(img, kps_array, dim=dim)
+            ret.append([kps_array, face_emb])
+        return ret
+
+    def _kps_for_swap(self, face_kps, align_kps_map):
+        """--align-for-swap：查旁路映射后交给 stdlib 纯决策函数。
+
+        ``ret`` 刻意保持 2 元素结构，68 点结果走 ``id(face_kps)`` 映射表
+        旁路传递；决策本身（侧度门 + 68 点质量门）在
+        ``detect_retry.align_kps_for_swap`` 里，可离线做行为测试。
+        """
+        if self.align_for_swap is None:
+            return face_kps
+        return align_kps_for_swap(
+            face_kps, align_kps_map.get(id(face_kps)), self.align_for_swap,
+        )
+
     def probe_orientation(self, img, detect_mode, detect_score, input_size=640):
         """依次试 [0, 90, 180, 270] 四个旋转角，选 detector 找到脸最多的那个朝向。
         平手时取 0（角度最小的候选），所以证据不足时我们倾向于不旋转。
@@ -446,7 +591,17 @@ class VideoManager():
             img = v2.functional.rotate(img, angle=applied_angle, interpolation=v2.InterpolationMode.BILINEAR, expand=True)
 
         # 找出画面里所有的脸，返回 5 点 kpss 列表
-        kpss = self.models.run_detect(img, detect_mode, max_num=10, score=detect_score, input_size=detect_input_size)
+        # 只有打开质量门控重检时才多要一份 confidence；不传开关时
+        # run_detect 的返回类型与旧版逐字一致。
+        need_scores = self.detect_retry_quality is not None
+        detect_result = self.models.run_detect(
+            img, detect_mode, max_num=10, score=detect_score,
+            input_size=detect_input_size, with_scores=need_scores,
+        )
+        if need_scores:
+            kpss, det_scores = detect_result
+        else:
+            kpss, det_scores = detect_result, None
 
         # 整帧朝向兜底（默认开启，--no-auto-orient 关闭）：只在第一遍 0
         # 检出的帧上试 90/180/270，命中后把整帧转正重新检测。正常视频
@@ -462,50 +617,114 @@ class VideoManager():
                 or applied_angle != 0.0
             ),
         ):
-            counts = {}
-            for angle in PROBE_ANGLES:
-                probe_img = v2.functional.rotate(
-                    img, angle=angle,
-                    interpolation=v2.InterpolationMode.BILINEAR, expand=True,
+            if self.probe_angles is None:
+                # 旧路径：整帧转正、在旋转域里换脸、末尾逆旋回来。
+                # 不传 --probe-angles 时逐字保留，workers=1 下逐像素回归。
+                counts = {}
+                for angle in PROBE_ANGLES:
+                    probe_img = v2.functional.rotate(
+                        img, angle=angle,
+                        interpolation=v2.InterpolationMode.BILINEAR, expand=True,
+                    )
+                    counts[angle] = len(self.models.run_detect(
+                        probe_img, detect_mode, max_num=10,
+                        score=detect_score, input_size=detect_input_size,
+                    ))
+                fallback_angle = choose_angle(counts)
+                if fallback_angle:
+                    # 只用 90 倍数：正旋 H×W → W×H，末尾的逆旋 W×H → H×W，
+                    # 输出尺寸与原帧严格一致，编码器不会看到变尺寸的帧。
+                    # 命中角度的图重新转一次，避免把 3 张全尺寸 CHW tensor
+                    # 同时留在显存里（workers>1 时这份开销会乘以 worker 数）。
+                    applied_angle = float(fallback_angle)
+                    img = v2.functional.rotate(
+                        img, angle=applied_angle,
+                        interpolation=v2.InterpolationMode.BILINEAR, expand=True,
+                    )
+                    kpss = self.models.run_detect(
+                        img, detect_mode, max_num=10,
+                        score=detect_score, input_size=detect_input_size,
+                    )
+            else:
+                # 新路径（--probe-angles）：img 全程不动，只转检测副本，
+                # 把 5 点 kps 逆映射回原帧坐标后直接交给 swap_core。
+                # 输出尺寸天然等于输入尺寸，也不需要末尾的逆旋。
+                candidates = self._collect_angle_candidates(
+                    img, self.probe_angles, detect_mode, detect_score,
+                    detect_input_size,
                 )
-                counts[angle] = len(self.models.run_detect(
-                    probe_img, detect_mode, max_num=10,
-                    score=detect_score, input_size=detect_input_size,
-                ))
-            fallback_angle = choose_angle(counts)
-            if fallback_angle:
-                # 只用 90 倍数：正旋 H×W → W×H，末尾的逆旋 W×H → H×W，
-                # 输出尺寸与原帧严格一致，编码器不会看到变尺寸的帧。
-                # 命中角度的图重新转一次，避免把 3 张全尺寸 CHW tensor
-                # 同时留在显存里（workers>1 时这份开销会乘以 worker 数）。
-                applied_angle = float(fallback_angle)
-                img = v2.functional.rotate(
-                    img, angle=applied_angle,
-                    interpolation=v2.InterpolationMode.BILINEAR, expand=True,
-                )
-                kpss = self.models.run_detect(
-                    img, detect_mode, max_num=10,
-                    score=detect_score, input_size=detect_input_size,
-                )
+                counts = {
+                    angle: len(kpss_frame)
+                    for angle, kpss_frame, _scores in candidates
+                }
+                fallback_angle = choose_angle(counts, self.probe_angles)
+                if fallback_angle:
+                    # applied_angle 保持 0：末尾三个逆旋分支都不触发，
+                    # paste_back 的 clamp 直接落在原帧画布上。
+                    chosen = next(
+                        kpss_frame
+                        for angle, kpss_frame, _ in candidates
+                        if angle == fallback_angle
+                    )
+                    kpss = np.asarray(
+                        chosen, dtype=np.float32,
+                    ).reshape(-1, 5, 2)
 
         # 漏检重试（DetectRetrySwitch）：0 检出帧升一档输入尺寸、抬高分
         # 数阈值再检一次（detect_retry.retry_plan 的两道防误检闸）。只在
         # 本来不会换脸的帧上追加推理；auto-orient 开启时不重试（它自己的
         # 4 向重探已覆盖横竖颠倒类漏检，双开会在同一帧跑两套试探）。
-        if len(kpss) == 0:
+        quality_limits = self.detect_retry_quality
+        # 整帧已被旋转（GUI OrientSwitch / 旧整帧兜底命中）时 kps 不在原帧
+        # 坐标域，第一遍的 scores 也已过期，不做质量门控重检。
+        quality_ok = quality_limits is not None and applied_angle == 0.0
+        max_conf = None
+        if (quality_ok and det_scores is not None and len(kpss) > 0
+                and len(det_scores) == len(kpss)):
+            max_conf = float(max(det_scores))
+        frame_quality = (
+            min((kps_quality(face) for face in kpss), default=None)
+            if quality_ok and len(kpss) > 0 else None
+        )
+        if len(kpss) == 0 or quality_ok:
             retry = retry_plan(
                 detected=len(kpss),
                 input_size=detect_input_size,
                 detect_score=detect_score,
                 auto_orient=auto_orient,
                 enabled=bool(parameters.get('DetectRetrySwitch')),
+                quality_enabled=quality_ok,
+                max_conf=max_conf,
+                frame_kps_quality=frame_quality,
+                min_conf=quality_limits[0] if quality_limits else 0.0,
+                min_kps_quality=quality_limits[1] if quality_limits else 0.0,
             )
             if retry is not None:
                 retry_size, retry_score = retry
-                kpss = self.models.run_detect(
+                retry_result = self.models.run_detect(
                     img, detect_mode, max_num=10,
                     score=retry_score, input_size=retry_size,
+                    with_scores=quality_ok,
                 )
+                if quality_ok:
+                    retry_kpss, retry_scores = retry_result
+                else:
+                    retry_kpss, retry_scores = retry_result, None
+                if len(kpss) == 0:
+                    # 0 检出帧：沿用旧行为，直接用重检结果。
+                    kpss = retry_kpss
+                else:
+                    # detected>0 的质量重检：只追加、不替换。直接覆盖会
+                    # 为了救一张侧脸把已检出的正脸丢掉（S5 §3.1 同类坑）。
+                    added = merge_probe_landmarks(
+                        kpss, [(0.0, retry_kpss, retry_scores)], max_faces=10,
+                    )
+                    if added:
+                        kpss = np.concatenate(
+                            [np.asarray(kpss, dtype=np.float32),
+                             np.asarray(added, dtype=np.float32)],
+                            axis=0,
+                        )
 
         # 自动朝向反馈：统计检测成功次数用于重新试探，并按第一张检测到的脸的
         # 眼轴更新微调角度的 EMA。
@@ -540,13 +759,37 @@ class VideoManager():
             opt_out=self.force_recognize,
         )
         ret = []
+        # --align-for-swap 的旁路映射：刻意不把 ret 扩成 3 元素，因为
+        # 后面多处 ``for face_kps, face_emb in ret`` 解包依赖 2 元素结构。
+        # key 用同一个 numpy 对象的 id（ret 持有引用，不会被回收后复用）。
+        align_kps_map = {}
+        want_align_kps = self.align_for_swap is not None and not skip_recognize
         for face_kps in kpss:
             face_emb = None
             if not skip_recognize:
-                face_emb, _ = self.models.run_recognize(
+                rec_result = self.models.run_recognize(
                     img, face_kps, dim=2 if self.recognize_dim2 else 1,
+                    with_align_kps=want_align_kps,
                 )
+                if want_align_kps:
+                    face_emb, _, align_kps = rec_result
+                    align_kps_map[id(face_kps)] = align_kps
+                else:
+                    face_emb, _ = rec_result
             ret.append([face_kps, face_emb])
+
+        # --probe-on-target-miss：指定 --target-face 且本帧已有脸却没匹配上
+        # 目标人物时，补做多向探测并合并去重，只把新增脸追加到 ret。
+        # 默认关闭时这一层只是一次布尔判断，正常帧逐像素行为不变。
+        if self.probe_on_target_miss and ret:
+            ret = self._probe_on_target_miss(
+                img, ret, detect_mode, detect_score, detect_input_size,
+                already_rotated=(
+                    auto_orient
+                    or bool(parameters.get('OrientSwitch', False))
+                    or applied_angle != 0.0
+                ),
+            )
         
         if ret and self.force_source_embedding is not None:
             # Headless 策略：一个 source 身份，作用到调用方选中的脸上。设置了
@@ -584,7 +827,8 @@ class VideoManager():
                         continue
                     with nvtx_range("swap_core"):
                         img = self.swap_core(
-                            img, face_kps, self.force_source_embedding,
+                            img, self._kps_for_swap(face_kps, align_kps_map),
+                            self.force_source_embedding,
                             parameters,
                         )
 
@@ -622,7 +866,10 @@ class VideoManager():
                 if best_slot is not None:
                     s_e = best_slot["AssignedEmbedding"]
                     with nvtx_range("swap_core"):
-                        img = self.swap_core(img, fface[0], s_e, parameters, slot=best_slot)
+                        img = self.swap_core(
+                            img, self._kps_for_swap(fface[0], align_kps_map),
+                            s_e, parameters, slot=best_slot,
+                        )
 
             img = img.permute(1,2,0)
             if applied_angle != 0.0:

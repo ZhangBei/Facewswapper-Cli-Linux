@@ -197,23 +197,32 @@ class Models():
         # 强制重载，让下次调用拿到新路径。
         self.delete_models()
 
-    def run_detect(self, img, detect_mode='Retinaface', max_num=1, score=0.5, input_size=640):
+    def run_detect(self, img, detect_mode='Retinaface', max_num=1, score=0.5,
+                   input_size=640, with_scores=False):
         """跑一次人脸检测。`input_size` 是模型输入的正方形边长
         （32 的倍数——320 / 416 / 480 / 640）。Retinaface 与 SCRDF
-        都接受动态输入 shape，所以这个值对它们有效。"""
+        都接受动态输入 shape，所以这个值对它们有效。
+
+        ``with_scores`` 默认关闭，返回 (N,5,2) kpss——现有全部调用点行为
+        逐字不变；显式打开时返回 ``(kpss, scores)``，供跨角度合并去重
+        按 confidence 排序。两条 detector 路径在 max_num 截断后 scores
+        与 kpss 严格对齐。"""
         kpss = []
+        scores = np.zeros((0,), dtype=np.float32)
 
         if detect_mode=='Retinaface':
             if not self.retinaface_model:
                 self._load_retinaface_model()
 
-            kpss = self.detect_retinaface(img, max_num=max_num, score=score, input_size=input_size)
+            kpss, scores = self.detect_retinaface(img, max_num=max_num, score=score, input_size=input_size)
 
         elif detect_mode=='SCRDF':
             self._ensure_scrdf_model()
 
-            kpss = self.detect_scrdf(img, max_num=max_num, score=score, input_size=input_size)
+            kpss, scores = self.detect_scrdf(img, max_num=max_num, score=score, input_size=input_size)
 
+        if with_scores:
+            return kpss, scores
         return kpss
         
     # Models 属性名 → _get_model_session 用的短 TLS/强引用键。
@@ -391,12 +400,16 @@ class Models():
         self._retinaface_uses_trt = False
         self._recognition_uses_trt = False
 
-    def run_recognize(self, img, kps, dim=1):
+    def run_recognize(self, img, kps, dim=1, with_align_kps=False):
         with nvtx_range("run_recognize"):
             if not self.recognition_model:
                 self._load_recognition_model()
 
-            embedding, cropped_image = self.recognize(img, kps, dim)
+            embedding, cropped_image, align_kps = self.recognize(img, kps, dim)
+            # 默认只返回两项，现有 7 处调用点行为逐字不变；--align-for-swap
+            # 显式 opt-in 才把 68 点派生的 5 点透出去，不额外跑 2dfan4。
+            if with_align_kps:
+                return embedding, cropped_image, align_kps
             return embedding, cropped_image
     
 
@@ -2067,7 +2080,10 @@ class Models():
             all_kpss = torch.cat(kpss_list)
 
             if all_scores.numel() == 0:
-                return np.zeros((0, 5, 2), dtype=np.float32)
+                return (
+                    np.zeros((0, 5, 2), dtype=np.float32),
+                    np.zeros((0,), dtype=np.float32),
+                )
 
             # 按 score 降序排（与旧代码里的 np.argsort()[::-1] 一致），然后
             # 在 IoU 空间做 NMS。除以 det_scale 把坐标从 letterbox 后的
@@ -2098,8 +2114,12 @@ class Models():
                 keep = keep[bindex]
 
             # 最末尾唯一一次设备边界。在此之前的一切都只是排在 worker 的
-            # CUDA stream 上。
-            return all_kpss[keep].cpu().numpy()
+            # CUDA stream 上。keep 在 max_num 截断时已统一作用于两者，
+            # 所以 scores 与 kpss 天然对齐。
+            return (
+                all_kpss[keep].cpu().numpy(),
+                all_scores[keep].cpu().numpy(),
+            )
 
     def detect_scrdf(self, img, max_num, score, input_size=640):
         # 把图缩放到 input_size 之内。模型是全卷积的，所以任何 32 的
@@ -2253,10 +2273,14 @@ class Models():
             bindex = np.argsort(values)[::-1]  # some extra weight on the centering
             bindex = bindex[0:max_num]
 
+            # max_num 截断必须同时作用于 det：旧实现只截了 kpss，
+            # 导致 det[:,4] 的 score 比 kpss 长，跨角度合并取 score
+            # 时会索引越界。
+            det = det[bindex]
             if kpss is not None:
                 kpss = kpss[bindex, :]
 
-        return kpss
+        return kpss, det[:, 4].astype(np.float32, copy=False)
 
     def recognize(self, img, face_kps, dim):
         with nvtx_range("rec_preprocess"):
@@ -2317,9 +2341,11 @@ class Models():
                         recognition_session.run_with_iobinding(io_binding)
                         temp_holder.append(torch.squeeze(output).cpu().numpy())
 
-            # 返回 embedding
+            # 返回 embedding。第三项 kps_for_align 供 --align-for-swap 复用
+            # 到 swap_core：68-point 模式下是 2dfan4 派生的原帧 5 点，
+            # 5-point 模式下就是传入的 face_kps。由 run_recognize 按需透出。
             out = np.mean(temp_holder, 0)
-            return out, cropped_image
+            return out, cropped_image, kps_for_align
         
     def resnet50(self, image, score=.5):   
         if not self.resnet50_model:
